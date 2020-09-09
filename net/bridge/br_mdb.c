@@ -180,10 +180,11 @@ static int __mdb_fill_info(struct sk_buff *skb,
 	if (nla_put_nohdr(skb, sizeof(e), &e) ||
 	    nla_put_u32(skb,
 			MDBA_MDB_EATTR_TIMER,
-			br_timer_value(mtimer))) {
-		nla_nest_cancel(skb, nest_ent);
-		return -EMSGSIZE;
-	}
+			br_timer_value(mtimer)))
+		goto nest_err;
+
+	if (p && nla_put_u8(skb, MDBA_MDB_EATTR_RTPROT, p->rt_protocol))
+		goto nest_err;
 	switch (mp->addr.proto) {
 	case htons(ETH_P_IP):
 		dump_srcs_mode = !!(p && mp->br->multicast_igmp_version == 3);
@@ -208,10 +209,8 @@ static int __mdb_fill_info(struct sk_buff *skb,
 	}
 	if (dump_srcs_mode &&
 	    (__mdb_fill_srcs(skb, p) ||
-	     nla_put_u8(skb, MDBA_MDB_EATTR_GROUP_MODE, p->filter_mode))) {
-		nla_nest_cancel(skb, nest_ent);
-		return -EMSGSIZE;
-	}
+	     nla_put_u8(skb, MDBA_MDB_EATTR_GROUP_MODE, p->filter_mode)))
+		goto nest_err;
 	nla_nest_end(skb, nest_ent);
 
 	return 0;
@@ -415,6 +414,9 @@ static size_t rtnl_mdb_nlmsg_size(struct net_bridge_port_group *pg)
 
 	if (!pg)
 		goto out;
+
+	/* MDBA_MDB_EATTR_RTPROT */
+	nlmsg_size += nla_total_size(sizeof(u8));
 
 	switch (pg->addr.proto) {
 	case htons(ETH_P_IP):
@@ -783,15 +785,19 @@ static int br_mdb_parse(struct sk_buff *skb, struct nlmsghdr *nlh,
 }
 
 static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
-			    struct br_ip *group, struct br_mdb_entry *entry,
+			    struct br_mdb_entry *entry,
+			    struct nlattr **mdb_attrs,
 			    struct netlink_ext_ack *extack)
 {
 	struct net_bridge_mdb_entry *mp;
 	struct net_bridge_port_group *p;
 	struct net_bridge_port_group __rcu **pp;
 	unsigned long now = jiffies;
+	struct br_ip group;
 	u8 filter_mode;
 	int err;
+
+	__mdb_entry_to_br_ip(entry, &group, mdb_attrs);
 
 	/* host join errors which can happen before creating the group */
 	if (!port) {
@@ -800,15 +806,15 @@ static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
 			NL_SET_ERR_MSG_MOD(extack, "Flags are not allowed for host groups");
 			return -EINVAL;
 		}
-		if (!br_multicast_is_star_g(group)) {
+		if (!br_multicast_is_star_g(&group)) {
 			NL_SET_ERR_MSG_MOD(extack, "Groups with sources cannot be manually host joined");
 			return -EINVAL;
 		}
 	}
 
-	mp = br_mdb_ip_get(br, group);
+	mp = br_mdb_ip_get(br, &group);
 	if (!mp) {
-		mp = br_multicast_new_group(br, group);
+		mp = br_multicast_new_group(br, &group);
 		err = PTR_ERR_OR_ZERO(mp);
 		if (err)
 			return err;
@@ -838,11 +844,11 @@ static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
 			break;
 	}
 
-	filter_mode = br_multicast_is_star_g(group) ? MCAST_EXCLUDE :
-						      MCAST_INCLUDE;
+	filter_mode = br_multicast_is_star_g(&group) ? MCAST_EXCLUDE :
+						       MCAST_INCLUDE;
 
-	p = br_multicast_new_port_group(port, group, *pp, entry->state, NULL,
-					filter_mode);
+	p = br_multicast_new_port_group(port, &group, *pp, entry->state, NULL,
+					filter_mode, RTPROT_STATIC);
 	if (unlikely(!p)) {
 		NL_SET_ERR_MSG_MOD(extack, "Couldn't allocate new port group");
 		return -ENOMEM;
@@ -861,13 +867,10 @@ static int __br_mdb_add(struct net *net, struct net_bridge *br,
 			struct nlattr **mdb_attrs,
 			struct netlink_ext_ack *extack)
 {
-	struct br_ip ip;
 	int ret;
 
-	__mdb_entry_to_br_ip(entry, &ip, mdb_attrs);
-
 	spin_lock_bh(&br->multicast_lock);
-	ret = br_mdb_add_group(br, p, &ip, entry, extack);
+	ret = br_mdb_add_group(br, p, entry, mdb_attrs, extack);
 	spin_unlock_bh(&br->multicast_lock);
 
 	return ret;
