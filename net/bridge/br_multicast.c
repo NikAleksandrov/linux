@@ -195,9 +195,192 @@ static bool br_port_group_equal(struct net_bridge_port_group *p,
 	return ether_addr_equal(src, p->eth_addr);
 }
 
+/* when a group transitions from EXCLUDE -> INCLUDE mode we need to remove it
+ * from all ports' S,G entries where it was automatically installed before
+ */
+static void br_multicast_fwd_filter_include(struct net_bridge_port_group *pg)
+{
+	struct net_bridge_port_group_sg_key sg_key;
+	struct net_bridge *br = pg->key.port->br;
+	struct net_bridge_port_group __rcu **pp;
+	struct net_bridge_mdb_entry *mp, *sgmp;
+	struct net_bridge_port_group *pg_lst;
+
+	if (pg->rt_protocol != RTPROT_KERNEL &&
+	    (pg->flags & MDB_PG_FLAGS_PERMANENT))
+		return;
+
+	/* no point to check an S,G */
+	if (!br_multicast_is_star_g(&pg->key.addr))
+		return;
+
+	mp = br_mdb_ip_get(br, &pg->key.addr);
+	if (!mp)
+		return;
+
+	memset(&sg_key, 0, sizeof(sg_key));
+	sg_key.port = pg->key.port;
+	for (pg_lst = mlock_dereference(mp->ports, br);
+	     pg_lst;
+	     pg_lst = mlock_dereference(pg_lst->next, br)) {
+		struct net_bridge_port_group *src_pg;
+		struct net_bridge_group_src *src_ent;
+
+		if (pg_lst == pg)
+			continue;
+		sg_key.addr = pg_lst->key.addr;
+		hlist_for_each_entry(src_ent, &pg_lst->src_list, node) {
+			if (!(src_ent->flags & BR_SGRP_F_INSTALLED))
+				continue;
+
+			sg_key.addr.src = src_ent->addr.src;
+			src_pg = br_sg_port_find(br, &sg_key);
+			if (!src_pg ||
+			    !(src_pg->flags & MDB_PG_FLAGS_STAR_EXCL))
+				continue;
+
+			sgmp = br_mdb_ip_get(br, &sg_key.addr);
+			if (!sgmp)
+				continue;
+
+			for (pp = &sgmp->ports;
+			     (src_pg = mlock_dereference(*pp, br)) != NULL;
+			     pp = &src_pg->next) {
+				if (!br_port_group_equal(src_pg, pg->key.port,
+							 pg->eth_addr))
+					continue;
+
+				if (src_pg->rt_protocol != RTPROT_KERNEL ||
+				    !(src_pg->flags & MDB_PG_FLAGS_STAR_EXCL))
+					break;
+
+				br_multicast_del_pg(sgmp, src_pg, pp);
+				break;
+			}
+		}
+	}
+}
+
+/* when a group transitions to (or is added as) EXCLUDE we need to add it
+ * to all ports' S,G entries which are not blocked by the current group
+ * for proper replication, the assumption is that any S,G blocked entries
+ * are already added so the S,G,port lookup should skip them
+ */
+void br_multicast_fwd_filter_exclude(struct net_bridge_port_group *pg)
+{
+	struct net_bridge_port_group_sg_key sg_key;
+	struct net_bridge *br = pg->key.port->br;
+	struct net_bridge_port_group *pg_lst;
+	struct net_bridge_mdb_entry *mp;
+	struct br_ip sg_ip;
+
+	if (pg->rt_protocol != RTPROT_KERNEL &&
+	    (pg->flags & MDB_PG_FLAGS_PERMANENT))
+		return;
+
+	mp = br_mdb_ip_get(br, &pg->key.addr);
+	if (!mp)
+		return;
+
+	memset(&sg_key, 0, sizeof(sg_key));
+	sg_key.port = pg->key.port;
+	for (pg_lst = mlock_dereference(mp->ports, br);
+	     pg_lst;
+	     pg_lst = mlock_dereference(pg_lst->next, br)) {
+		struct net_bridge_port_group *src_pg;
+		struct net_bridge_group_src *src_ent;
+
+		if (pg_lst == pg)
+			continue;
+		sg_key.addr = pg_lst->key.addr;
+		hlist_for_each_entry(src_ent, &pg_lst->src_list, node) {
+			if (!(src_ent->flags & BR_SGRP_F_INSTALLED))
+				continue;
+
+			sg_key.addr.src = src_ent->addr.src;
+			if (br_sg_port_find(src_ent->br, &sg_key))
+				continue;
+
+			memset(&sg_ip, 0, sizeof(sg_ip));
+			sg_ip = pg->key.addr;
+			sg_ip.src = src_ent->addr.src;
+			src_pg = __br_multicast_add_group(br, pg->key.port, &sg_ip,
+							  pg->eth_addr,
+							  MCAST_INCLUDE, false);
+			if (IS_ERR_OR_NULL(src_pg) ||
+			    src_pg->rt_protocol != RTPROT_KERNEL)
+				continue;
+			src_pg->flags |= MDB_PG_FLAGS_STAR_EXCL;
+		}
+	}
+}
+
+static void br_multicast_sg_clean_stars(struct net_bridge_mdb_entry *mp)
+{
+	struct net_bridge_port_group __rcu **pp;
+	struct net_bridge_port_group *p;
+
+	/* *,G exclude ports are only added to S,G entries */
+	if (br_multicast_is_star_g(&mp->addr))
+		return;
+
+	/* we need the STAR_EXCLUDE ports if there are non-STAR_EXCLUDE ports */
+	for (pp = &mp->ports;
+	     (p = mlock_dereference(*pp, mp->br)) != NULL;
+	     pp = &p->next)
+		if (!(p->flags & MDB_PG_FLAGS_STAR_EXCL))
+			return;
+
+	for (pp = &mp->ports;
+	     (p = mlock_dereference(*pp, mp->br)) != NULL;
+	     pp = &p->next)
+		br_multicast_del_pg(mp, p, pp);
+}
+
+void br_multicast_sg_add_exclude_ports(struct net_bridge_mdb_entry *star_mp,
+				       struct net_bridge_port_group *sg)
+{
+	struct net_bridge_port_group_sg_key sg_key;
+	struct net_bridge *br = star_mp->br;
+	struct net_bridge_port_group *pg;
+
+	if (br_multicast_is_star_g(&sg->key.addr))
+		return;
+
+	if (sg->rt_protocol != RTPROT_KERNEL &&
+	    (sg->flags & MDB_PG_FLAGS_PERMANENT))
+		return;
+
+	memset(&sg_key, 0, sizeof(sg_key));
+	sg_key.addr = sg->key.addr;
+	/* we need to add all exclude ports to the S,G */
+	for (pg = mlock_dereference(star_mp->ports, br);
+	     pg;
+	     pg = mlock_dereference(pg->next, br)) {
+		struct net_bridge_port_group *src_pg;
+
+		if (pg == sg || pg->filter_mode == MCAST_INCLUDE)
+			continue;
+
+		sg_key.port = pg->key.port;
+		if (br_sg_port_find(br, &sg_key))
+			continue;
+
+		src_pg = __br_multicast_add_group(br, pg->key.port,
+						  &sg->key.addr,
+						  sg->eth_addr,
+						  MCAST_INCLUDE, false);
+		if (IS_ERR_OR_NULL(src_pg) ||
+		    src_pg->rt_protocol != RTPROT_KERNEL)
+			continue;
+		src_pg->flags |= MDB_PG_FLAGS_STAR_EXCL;
+	}
+}
+
 static void br_multicast_fwd_src_add(struct net_bridge_group_src *src)
 {
 	struct net_bridge_port_group *sg;
+	struct net_bridge_mdb_entry *mp;
 	struct br_ip sg_ip;
 
 	if (src->flags & BR_SGRP_F_INSTALLED)
@@ -219,6 +402,11 @@ static void br_multicast_fwd_src_add(struct net_bridge_group_src *src)
 
 	/* the kernel is now responsible for removing this S,G */
 	del_timer(&sg->timer);
+	mp = br_mdb_ip_get(src->br, &src->pg->key.addr);
+	if (!mp)
+		return;
+
+	br_multicast_sg_add_exclude_ports(mp, sg);
 }
 
 static void br_multicast_fwd_src_remove(struct net_bridge_group_src *src)
@@ -350,6 +538,7 @@ void br_multicast_del_pg(struct net_bridge_mdb_entry *mp,
 	br_mdb_notify(br->dev, mp, pg, RTM_DELMDB);
 	hlist_add_head(&pg->mcast_gc.gc_node, &br->mcast_gc_list);
 	queue_work(system_long_wq, &br->mcast_gc_work);
+	br_multicast_sg_clean_stars(mp);
 
 	if (!mp->ports && !mp->host_joined && netif_running(br->dev))
 		mod_timer(&mp->timer, jiffies);
@@ -400,6 +589,9 @@ static void br_multicast_port_group_expired(struct timer_list *t)
 			changed = true;
 		}
 	}
+
+	if (changed)
+		br_multicast_fwd_filter_include(pg);
 
 	if (hlist_empty(&pg->src_list)) {
 		br_multicast_find_del_pg(br, pg);
@@ -1653,6 +1845,7 @@ static bool br_multicast_isexc(struct net_bridge_port_group *pg,
 	switch (pg->filter_mode) {
 	case MCAST_INCLUDE:
 		__grp_src_isexc_incl(pg, srcs, nsrcs, src_size);
+		br_multicast_fwd_filter_exclude(pg);
 		changed = true;
 		break;
 	case MCAST_EXCLUDE:
@@ -1865,6 +2058,7 @@ static bool br_multicast_toex(struct net_bridge_port_group *pg,
 	switch (pg->filter_mode) {
 	case MCAST_INCLUDE:
 		__grp_src_toex_incl(pg, srcs, nsrcs, src_size);
+		br_multicast_fwd_filter_exclude(pg);
 		changed = true;
 		break;
 	case MCAST_EXCLUDE:

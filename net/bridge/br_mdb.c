@@ -789,11 +789,11 @@ static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
 			    struct nlattr **mdb_attrs,
 			    struct netlink_ext_ack *extack)
 {
-	struct net_bridge_mdb_entry *mp;
+	struct net_bridge_mdb_entry *mp, *star_mp;
 	struct net_bridge_port_group *p;
 	struct net_bridge_port_group __rcu **pp;
+	struct br_ip group, star_group;
 	unsigned long now = jiffies;
-	struct br_ip group;
 	u8 filter_mode;
 	int err;
 
@@ -857,6 +857,25 @@ static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
 	if (entry->state == MDB_TEMPORARY)
 		mod_timer(&p->timer, now + br->multicast_membership_interval);
 	br_mdb_notify(br->dev, mp, p, RTM_NEWMDB);
+	/* if we are adding a new EXCLUDE port group it needs to be also
+	 * added to all S,G entries for proper replication, if we are adding
+	 * a new INCLUDE port (S,G) then all of *,G EXCLUDE ports need to be
+	 * added to it for proper replication
+	 */
+	if (br_multicast_should_handle_mode(br, group.proto)) {
+		switch (filter_mode) {
+		case MCAST_EXCLUDE:
+			br_multicast_fwd_filter_exclude(p);
+			break;
+		case MCAST_INCLUDE:
+			star_group = p->key.addr;
+			memset(&star_group.src, 0, sizeof(star_group.src));
+			star_mp = br_mdb_ip_get(br, &star_group);
+			if (star_mp)
+				br_multicast_sg_add_exclude_ports(star_mp, p);
+			break;
+		}
+	}
 
 	return 0;
 }
