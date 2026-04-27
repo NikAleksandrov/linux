@@ -74,6 +74,8 @@
 
 #include <linux/mlx5/driver.h>
 
+struct vfmig_iova_domain;
+
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 
 int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev);
@@ -173,6 +175,38 @@ int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev);
  */
 bool mlx5_vf_is_vfmig_tracked(struct mlx5_core_dev *dev);
 
+/*
+ * If @vf_dev is a VF whose owning PF has SET_TRACKED { enable=1 }
+ * latched on this slot, return the per-VF deterministic IOVA domain
+ * allocated for it; otherwise return NULL.
+ *
+ * Probe-time DMA hook used by mlx5_cmd_enable, pages.c, etc. to route
+ * coherent allocations through vfmig_iova_alloc_coherent() instead of
+ * dma_alloc_coherent() so that source/destination IOVAs match across a
+ * SAVE/LOAD round-trip. Callers stash the returned pointer alongside
+ * the allocation so the matching free path can dispatch to the right
+ * allocator without re-running the lookup.
+ *
+ * Lifetime contract:
+ *   - The returned pointer is owned by the PF's mlx5_vfmig_pf and lives
+ *     until SET_TRACKED { enable=0 } or sriov_disable / PF unbind. All
+ *     three of those paths require the VF to be unbound first
+ *     (SET_TRACKED via the device_lock check; sriov_disable because the
+ *     PCI core unbinds the VFs first; PF unbind because mlx5_unload
+ *     drops sriov before the cdev cleanup). So as long as @vf_dev is
+ *     mid-probe (i.e. between mlx5_cmd_enable and mlx5_cmd_disable),
+ *     the returned domain is guaranteed to outlive that probe.
+ *   - Same caller contract as mlx5_vf_is_vfmig_tracked: takes the PF
+ *     reference internally for the lookup, so must NOT be called while
+ *     already holding the PF's intf_state_mutex.
+ *
+ * Returns NULL on PFs, on VFs whose owning PF has no /dev/mlx5_vfmig
+ * cdev, on VFs that have not had SET_TRACKED { enable=1 } issued, and
+ * on transient PF lookup failure.
+ */
+struct vfmig_iova_domain *
+mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev);
+
 /* Module init/exit hooks for the cdev region. */
 int  mlx5_vfmig_module_init(void);
 void mlx5_vfmig_module_exit(void);
@@ -200,6 +234,8 @@ static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev,
 }
 static inline int  mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev) { return 0; }
 static inline bool mlx5_vf_is_vfmig_tracked(struct mlx5_core_dev *dev) { return false; }
+static inline struct vfmig_iova_domain *
+mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev) { return NULL; }
 static inline int  mlx5_vfmig_module_init(void) { return 0; }
 static inline void mlx5_vfmig_module_exit(void) { }
 

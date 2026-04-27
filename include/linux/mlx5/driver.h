@@ -317,6 +317,20 @@ struct mlx5_cmd {
 	void	       *cmd_buf;
 	dma_addr_t	dma;
 
+	/*
+	 * If non-NULL, the cmd ring page was allocated through the per-VF
+	 * vfmig deterministic IOVA allocator (see vfmig_iova.h) instead of
+	 * dma_alloc_coherent(), and free_cmd_page() must release it via
+	 * vfmig_iova_free_coherent() against this domain. NULL means the
+	 * default DMA allocator was used. Set unconditionally so cmd.c
+	 * doesn't have to #ifdef around the field; the actual route-through
+	 * is gated on CONFIG_MLX5_VFMIG via mlx5_vf_get_vfmig_iova_domain().
+	 *
+	 * Opaque on purpose: struct vfmig_iova_domain is mlx5_core-internal,
+	 * not exported in this header.
+	 */
+	void	       *vfmig_iova_dom;
+
 	/* protect command queue allocations
 	 */
 	spinlock_t	alloc_lock;

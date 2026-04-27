@@ -60,6 +60,45 @@
  *   Layer 2: MANAGE_PAGES (boot pages, FW-driven page-give);
  *   Layer 3: EQs + UARs;
  *   Layer 4: user resources.
+ *
+ * Determinism contract (v1 shortcut -- READ THIS)
+ * -----------------------------------------------
+ * vfmig_iova_alloc_coherent() does NOT change allocation semantics
+ * at the call site. It looks just like dma_alloc_coherent: caller
+ * passes a size, gets back (iova, vaddr), and passes no identifier
+ * for *which* allocation this is. The IOVA we hand back is whatever
+ * the per-VF bump cursor currently points at.
+ *
+ * That means source/destination IOVA equivalence rests entirely on
+ * caller discipline: the same converted call sites must execute in
+ * the same order with the same sizes on both sides of the migration.
+ * Any reorder, addition, removal, or size change between source and
+ * destination probe paths drifts the cursor and silently misroutes
+ * IOVAs -- the destination FW then dereferences a buffer at the
+ * wrong address with no immediately-visible error.
+ *
+ * Why we accept this in v1: Layer 1 has exactly one converted call
+ * site (the cmd ring); Layer 2 adds MANAGE_PAGES which are also
+ * order-stable in practice. Building the proper structured store
+ * (below) before validating the IOVA-preservation hypothesis on
+ * Layer 1 risks scaffolding for an approach that may not work.
+ *
+ * The intended v2: every converted site gets a stable slot identity
+ * (enum vfmig_iova_slot + an instance index). Allocator becomes
+ * vfmig_iova_alloc_slot(dom, slot, instance, size, ...). IOVA is
+ * derived from (slot, instance), and registry / wire records are
+ * keyed by the same. Order, missing-on-one-side, and size mismatches
+ * all become loud, specific errors. The bump cursor and
+ * lookup-at-cursor logic in alloc_coherent go away.
+ *
+ * v2 is a hard-required follow-up before Layer 3, not a "nice to
+ * have". See the "Architectural shortcut: order-based determinism"
+ * section of the plan document for the full rationale and the
+ * proposed slot enum sketch.
+ *
+ * The one defensive cross-check we keep at this site: a registry hit
+ * at the cursor whose recorded length differs from the requested
+ * size returns -EINVAL. That catches size drift but not order drift.
  */
 
 #ifndef __MLX5_CORE_VFMIG_IOVA_H__
@@ -165,10 +204,15 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
  *                             vaddr) without allocating a new page.
  *
  * Either way the cursor advances by ALIGN(size, VFMIG_IOVA_GRANULE).
- * Caller's contract: probe-time allocators must call this in the
- * SAME ORDER and with the SAME SIZES on source and destination, or
- * IOVAs drift. (Future layers will tag calls with a slot id for
- * defensive lookup; v1 trusts probe-order determinism.)
+ *
+ * v1 CALLER CONTRACT (see file-top "Determinism contract" block):
+ * probe-time allocators MUST call this in the SAME ORDER and with
+ * the SAME SIZES on source and destination, or IOVAs drift silently.
+ * The API has no slot-id parameter on purpose: v1 ships the bump
+ * cursor as-is so we can validate the IOVA-preservation hypothesis
+ * (Layer 1 keystone) before investing in the structured slot store
+ * v2 will introduce (vfmig_iova_alloc_slot). Treat the "no slot id"
+ * as a temporary state, not a permanent design.
  *
  * Size is rounded up to PAGE_SIZE. @gfp is honoured for the page
  * allocation in the fresh-alloc case; on the replay-hit path no

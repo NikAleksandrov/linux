@@ -2381,6 +2381,45 @@ bool mlx5_vf_is_vfmig_tracked(struct mlx5_core_dev *dev)
 	return tracked;
 }
 
+struct vfmig_iova_domain *
+mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev)
+{
+	struct pci_dev *vf_pdev = vf_dev->pdev;
+	struct vfmig_iova_domain *dom = NULL;
+	struct mlx5_core_dev *pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	int vf_id;
+
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return NULL;
+
+	vf_id = pci_iov_vf_id(vf_pdev);
+	if (vf_id < 0)
+		return NULL;
+
+	pf_mdev = mlx5_vf_get_core_dev(vf_pdev);
+	if (!pf_mdev)
+		return NULL;
+
+	/*
+	 * The vfmig_iova_dom pointer is set under the PF's vfmig->lock by
+	 * the SET_TRACKED handler, but reading it here is unlocked: the
+	 * lifetime contract documented on this function (VF must be unbound
+	 * for either SET_TRACKED { enable=0 } or sriov_disable to free the
+	 * domain, and we are mid-probe of the VF, so the VF is bound) means
+	 * the pointer cannot be torn down underneath us. mlx5_vf_get_core_dev
+	 * also pins the PF mdev until put, so the vfs_ctx[] array stays alive.
+	 *
+	 * Tracked-bit and domain-pointer set/clear together in the SET_TRACKED
+	 * handler, so it's enough to check vfmig_iova_dom directly.
+	 */
+	sriov = &pf_mdev->priv.sriov;
+	if (vf_id < sriov->num_vfs)
+		dom = sriov->vfs_ctx[vf_id].vfmig_iova_dom;
+	mlx5_vf_put_core_dev(pf_mdev);
+	return dom;
+}
+
 bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev, u16 *vhca_id_out)
 {
 	struct pci_dev *vf_pdev = dev->pdev;
