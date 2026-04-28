@@ -63,6 +63,7 @@
 
 #include "mlx5_core.h"
 #include "vfmig.h"
+#include "vfmig_iova.h"
 
 #define MLX5_VFMIG_MAX_DEVICES	256
 
@@ -240,6 +241,7 @@ struct mlx5_vfmig_load_ctx {
 static void vfmig_load_release_resources(struct mlx5_vfmig_load_ctx *ctx);
 static bool vfmig_vf_id_busy_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id);
 static void vfmig_pf_drop_pending_loads_locked(struct mlx5_vfmig_pf *vfmig);
+static void vfmig_pf_drop_iova_domains_locked(struct mlx5_vfmig_pf *vfmig);
 
 static void vfmig_pf_release(struct kref *kref)
 {
@@ -476,23 +478,39 @@ static struct pci_dev *vfmig_get_vf_pdev(struct pci_dev *pf_pdev, u32 vf_id)
 /*
  * MLX5_VFMIG_IOC_SET_TRACKED handler.
  *
- * Toggles the per-VF @vfmig_tracked flag on the PF's vfs_ctx[]. Today
- * the flag has no probe-time consumers yet (mlx5_cmd_enable etc. will
- * start reading it once the vfmig_iova module lands). Even so we
- * enforce the eventual contract from day 1:
+ * Toggles the per-VF @vfmig_tracked flag on the PF's vfs_ctx[] and
+ * couples it to creation/destruction of the per-VF deterministic
+ * IOVA domain (vfmig_iova.c). The flag and the domain pointer are
+ * the two halves of "this VF's address space is owned by vfmig":
+ * tracked=1 iff vfmig_iova_dom != NULL. mlx5_vf_is_vfmig_tracked()
+ * and future probe-time hooks rely on this invariant.
  *
- *   - VF must be currently unbound (no driver attached). We take the
- *     VF pci_dev's device_lock to read ->dev.driver atomically with
- *     the flag write; that's the same lock pci_device_probe / remove
- *     take, so the flag and any future probe see consistent ordering.
- *   - On enable=1: set flag. (Future: also allocate & attach the
- *     per-VF unmanaged iommu_domain.)
- *   - On enable=0: clear flag. (Future: also detach & free domain;
- *     reject if a LOAD blob is staged-but-unapplied since the staged
- *     blob references IOVAs in this domain.)
+ * Contract:
+ *   - VF must be currently unbound (no driver attached). We take
+ *     the VF pci_dev's device_lock to read ->dev.driver atomically
+ *     with the domain attach/detach + flag write; that's the same
+ *     lock pci_device_probe / remove take, so the flag and any
+ *     future probe see consistent ordering.
+ *   - On enable=1: allocate an unmanaged paging iommu_domain,
+ *     attach it to the VF, stash it on vfs_ctx[].vfmig_iova_dom,
+ *     and set the flag. After this point dma_alloc_coherent on
+ *     this VF will fail (the dma-iommu-managed default DMA domain
+ *     is displaced); only callers routed through
+ *     vfmig_iova_alloc_coherent() will resolve to a valid IOVA.
+ *   - On enable=0: clear the flag, detach + free the domain, NULL
+ *     out the pointer. Restores the device's default DMA domain;
+ *     subsequent normal mlx5_core probes work as before.
  *
  * Idempotent toggles (flag already in the requested state) are
- * silent no-ops -- they don't even take device_lock or log.
+ * silent no-ops -- they don't take device_lock or log.
+ *
+ * NOTE on -EBUSY semantics: SET_TRACKED { enable=0 } while a LOAD
+ * blob is staged-but-unapplied would invalidate IOVAs the staged
+ * blob expects to find at apply time. We don't yet enforce this
+ * (Layer 1 will, once HOST_PAGE records actually populate the
+ * domain at LOAD time); for now the worst case is the staged blob
+ * pointing into a freed domain, which apply_pending_load will
+ * detect on the next probe and refuse.
  */
 static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 				  void __user *uarg)
@@ -501,6 +519,8 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
 	struct mlx5_core_sriov *sriov;
 	struct mlx5_vf_context *vfs_ctx;
+	struct vfmig_iova_domain *new_dom = NULL;
+	struct vfmig_iova_domain *old_dom = NULL;
 	struct pci_dev *vf_pdev;
 	bool desired;
 	int err = 0;
@@ -543,14 +563,51 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 		goto out_unlock;
 	}
 
-	vfs_ctx->vfmig_tracked = desired ? 1 : 0;
-	mlx5_core_info(pf_mdev,
-		       "vfmig: vf %u tracked=%d (iommu domain attach pending L0 module)\n",
-		       arg.vf_id, desired);
+	if (desired) {
+		/*
+		 * Belt-and-suspenders: an existing domain pointer with
+		 * tracked=0 is a state-machine bug. Detect, log, free
+		 * it before allocating a new one rather than leaking.
+		 */
+		if (WARN_ON_ONCE(vfs_ctx->vfmig_iova_dom)) {
+			old_dom = vfs_ctx->vfmig_iova_dom;
+			vfs_ctx->vfmig_iova_dom = NULL;
+		}
+		err = vfmig_iova_domain_create(vf_pdev, arg.vf_id, &new_dom);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SET_TRACKED vf %u: iova_domain_create failed: %d\n",
+				       arg.vf_id, err);
+			goto out_unlock;
+		}
+		vfs_ctx->vfmig_iova_dom = new_dom;
+		vfs_ctx->vfmig_tracked = 1;
+		mlx5_core_info(pf_mdev,
+			       "vfmig: vf %u tracked=1, iova domain attached\n",
+			       arg.vf_id);
+	} else {
+		old_dom = vfs_ctx->vfmig_iova_dom;
+		vfs_ctx->vfmig_iova_dom = NULL;
+		vfs_ctx->vfmig_tracked = 0;
+		mlx5_core_info(pf_mdev,
+			       "vfmig: vf %u tracked=0, iova domain detaching\n",
+			       arg.vf_id);
+	}
 
 out_unlock:
 	device_unlock(&vf_pdev->dev);
 	pci_dev_put(vf_pdev);
+
+	/*
+	 * Free the old domain *outside* device_lock: domain_destroy
+	 * walks the iommu_domain's mapping tree, frees pages, and
+	 * detaches via iommu_detach_device which takes iommu group
+	 * locks. None of that benefits from holding device_lock
+	 * here; not holding it also avoids any subtle iommu-group
+	 * vs device-lock ordering hazards in iommu drivers.
+	 */
+	if (old_dom)
+		vfmig_iova_domain_destroy(old_dom);
 	return err;
 }
 
@@ -2279,6 +2336,13 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 	 * is still alive so PD/MKEY/DMA teardown works.
 	 */
 	vfmig_pf_drop_pending_loads_locked(vfmig);
+	/*
+	 * Drop any per-VF IOVA domains. Same ordering rationale: must run
+	 * while the VF pci_devs are still live so iommu_detach_device()
+	 * inside vfmig_iova_domain_destroy() finds a real device. PF unbind
+	 * unloads after this returns (mlx5_unload), so VFs are still here.
+	 */
+	vfmig_pf_drop_iova_domains_locked(vfmig);
 	vfmig->dead = true;
 	vfmig->pf_mdev = NULL;
 	up_write(&vfmig->lock);
@@ -2578,6 +2642,90 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
 	down_read(&vfmig->lock);
 	if (!vfmig->dead)
 		vfmig_pf_drop_pending_loads_locked(vfmig);
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+}
+
+/*
+ * Drop any per-VF deterministic IOVA domains. Mirror image of
+ * vfmig_pf_drop_pending_loads_locked() but for vfs_ctx[].vfmig_iova_dom.
+ *
+ * Ordering contract (CRITICAL — get this wrong and you get a UAF in
+ * vfmig_iova_free_coherent on teardown):
+ *
+ *   The IOVA domain MUST outlive every code path on the VF side that
+ *   can call vfmig_iova_alloc_coherent() / vfmig_iova_free_coherent().
+ *   On the sriov_numvfs=0 path that means we run AFTER
+ *   pci_disable_sriov() has finished -- i.e. after every VF has been
+ *   fully unbound (mlx5_core remove_one -> mlx5_unregister_device ->
+ *   mlx5_ib teardown -> mlx5_function_disable -> mlx5_cmd_disable ->
+ *   free_cmd_page) and no caller can dereference dev->cmd.vfmig_iova_dom
+ *   any more. See the comment in mlx5_sriov_disable() for the full
+ *   reasoning.
+ *
+ *   pci_dev_get() in vfmig_iova_domain_create() pins the VF pci_dev,
+ *   so iommu_detach_device() is safe to invoke even after the VF has
+ *   been removed from its IOMMU group by device_del(): the iommu core
+ *   short-circuits on a NULL group.
+ *
+ * Caller-side locking matches drop_pending_loads_locked: vfmig->lock is
+ * held read or write by the caller. Inside, we splice each domain
+ * pointer out of vfs_ctx[] under ctxs_lock, then drop ctxs_lock to do
+ * the actual destroy (which can sleep / take iommu group locks).
+ */
+static void vfmig_pf_drop_iova_domains_locked(struct mlx5_vfmig_pf *vfmig)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	int total_vfs;
+	int i;
+
+	if (!pf_mdev)
+		return;
+	sriov = &pf_mdev->priv.sriov;
+	if (!sriov->vfs_ctx)
+		return;
+
+	/*
+	 * As in drop_pending_loads_locked, num_vfs is the upper bound we
+	 * have without a cheap accessor for the vfs_ctx[] capacity; any
+	 * slot outside that range can only have been left over from a
+	 * stale generation (set_tracked rejects bogus vf_ids).
+	 */
+	total_vfs = sriov->num_vfs;
+	mutex_lock(&vfmig->ctxs_lock);
+	for (i = 0; i < total_vfs; i++) {
+		struct vfmig_iova_domain *dom =
+			sriov->vfs_ctx[i].vfmig_iova_dom;
+
+		if (!dom)
+			continue;
+		sriov->vfs_ctx[i].vfmig_iova_dom = NULL;
+		sriov->vfs_ctx[i].vfmig_tracked = 0;
+		mutex_unlock(&vfmig->ctxs_lock);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: dropping iova domain for vf %d on PF teardown / sriov disable\n",
+			       i);
+		vfmig_iova_domain_destroy(dom);
+		mutex_lock(&vfmig->ctxs_lock);
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
+}
+
+void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
+{
+	struct mlx5_vfmig_pf *vfmig;
+
+	if (!pf_mdev || !mlx5_core_is_pf(pf_mdev))
+		return;
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig)
+		return;
+
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_pf_drop_iova_domains_locked(vfmig);
 	up_read(&vfmig->lock);
 	vfmig_pf_put(vfmig);
 }

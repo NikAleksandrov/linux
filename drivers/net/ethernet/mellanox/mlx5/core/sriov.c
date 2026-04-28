@@ -213,7 +213,33 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	struct devlink *devlink = priv_to_devlink(dev);
 	int num_vfs = pci_num_vf(dev->pdev);
 
+	/*
+	 * pci_disable_sriov() runs the FULL teardown for every VF
+	 * synchronously: device_release_driver -> mlx5_core remove_one
+	 * -> mlx5_unregister_device -> mlx5_ib_remove (destroying GSI
+	 * QP, MR cache, etc.) -> mlx5_function_disable -> mlx5_cmd_disable.
+	 * Many of those teardown steps allocate or free DMA buffers via
+	 * mlx5_dma_free_coherent_node / vfmig_iova_free_coherent, which
+	 * dereference the per-VF IOVA domain. The domain MUST outlive
+	 * those derefs.
+	 *
+	 * So we drop the IOVA domains *after* pci_disable_sriov returns,
+	 * by which point every VF is fully unbound and no caller can
+	 * reach into vfmig_iova_free_coherent() any more. Reversing this
+	 * order is a use-after-free: the in-flight destroy_qp/destroy_cq
+	 * paths from mlx5_ib unwind would dereference the freed domain
+	 * struct (NULL deref at the dom->lock mutex pointer).
+	 *
+	 * iommu_detach_device() inside vfmig_iova_domain_destroy() is
+	 * safe to call against a VF that pci_disable_sriov() has already
+	 * removed: device_del() detaches the IOMMU domain implicitly via
+	 * iommu_release_device(), and the iommu core's
+	 * iommu_detach_device() short-circuits when the device has no
+	 * group. The pci_dev itself stays alive because we hold a ref
+	 * via pci_dev_get() in vfmig_iova_domain_create().
+	 */
 	pci_disable_sriov(pdev);
+	mlx5_vfmig_pf_drop_iova_domains(dev);
 	devl_lock(devlink);
 	mlx5_device_disable_sriov(dev, num_vfs, true, num_vf_change);
 	devl_unlock(devlink);

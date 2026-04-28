@@ -94,6 +94,19 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * Drop any per-VF deterministic IOVA domains staged on @pf_mdev's
+ * sriov->vfs_ctx[]. Called from mlx5_sriov_disable() *before*
+ * pci_disable_sriov() runs: the IOVA domain is attached to the VF's
+ * struct device, so it must be detached before the PCI core tears
+ * the VF pci_dev down. Also called from mlx5_vfmig_pf_cleanup() so
+ * PF unbind cleans up any orphaned domains the user forgot to
+ * release explicitly via SET_TRACKED { enable=0 }.
+ *
+ * Safe to call when there is no vfmig PF context yet (no-op).
+ */
+void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev);
+
+/*
  * Returns true iff @dev is a VF and its PF has marked it as restored.
  * Safe to call unconditionally on any mlx5_core_dev. Internally takes
  * and releases mlx5_vf_get_core_dev() / mlx5_vf_put_core_dev() on the
@@ -179,6 +192,7 @@ void mlx5_vfmig_module_exit(void);
 static inline int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev) { return 0; }
 static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev) { }
+static inline void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev) { }
 static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev,
 						  u16 *vhca_id_out)
 {
