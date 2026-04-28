@@ -487,6 +487,7 @@ struct mlx5_lag;
 struct mlx5_devcom_dev;
 struct mlx5_fw_reset;
 struct mlx5_eq_table;
+struct mlx5_vfmig_pf;
 struct mlx5_irq_table;
 struct mlx5_sf_dev_table;
 struct mlx5_sf_hw_table;
@@ -629,6 +630,14 @@ struct mlx5_priv {
 	struct mlx5_sf_table *sf_table;
 #endif
 	struct blocking_notifier_head lag_nh;
+
+	/*
+	 * Per-PF state for the host-driven VF migration / CRIU restore cdev
+	 * (/dev/mlx5_vfmig/<bdf>). NULL on VFs and on PFs that haven't yet
+	 * registered the cdev. Owned by drivers/net/ethernet/mellanox/mlx5/
+	 * core/vfmig.c.
+	 */
+	struct mlx5_vfmig_pf *vfmig;
 };
 
 enum mlx5_device_state {

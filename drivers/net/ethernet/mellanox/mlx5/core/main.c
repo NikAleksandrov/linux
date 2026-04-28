@@ -74,6 +74,7 @@
 #include "mlx5_irq.h"
 #include "hwmon.h"
 #include "lag/lag.h"
+#include "vfmig.h"
 
 MODULE_AUTHOR("Eli Cohen <eli@mellanox.com>");
 MODULE_DESCRIPTION("Mellanox 5th generation network adapters (ConnectX series) core driver");
@@ -1496,6 +1497,16 @@ int mlx5_init_one_devl_locked(struct mlx5_core_dev *dev)
 		mlx5_core_err(dev, "mlx5_hwmon_dev_register failed with error code %d\n", err);
 
 	mutex_unlock(&dev->intf_state_mutex);
+
+	/*
+	 * Register the per-PF /dev/mlx5_vfmig cdev. Done after dropping
+	 * intf_state_mutex to keep cdev / device class APIs out of any
+	 * mlx5 lock ordering. No-ops on VFs. Failure is non-fatal: the
+	 * device works without the host-driven migration interface.
+	 */
+	if (mlx5_vfmig_pf_init(dev))
+		mlx5_core_warn(dev, "vfmig: cdev init failed; migration knob unavailable\n");
+
 	return 0;
 
 err_register:
@@ -1531,6 +1542,13 @@ int mlx5_init_one(struct mlx5_core_dev *dev)
 void mlx5_uninit_one(struct mlx5_core_dev *dev)
 {
 	struct devlink *devlink = priv_to_devlink(dev);
+
+	/*
+	 * Drop the cdev before any device-state cleanup so that userspace
+	 * opens of /dev/mlx5_vfmig/<bdf> are sealed off first. No-op on VFs
+	 * and on PFs where pf_init failed or wasn't called.
+	 */
+	mlx5_vfmig_pf_cleanup(dev);
 
 	devl_lock(devlink);
 	mutex_lock(&dev->intf_state_mutex);
@@ -2381,6 +2399,10 @@ static int __init mlx5_init(void)
 	if (err)
 		goto err_sf;
 
+	err = mlx5_vfmig_module_init();
+	if (err)
+		goto err_vfmig;
+
 	err = pci_register_driver(&mlx5_core_driver);
 	if (err)
 		goto err_pci;
@@ -2388,6 +2410,8 @@ static int __init mlx5_init(void)
 	return 0;
 
 err_pci:
+	mlx5_vfmig_module_exit();
+err_vfmig:
 	mlx5_sf_driver_unregister();
 err_sf:
 	mlx5e_cleanup();
@@ -2399,6 +2423,7 @@ err_debug:
 static void __exit mlx5_cleanup(void)
 {
 	pci_unregister_driver(&mlx5_core_driver);
+	mlx5_vfmig_module_exit();
 	mlx5_sf_driver_unregister();
 	mlx5e_cleanup();
 	mlx5_unregister_debugfs();
