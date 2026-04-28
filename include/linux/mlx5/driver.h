@@ -494,6 +494,18 @@ struct mlx5_vf_context {
 	 * mlx5_vfmig_vf_apply_pending_load().
 	 */
 	struct mlx5_vfmig_vf_load *vfmig_pending_load;
+	/*
+	 * Set by /dev/mlx5_vfmig SET_TRACKED { enable=1 } ioctl on the PF
+	 * mdev. When set, the per-VF IOMMU domain pointed to by
+	 * @vfmig_iova_dom owns the VF's address space, and host-side
+	 * allocators (cmd ring, MANAGE_PAGES, EQ buffers) route through
+	 * the deterministic IOVA allocator in vfmig_iova.c. Read by
+	 * mlx5_vf_is_vfmig_tracked() and consulted at probe time by
+	 * mlx5_cmd_enable() and friends. Cleared by SET_TRACKED
+	 * { enable=0 } or by SR-IOV teardown.
+	 */
+	u8	vfmig_tracked:1;
+	struct vfmig_iova_domain *vfmig_iova_dom;
 	enum port_state_policy	policy;
 	struct blocking_notifier_head notifier;
 };
@@ -514,6 +526,7 @@ struct mlx5_fw_reset;
 struct mlx5_eq_table;
 struct mlx5_vfmig_pf;
 struct mlx5_vfmig_vf_load;
+struct vfmig_iova_domain;
 struct mlx5_irq_table;
 struct mlx5_sf_dev_table;
 struct mlx5_sf_hw_table;

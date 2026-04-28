@@ -213,4 +213,56 @@ struct mlx5_vfmig_enable_migratable {
 #define MLX5_VFMIG_IOC_ENABLE_MIGRATABLE \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x06, struct mlx5_vfmig_enable_migratable)
 
+/*
+ * MLX5_VFMIG_IOC_SET_TRACKED:
+ *   Toggle the host-driver-side "vfmig tracked" mode on a VF. When set,
+ *   the PF allocates a per-VF unmanaged IOMMU domain and attaches it
+ *   to the VF's pci_dev, and subsequent host-side allocators in the
+ *   destination VF's mlx5_core probe (cmd ring, MANAGE_PAGES pages,
+ *   EQ buffers, ...) route through a deterministic IOVA allocator
+ *   instead of the kernel's default DMA allocator. This is the
+ *   plumbing that lets a SAVE/LOAD round-trip preserve every IOVA
+ *   captured in the firmware blob across host changes -- without it,
+ *   LOAD_VHCA_STATE accepts the blob but the destination VHCA's
+ *   cmd ring is dead afterwards (every command 60s timeout).
+ *
+ *   This flag is orthogonal to MLX5_VFMIG_IOC_ENABLE_MIGRATABLE: the
+ *   migratable bit is the firmware gate for the SUSPEND/SAVE/LOAD/
+ *   RESUME command family; @vfmig_tracked is the host-driver gate for
+ *   the IOMMU/IOVA layer that makes those commands semantically
+ *   correct on a native (non-VFIO) destination. Userspace will
+ *   typically call both, in either order, before binding the VF.
+ *
+ *   Lifetime semantics:
+ *     - @enable=1 must be called while the VF is unbound (no driver
+ *       attached). Returns -EBUSY otherwise. Allocates the per-VF
+ *       IOMMU domain (idempotent: returns 0 if the flag is already
+ *       set).
+ *     - @enable=0 must also be called while the VF is unbound. Frees
+ *       the domain and clears the flag. Returns -EBUSY if the VF is
+ *       currently bound or if a LOAD blob is staged-but-unapplied
+ *       (the staged blob references IOVAs in this domain).
+ *     - The domain survives a VF unbind/rebind cycle. It is destroyed
+ *       implicitly when sriov_numvfs is dropped (the VF goes away) or
+ *       when the PF is unloaded. This avoids repeated
+ *       iommu_domain_alloc()/teardown across SAVE -> destroy -> create
+ *       -> LOAD cycles, which is the common case for HW-failure
+ *       recovery.
+ *
+ *   Returns 0 on success, -EINVAL if vf_id is out of range or @flags
+ *   has unknown bits, -EBUSY per the above, -ENODEV if the PF is
+ *   gone, -EOPNOTSUPP if the platform has no IOMMU coverage for the
+ *   VF's pci_dev (no IOMMU group, etc.).
+ */
+struct mlx5_vfmig_set_tracked {
+	__u32 vf_id;	/* in  */
+	__u32 enable;	/* in: 0 = detach domain + clear flag,
+			 *     1 = attach domain + set flag
+			 */
+	__u32 flags;	/* in: reserved, must be 0 */
+	__u32 reserved;
+};
+#define MLX5_VFMIG_IOC_SET_TRACKED \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x07, struct mlx5_vfmig_set_tracked)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

@@ -448,6 +448,112 @@ static long vfmig_ioc_enable_migratable(struct mlx5_vfmig_pf *vfmig,
 	return vfmig_set_vf_migratable(vfmig->pf_mdev, arg.vf_id);
 }
 
+/*
+ * Look up the pci_dev for VF @vf_id of @pf_pdev. Returns a refcounted
+ * pci_dev (caller must pci_dev_put()) or NULL if no such VF currently
+ * exists (e.g. sriov_numvfs has been dropped between the num_vfs
+ * check and now).
+ *
+ * We can't use pci_get_domain_bus_and_slot(pci_iov_virtfn_bus(),
+ * pci_iov_virtfn_devfn()) because pci_iov_virtfn_bus() is not exported
+ * to modules (only the ..._devfn variant is, see drivers/pci/iov.c).
+ * Walking the PCI device list and matching on (physfn, pci_iov_vf_id)
+ * sidesteps that and is O(num_pci_devs) on a slow ioctl path -- fine.
+ */
+static struct pci_dev *vfmig_get_vf_pdev(struct pci_dev *pf_pdev, u32 vf_id)
+{
+	struct pci_dev *iter = NULL;
+
+	for_each_pci_dev(iter) {
+		if (iter->is_virtfn &&
+		    iter->physfn == pf_pdev &&
+		    pci_iov_vf_id(iter) == (int)vf_id)
+			return iter;	/* for_each_pci_dev kept the ref */
+	}
+	return NULL;
+}
+
+/*
+ * MLX5_VFMIG_IOC_SET_TRACKED handler.
+ *
+ * Toggles the per-VF @vfmig_tracked flag on the PF's vfs_ctx[]. Today
+ * the flag has no probe-time consumers yet (mlx5_cmd_enable etc. will
+ * start reading it once the vfmig_iova module lands). Even so we
+ * enforce the eventual contract from day 1:
+ *
+ *   - VF must be currently unbound (no driver attached). We take the
+ *     VF pci_dev's device_lock to read ->dev.driver atomically with
+ *     the flag write; that's the same lock pci_device_probe / remove
+ *     take, so the flag and any future probe see consistent ordering.
+ *   - On enable=1: set flag. (Future: also allocate & attach the
+ *     per-VF unmanaged iommu_domain.)
+ *   - On enable=0: clear flag. (Future: also detach & free domain;
+ *     reject if a LOAD blob is staged-but-unapplied since the staged
+ *     blob references IOVAs in this domain.)
+ *
+ * Idempotent toggles (flag already in the requested state) are
+ * silent no-ops -- they don't even take device_lock or log.
+ */
+static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	struct mlx5_vfmig_set_tracked arg;
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	struct mlx5_vf_context *vfs_ctx;
+	struct pci_dev *vf_pdev;
+	bool desired;
+	int err = 0;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.flags || arg.reserved)
+		return -EINVAL;
+	if (arg.enable > 1)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	vfs_ctx = &sriov->vfs_ctx[arg.vf_id];
+	desired = (arg.enable == 1);
+
+	if (!!vfs_ctx->vfmig_tracked == desired) {
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: SET_TRACKED vf %u: already %d, no-op\n",
+			      arg.vf_id, desired);
+		return 0;
+	}
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u: VF pci_dev lookup failed\n",
+			       arg.vf_id);
+		return -ENODEV;
+	}
+
+	device_lock(&vf_pdev->dev);
+	if (vf_pdev->dev.driver) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u rejected: VF is bound to %s (must be unbound first)\n",
+			       arg.vf_id, vf_pdev->dev.driver->name);
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
+	vfs_ctx->vfmig_tracked = desired ? 1 : 0;
+	mlx5_core_info(pf_mdev,
+		       "vfmig: vf %u tracked=%d (iommu domain attach pending L0 module)\n",
+		       arg.vf_id, desired);
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
 static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 				    void __user *uarg)
 {
@@ -2057,6 +2163,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case MLX5_VFMIG_IOC_ENABLE_MIGRATABLE:
 		ret = vfmig_ioc_enable_migratable(vfmig, uarg);
 		break;
+	case MLX5_VFMIG_IOC_SET_TRACKED:
+		ret = vfmig_ioc_set_tracked(vfmig, uarg);
+		break;
 	default:
 		ret = -ENOTTY;
 		break;
@@ -2181,6 +2290,32 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 }
 
 /* -------- VF probe-time hook -------------------------------------------- */
+
+bool mlx5_vf_is_vfmig_tracked(struct mlx5_core_dev *dev)
+{
+	struct pci_dev *vf_pdev = dev->pdev;
+	struct mlx5_core_dev *pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	bool tracked = false;
+	int vf_id;
+
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return false;
+
+	vf_id = pci_iov_vf_id(vf_pdev);
+	if (vf_id < 0)
+		return false;
+
+	pf_mdev = mlx5_vf_get_core_dev(vf_pdev);
+	if (!pf_mdev)
+		return false;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (vf_id < sriov->num_vfs)
+		tracked = sriov->vfs_ctx[vf_id].vfmig_tracked;
+	mlx5_vf_put_core_dev(pf_mdev);
+	return tracked;
+}
 
 bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev, u16 *vhca_id_out)
 {

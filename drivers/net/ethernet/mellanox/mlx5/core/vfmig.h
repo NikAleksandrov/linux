@@ -74,6 +74,8 @@
 
 #include <linux/mlx5/driver.h>
 
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+
 int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev);
 
@@ -144,8 +146,49 @@ bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev, u16 *vhca_id_out)
  */
 int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev);
 
+/*
+ * Returns true iff @dev is a VF whose owning PF has SET_TRACKED { enable=1 }
+ * latched on the PF's vfs_ctx[vf_id]. Probe-time predicate consulted by
+ * host-side allocators (mlx5_cmd_enable, pages.c, ...) to decide whether
+ * to route through the deterministic IOVA allocator.
+ *
+ * Safe to call on any mlx5_core_dev: returns false on PFs and on VFs
+ * whose owning PF either has no /dev/mlx5_vfmig cdev or has not had
+ * SET_TRACKED issued for this slot. Internally takes
+ * mlx5_vf_get_core_dev() / mlx5_vf_put_core_dev() on the PF, so it must
+ * NOT be called while already holding the PF's intf_state_mutex.
+ */
+bool mlx5_vf_is_vfmig_tracked(struct mlx5_core_dev *dev);
+
 /* Module init/exit hooks for the cdev region. */
 int  mlx5_vfmig_module_init(void);
 void mlx5_vfmig_module_exit(void);
+
+#else /* !CONFIG_MLX5_VFMIG */
+
+/*
+ * Stubs for builds with vfmig compiled out. They make the symbol
+ * surface available unconditionally so callers in main.c / sriov.c
+ * stay free of #ifdef CONFIG_MLX5_VFMIG sprinkles.
+ *
+ * Semantically the stubs match "no VF was ever marked restored, no
+ * pending load was ever staged, no PF state ever existed", which is
+ * the correct null behaviour for a tree without the migration
+ * subsystem.
+ */
+static inline int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev) { return 0; }
+static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev) { }
+static inline void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev) { }
+static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev,
+						  u16 *vhca_id_out)
+{
+	return false;
+}
+static inline int  mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev) { return 0; }
+static inline bool mlx5_vf_is_vfmig_tracked(struct mlx5_core_dev *dev) { return false; }
+static inline int  mlx5_vfmig_module_init(void) { return 0; }
+static inline void mlx5_vfmig_module_exit(void) { }
+
+#endif /* CONFIG_MLX5_VFMIG */
 
 #endif /* __MLX5_CORE_VFMIG_H__ */
