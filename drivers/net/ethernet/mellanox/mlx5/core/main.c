@@ -1194,24 +1194,67 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 	mlx5_cmd_set_state(dev, MLX5_CMDIF_STATE_UP);
 
 	/*
-	 * Restored VF bring-up. The VHCA's firmware state (caps, ISSI
-	 * version, page allocations, INIT_HCA-equivalent state) was
-	 * already populated by the migration plumbing (MARK_RESTORED
-	 * via /dev/mlx5_vfmig). Re-issuing SET_ISSI / boot-pages /
-	 * INIT_HCA on top would mutate that state. Just enable the HCA
-	 * for the kernel's own command session, start health polling,
-	 * and let mlx5_function_open()'s post_init_hca path take over
-	 * for the cap query.
+	 * Restored VF bring-up.
+	 *
+	 * Order rationale (bisected on CX-7, FW 28.48.1000):
+	 *
+	 *   - LOAD_VHCA_STATE only works on a VHCA that has been
+	 *     enabled by the PF (during sriov_numvfs) and has had no
+	 *     other firmware command issued against it. Any pre-LOAD
+	 *     VHCA-side command -- ENABLE_HCA(function_id=0), SET_ISSI,
+	 *     MANAGE_PAGES (SATISFY_STARTUP_PAGES) or INIT_HCA --
+	 *     mutates VHCA state off the saved-blob shape and FW
+	 *     returns LOAD with bad parameter (syndrome 0x2c9bb0).
+	 *
+	 *   - LOAD_VHCA_STATE succeeds in the cleared state above, but
+	 *     the destination's own command interface is afterwards
+	 *     non-functional on a native (non-VFIO, non-VM) probe: FW
+	 *     silently drops commands on the destination's cmd ring
+	 *     because the blob captured the source's host-ownership
+	 *     view of that ring. ENABLE_HCA(self) issued post-LOAD
+	 *     also times out. This is the FW design constraint
+	 *     documented at the top of vfmig.h; resolving it requires
+	 *     deterministic IOVAs (i.e. an IOMMU) so the destination
+	 *     can reproduce the source's address layout.
+	 *
+	 * For now we still take the LOAD path so the SAVE+LOAD plumbing
+	 * is exercised end-to-end and the architectural finding stays
+	 * reproducible. We then attempt ENABLE_HCA(self) on the cleared-
+	 * VHCA cmd ring; on FW versions where the post-LOAD cmd ring is
+	 * dead, that times out and the bind fails -- which is the
+	 * correct loud failure to expose to userspace.
+	 *
+	 * SET_ISSI / SATISFY_STARTUP_PAGES / INIT_HCA stay skipped: the
+	 * blob already carries ISSI version, all VHCA pages and
+	 * INIT_HCA-equivalent state from the source.
 	 */
 	if (mlx5_vfmig_vf_consume_restored(dev, &restored_vhca_id)) {
 		restored = true;
 		if (restored_out)
 			*restored_out = true;
 
+		err = mlx5_vfmig_vf_apply_pending_load(dev);
+		if (err) {
+			mlx5_core_err(dev,
+				      "vfmig: apply LOAD_VHCA_STATE failed for vhca_id 0x%04x: %d\n",
+				      restored_vhca_id, err);
+			goto err_cmd_cleanup;
+		}
+
 		err = mlx5_core_enable_hca(dev, 0);
 		if (err) {
-			mlx5_core_err(dev, "enable hca failed\n");
-			goto err_cmd_cleanup;
+			/*
+			 * Any error here is informational: either FW
+			 * reports "already enabled" (LOAD restored a VHCA
+			 * the source had already brought up), or the
+			 * post-LOAD cmd ring is dead and this command
+			 * timed out. Either way, log and let the next
+			 * VHCA-targeted command (mlx5_query_hca_caps in
+			 * mlx5_function_open) surface the real state.
+			 */
+			mlx5_core_warn(dev,
+				       "vfmig: post-LOAD ENABLE_HCA(self) returned %d for vhca_id 0x%04x; continuing\n",
+				       err, restored_vhca_id);
 		}
 
 		mlx5_start_health_poll(dev);
@@ -1277,11 +1320,11 @@ static int mlx5_function_open(struct mlx5_core_dev *dev, bool restored)
 
 	/*
 	 * Restored VFs take a different bring-up path. Their entire VHCA
-	 * state (caps, pages, queues) was already populated by the
-	 * migration plumbing prior to probe. Skip every command that
-	 * would re-mutate VHCA state (set_hca_ctrl, set_hca_cap,
-	 * satisfy_startup_pages, INIT_HCA); mlx5_query_hca_caps still
-	 * runs so the kernel learns the post-restore cap layout.
+	 * state (caps, pages, queues) lives in the LOAD blob that was
+	 * already applied inside mlx5_function_enable. Skip every command
+	 * that would re-mutate VHCA state (set_hca_ctrl, set_hca_cap,
+	 * satisfy_startup_pages, INIT_HCA); mlx5_query_hca_caps still runs
+	 * so the kernel learns the post-restore cap layout.
 	 */
 	if (restored)
 		goto post_init_hca;
