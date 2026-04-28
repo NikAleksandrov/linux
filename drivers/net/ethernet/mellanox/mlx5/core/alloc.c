@@ -40,6 +40,7 @@
 #include <linux/mlx5/driver.h>
 
 #include "mlx5_core.h"
+#include "vfmig_iova.h"
 
 struct mlx5_db_pgdir {
 	struct list_head	list;
@@ -56,10 +57,51 @@ static void *mlx5_dma_zalloc_coherent_node(struct mlx5_core_dev *dev,
 					   size_t size, dma_addr_t *dma_handle,
 					   int node)
 {
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
 	struct device *device = mlx5_core_dma_dev(dev);
 	struct mlx5_priv *priv = &dev->priv;
 	int original_node;
 	void *cpu_handle;
+
+	if (vfmig_dom) {
+		/*
+		 * Tracked VF: route every coherent host buffer (EQ frag
+		 * pages, doorbell pages, anything else funneling through
+		 * this helper) through the per-VF deterministic IOVA
+		 * allocator. Same reasoning as the cmd ring (cmd.c) and
+		 * MANAGE_PAGES (pagealloc.c) hooks: dma_alloc_coherent on
+		 * the default DMA path is unusable while our unmanaged
+		 * IOMMU domain is attached, and FW would silently fault on
+		 * the first dereference -- which is exactly what we see at
+		 * CREATE_EQ on a tracked VF without this hook.
+		 *
+		 * NUMA hint: ignored on the vfmig path. vfmig_iova_alloc_
+		 * coherent uses alloc_pages() (no node hint), so we pay a
+		 * potential NUMA-locality cost to keep the deterministic-
+		 * IOVA invariant. EQ buffers are small and allocated once
+		 * per probe; the hit is negligible.
+		 *
+		 * The single-page-per-allocation cost vs dma_pool-style
+		 * sub-allocation is the same trade-off documented in
+		 * alloc_cmd_box: 4 GiB IOVA window, ~tens of allocations
+		 * here, well under 1 %% of the window.
+		 */
+		dma_addr_t iova;
+		void *vaddr;
+		int err;
+
+		err = vfmig_iova_alloc_coherent(vfmig_dom, size, GFP_KERNEL,
+						&iova, &vaddr);
+		if (err) {
+			mlx5_core_warn(dev,
+				       "vfmig: dma_zalloc_coherent_node: vfmig_iova_alloc_coherent(size=%zu): %d\n",
+				       size, err);
+			return NULL;
+		}
+		memset(vaddr, 0, size);
+		*dma_handle = iova;
+		return vaddr;
+	}
 
 	mutex_lock(&priv->alloc_mutex);
 	original_node = dev_to_node(device);
@@ -69,6 +111,27 @@ static void *mlx5_dma_zalloc_coherent_node(struct mlx5_core_dev *dev,
 	set_dev_node(device, original_node);
 	mutex_unlock(&priv->alloc_mutex);
 	return cpu_handle;
+}
+
+/*
+ * Symmetric release helper for buffers obtained via
+ * mlx5_dma_zalloc_coherent_node(). Dispatches to the per-VF IOVA
+ * allocator on tracked VFs, falls through to dma_free_coherent
+ * otherwise. Use this at every free site instead of calling
+ * dma_free_coherent() directly so the predicate stays in lockstep.
+ */
+static void mlx5_dma_free_coherent_node(struct mlx5_core_dev *dev,
+					size_t size, void *cpu_handle,
+					dma_addr_t dma_handle)
+{
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
+
+	if (vfmig_dom) {
+		vfmig_iova_free_coherent(vfmig_dom, dma_handle, size);
+		return;
+	}
+	dma_free_coherent(mlx5_core_dma_dev(dev), size, cpu_handle,
+			  dma_handle);
 }
 
 int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
@@ -93,8 +156,9 @@ int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
 		if (!frag->buf)
 			goto err_free_buf;
 		if (frag->map & ((1 << buf->page_shift) - 1)) {
-			dma_free_coherent(mlx5_core_dma_dev(dev), frag_sz,
-					  buf->frags[i].buf, buf->frags[i].map);
+			mlx5_dma_free_coherent_node(dev, frag_sz,
+						    buf->frags[i].buf,
+						    buf->frags[i].map);
 			mlx5_core_warn(dev, "unexpected map alignment: %pad, page_shift=%d\n",
 				       &frag->map, buf->page_shift);
 			goto err_free_buf;
@@ -106,8 +170,8 @@ int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
 
 err_free_buf:
 	while (i--)
-		dma_free_coherent(mlx5_core_dma_dev(dev), PAGE_SIZE, buf->frags[i].buf,
-				  buf->frags[i].map);
+		mlx5_dma_free_coherent_node(dev, PAGE_SIZE, buf->frags[i].buf,
+					    buf->frags[i].map);
 	kfree(buf->frags);
 err_out:
 	return -ENOMEM;
@@ -122,8 +186,8 @@ void mlx5_frag_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf)
 	for (i = 0; i < buf->npages; i++) {
 		int frag_sz = min_t(int, size, PAGE_SIZE);
 
-		dma_free_coherent(mlx5_core_dma_dev(dev), frag_sz, buf->frags[i].buf,
-				  buf->frags[i].map);
+		mlx5_dma_free_coherent_node(dev, frag_sz, buf->frags[i].buf,
+					    buf->frags[i].map);
 		size -= frag_sz;
 	}
 	kfree(buf->frags);
@@ -222,8 +286,9 @@ void mlx5_db_free(struct mlx5_core_dev *dev, struct mlx5_db *db)
 	__set_bit(db->index, db->u.pgdir->bitmap);
 
 	if (bitmap_full(db->u.pgdir->bitmap, db_per_page)) {
-		dma_free_coherent(mlx5_core_dma_dev(dev), PAGE_SIZE,
-				  db->u.pgdir->db_page, db->u.pgdir->db_dma);
+		mlx5_dma_free_coherent_node(dev, PAGE_SIZE,
+					    db->u.pgdir->db_page,
+					    db->u.pgdir->db_dma);
 		list_del(&db->u.pgdir->list);
 		bitmap_free(db->u.pgdir->bitmap);
 		kfree(db->u.pgdir);
