@@ -1436,11 +1436,57 @@ static int mlx5_copy_from_msg(void *to, struct mlx5_cmd_msg *from, int size)
 static struct mlx5_cmd_mailbox *alloc_cmd_box(struct mlx5_core_dev *dev,
 					      gfp_t flags)
 {
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
 	struct mlx5_cmd_mailbox *mailbox;
 
 	mailbox = kmalloc(sizeof(*mailbox), flags);
 	if (!mailbox)
 		return ERR_PTR(-ENOMEM);
+
+	if (vfmig_dom) {
+		/*
+		 * Tracked VF: route mailbox-block backing through the
+		 * per-VF deterministic IOVA allocator. dma_alloc_coherent
+		 * is unusable here because attaching our unmanaged IOMMU
+		 * domain leaves the device's *default* DMA domain stale
+		 * but still nominally selectable, so dma-iommu would hand
+		 * back IOVAs that don't translate in the actually-attached
+		 * domain. FW would then fault on every non-inline command
+		 * (e.g. QUERY_ISSI's 4 KiB output mailbox).
+		 *
+		 * Page-per-mailbox is wasteful by a factor of ~7x against
+		 * the 576-byte mlx5_cmd_prot_block size, but the cmd
+		 * cache's worst-case footprint (~3900 mailboxes from
+		 * cmd_cache_num_ent[]) is ~16 MiB -- well under 1 %% of
+		 * the 4 GiB IOVA window. Mailbox IOVAs do not need
+		 * source/destination determinism (mailboxes are per-cmd,
+		 * not referenced by FW between commands), so the bump-
+		 * only allocator's IOVA-leak-on-free is benign at this
+		 * layer; long-running workloads on tracked VFs would
+		 * eventually exhaust the window after ~1M command frees.
+		 * The structured slot store (R2 in the layered restore
+		 * plan) is the proper fix and lands before any real
+		 * production use.
+		 */
+		dma_addr_t iova;
+		void *vaddr;
+		int err;
+
+		err = vfmig_iova_alloc_coherent(vfmig_dom, PAGE_SIZE,
+						flags, &iova, &vaddr);
+		if (err) {
+			mlx5_core_dbg(dev,
+				      "vfmig: alloc_cmd_box: vfmig_iova_alloc_coherent: %d\n",
+				      err);
+			kfree(mailbox);
+			return ERR_PTR(err);
+		}
+		memset(vaddr, 0, PAGE_SIZE);
+		mailbox->buf = vaddr;
+		mailbox->dma = iova;
+		mailbox->next = NULL;
+		return mailbox;
+	}
 
 	mailbox->buf = dma_pool_zalloc(dev->cmd.pool, flags,
 				       &mailbox->dma);
@@ -1457,7 +1503,13 @@ static struct mlx5_cmd_mailbox *alloc_cmd_box(struct mlx5_core_dev *dev,
 static void free_cmd_box(struct mlx5_core_dev *dev,
 			 struct mlx5_cmd_mailbox *mailbox)
 {
-	dma_pool_free(dev->cmd.pool, mailbox->buf, mailbox->dma);
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
+
+	if (vfmig_dom) {
+		vfmig_iova_free_coherent(vfmig_dom, mailbox->dma, PAGE_SIZE);
+	} else {
+		dma_pool_free(dev->cmd.pool, mailbox->buf, mailbox->dma);
+	}
 	kfree(mailbox);
 }
 

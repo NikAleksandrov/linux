@@ -95,6 +95,52 @@ struct vfmig_wire_header {
 #define VFMIG_WIRE_TAG_STOP_COPY_SIZE	1
 #define VFMIG_WIRE_FLAGS_TAG_OPTIONAL	BIT(0)
 
+/*
+ * VFMIG_WIRE_TAG_HOST_PAGE
+ * ------------------------
+ * vfmig-private (intentionally outside the VFIO mlx5 tag namespace):
+ * carries a single deterministic-IOVA page snapshot from the source
+ * VF's vfmig_iova_domain into the destination VF's vfmig_iova_domain
+ * via vfmig_iova_replay_page(). One record per registry entry. SAVE
+ * emits these BEFORE the FW_DATA record so that on the destination
+ * side, by the time the FW_DATA record is staged into the
+ * pending_load slot, every IOVA the FW state references already maps
+ * to a populated page in the destination's domain. The destination
+ * VF probe's first vfmig_iova_alloc_coherent() will find the
+ * replayed entry at the cursor and reuse it, instead of allocating
+ * a fresh empty page.
+ *
+ * The tag value 0x4842 is "HB" (host-buffer); chosen well clear of
+ * the {0, 1} VFIO mlx5 tag range and intentionally NOT marked
+ * OPTIONAL: a HOST_PAGE-bearing blob fed to a parser that doesn't
+ * understand the tag should fail loudly via the "unknown mandatory
+ * tag" rule (-EOPNOTSUPP), because silently dropping the IOVA
+ * payload would mean a successful LOAD followed by a dead VHCA --
+ * the very failure mode the IOVA work exists to eliminate.
+ *
+ * On-wire layout per record:
+ *   [16 B] struct vfmig_wire_header { record_size, flags=0, tag=HOST_PAGE }
+ *   [16 B] struct vfmig_host_page_record { iova, len }
+ *   [len bytes] page contents, len % VFMIG_IOVA_GRANULE == 0
+ * with record_size = sizeof(struct vfmig_host_page_record) + len.
+ *
+ * Sanity cap on a single record's @len; records bigger than this are
+ * rejected by the LOAD parser. 16 MiB is far above any single
+ * registry entry the v1 layered restore plan emits (4 KiB cmd ring
+ * page on Layer 1; small contiguous blocks on Layer 2). Bump if a
+ * future layer legitimately needs larger atomic regions; for now,
+ * the cap is a defense-in-depth check so a malicious or corrupt
+ * blob can't kvmalloc the host out of memory before we even reach
+ * the IOVA-window range check.
+ */
+#define VFMIG_WIRE_TAG_HOST_PAGE	0x4842
+#define VFMIG_HOST_PAGE_MAX_LEN		(16ULL << 20)
+
+struct vfmig_host_page_record {
+	__le64 iova;
+	__le64 len;
+};
+
 /* Module-wide cdev region; one minor per PF mlx5_core. */
 static dev_t mlx5_vfmig_devt;
 static struct class *mlx5_vfmig_class;
@@ -178,6 +224,18 @@ enum vfmig_load_state {
 	VFMIG_LS_PREP_IMAGE,
 	VFMIG_LS_READ_IMAGE,
 	VFMIG_LS_LOAD_IMAGE,
+	/*
+	 * HOST_PAGE record sub-states. After dispatch_header reads the
+	 * 16-byte vfmig_wire_header and sees tag=HOST_PAGE, the parser:
+	 *   HP_READ_SUBHDR -> reads 16 more bytes (iova, len)
+	 *   HP_READ_DATA   -> reads @len bytes into a kvmalloc'd buffer
+	 *   HP_REPLAY      -> calls vfmig_iova_replay_page() against
+	 *                     the destination VF's domain, frees the
+	 *                     buffer, returns to READ_HEADER
+	 */
+	VFMIG_LS_HP_READ_SUBHDR,
+	VFMIG_LS_HP_READ_DATA,
+	VFMIG_LS_HP_REPLAY,
 };
 
 /*
@@ -236,6 +294,47 @@ struct mlx5_vfmig_load_ctx {
 	u64 record_size;	/* current record's payload size */
 	u32 record_tag;		/* current record's tag */
 	u64 record_skipped;	/* bytes consumed-and-discarded for this rec */
+
+	/*
+	 * HOST_PAGE replay state. @iova_dom is the destination VF's
+	 * deterministic IOVA domain, captured at LOAD-ioctl time from
+	 * sriov->vfs_ctx[vf_id].vfmig_iova_dom. NULL iff the user has
+	 * NOT issued SET_TRACKED { enable=1 } before LOAD; in that case
+	 * any incoming HOST_PAGE record is rejected with -EINVAL by the
+	 * parser dispatcher. The pointer's lifetime is governed by the
+	 * SET_TRACKED { enable=0 } / sriov_disable / pf_unbind contract:
+	 * all three teardown paths require the destination VF to be
+	 * unbound, and the LOAD ioctl is itself only useful while the
+	 * destination VF is unbound (binding it consumes the staged
+	 * blob), so the captured pointer is guaranteed live for the
+	 * fd's lifetime.
+	 *
+	 * Per-record sub-state (only meaningful while parser is in one
+	 * of the VFMIG_LS_HP_* states):
+	 *   hp_subhdr_buf    -- 16-byte vfmig_host_page_record being read
+	 *   hp_subhdr_filled -- bytes accumulated in @hp_subhdr_buf
+	 *   hp_iova / hp_len -- parsed from @hp_subhdr_buf at end of
+	 *                       HP_READ_SUBHDR
+	 *   hp_contents      -- kvmalloc'd payload buffer, sized @hp_len
+	 *   hp_filled        -- bytes accumulated in @hp_contents
+	 * @hp_contents is freed both on the happy REPLAY -> READ_HEADER
+	 * transition and unconditionally on fd close (handles partial
+	 * mid-record close).
+	 *
+	 * @cursor_reset_done is a once-per-fd latch ensuring the LOAD
+	 * release path calls vfmig_iova_reset_cursor() exactly once
+	 * before the staged FW_DATA blob gets handed off to the next VF
+	 * probe. Reset cannot happen earlier (the parser may still emit
+	 * more HOST_PAGE records, each of which advances the cursor).
+	 */
+	struct vfmig_iova_domain *iova_dom;
+	u8  hp_subhdr_buf[sizeof(struct vfmig_host_page_record)];
+	u32 hp_subhdr_filled;
+	u64 hp_iova;
+	u64 hp_len;
+	void *hp_contents;
+	u64 hp_filled;
+	bool cursor_reset_done;
 };
 
 static void vfmig_load_release_resources(struct mlx5_vfmig_load_ctx *ctx);
@@ -1182,6 +1281,27 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 	case VFMIG_WIRE_TAG_FW_DATA:
 		ctx->state = VFMIG_LS_PREP_IMAGE;
 		return 0;
+	case VFMIG_WIRE_TAG_HOST_PAGE:
+		/*
+		 * HOST_PAGE replays into the per-VF IOVA domain. If the
+		 * destination wasn't SET_TRACKED'd, there's nowhere to
+		 * replay to -- this is a userspace ordering bug (the
+		 * paired source must have been tracked, so the LOAD blob
+		 * carries IOVA payload, but the destination is bare DMA),
+		 * not something we can paper over silently.
+		 */
+		if (!ctx->iova_dom) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_PAGE record in blob but destination not SET_TRACKED'd; aborting LOAD\n",
+				       ctx->vf_id);
+			return -EINVAL;
+		}
+		if (record_size < sizeof(struct vfmig_host_page_record))
+			return -EINVAL;
+		ctx->hp_subhdr_filled = 0;
+		ctx->hp_filled = 0;
+		ctx->state = VFMIG_LS_HP_READ_SUBHDR;
+		return 0;
 	default:
 		if (!(flags & VFMIG_WIRE_FLAGS_TAG_OPTIONAL))
 			return -EOPNOTSUPP;
@@ -1296,6 +1416,106 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 		*progressed = n > 0;
 		if (ctx->record_skipped == ctx->record_size)
 			ctx->state = VFMIG_LS_READ_HEADER;
+		return 0;
+
+	case VFMIG_LS_HP_READ_SUBHDR: {
+		/*
+		 * Pull the 16-byte vfmig_host_page_record out of the
+		 * stream into ctx->hp_subhdr_buf, then parse iova/len
+		 * and kvmalloc a payload-sized buffer for HP_READ_DATA
+		 * to fill. The payload size MUST match what the record
+		 * header advertised: record_size = 16 + len.
+		 */
+		size_t need = sizeof(ctx->hp_subhdr_buf) - ctx->hp_subhdr_filled;
+		size_t take = min(need, *left);
+		struct vfmig_host_page_record subhdr;
+		u64 declared_payload;
+
+		if (take) {
+			if (copy_from_user(ctx->hp_subhdr_buf + ctx->hp_subhdr_filled,
+					   *ubuf, take))
+				return -EFAULT;
+			ctx->hp_subhdr_filled += take;
+			*ubuf += take;
+			*left -= take;
+			*progressed = true;
+		}
+		if (ctx->hp_subhdr_filled < sizeof(ctx->hp_subhdr_buf))
+			return 0;
+
+		memcpy(&subhdr, ctx->hp_subhdr_buf, sizeof(subhdr));
+		ctx->hp_iova = le64_to_cpu(subhdr.iova);
+		ctx->hp_len  = le64_to_cpu(subhdr.len);
+
+		declared_payload = ctx->record_size -
+				   sizeof(struct vfmig_host_page_record);
+		if (ctx->hp_len != declared_payload ||
+		    ctx->hp_len == 0 ||
+		    ctx->hp_len > VFMIG_HOST_PAGE_MAX_LEN ||
+		    !IS_ALIGNED(ctx->hp_len, VFMIG_IOVA_GRANULE) ||
+		    !IS_ALIGNED(ctx->hp_iova, VFMIG_IOVA_GRANULE)) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: malformed HOST_PAGE record iova=0x%llx len=%llu (rec=%llu, max=%llu)\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hp_iova,
+				       (unsigned long long)ctx->hp_len,
+				       (unsigned long long)ctx->record_size,
+				       (unsigned long long)VFMIG_HOST_PAGE_MAX_LEN);
+			return -EINVAL;
+		}
+
+		ctx->hp_contents = kvmalloc(ctx->hp_len, GFP_KERNEL);
+		if (!ctx->hp_contents)
+			return -ENOMEM;
+		ctx->hp_filled = 0;
+		ctx->state = VFMIG_LS_HP_READ_DATA;
+		*progressed = true;
+		return 0;
+	}
+
+	case VFMIG_LS_HP_READ_DATA: {
+		size_t need = ctx->hp_len - ctx->hp_filled;
+		size_t take = min(need, *left);
+
+		if (!take) {
+			if (ctx->hp_filled == ctx->hp_len)
+				ctx->state = VFMIG_LS_HP_REPLAY;
+			else
+				*progressed = false;
+			return 0;
+		}
+		if (copy_from_user((u8 *)ctx->hp_contents + ctx->hp_filled,
+				   *ubuf, take))
+			return -EFAULT;
+		ctx->hp_filled += take;
+		*ubuf += take;
+		*left -= take;
+		*progressed = true;
+		if (ctx->hp_filled == ctx->hp_len)
+			ctx->state = VFMIG_LS_HP_REPLAY;
+		return 0;
+	}
+
+	case VFMIG_LS_HP_REPLAY:
+		err = vfmig_iova_replay_page(ctx->iova_dom, ctx->hp_iova,
+					     ctx->hp_contents, ctx->hp_len);
+		kvfree(ctx->hp_contents);
+		ctx->hp_contents = NULL;
+		if (err) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: replay_page(iova=0x%llx, len=%llu) failed: %d\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hp_iova,
+				       (unsigned long long)ctx->hp_len, err);
+			return err;
+		}
+		mlx5_core_dbg(ctx->vfmig->pf_mdev,
+			      "vfmig: vf %u: replayed HOST_PAGE iova=0x%llx len=%llu\n",
+			      ctx->vf_id,
+			      (unsigned long long)ctx->hp_iova,
+			      (unsigned long long)ctx->hp_len);
+		ctx->state = VFMIG_LS_READ_HEADER;
+		*progressed = true;
 		return 0;
 	}
 	return -EINVAL;
@@ -1523,13 +1743,46 @@ static int vfmig_load_release(struct inode *inode, struct file *filp)
 	struct mlx5_vfmig_pf *vfmig = ctx->vfmig;
 
 	/*
+	 * Free any HOST_PAGE payload buffer that was mid-record at close
+	 * time (the parser allocates it in HP_READ_SUBHDR and frees it
+	 * on the HP_REPLAY -> READ_HEADER transition; close() between
+	 * those two states would otherwise leak the kvmalloc'd buffer).
+	 * Safe outside vfmig->lock: hp_contents is purely ctx-local.
+	 */
+	if (ctx->hp_contents) {
+		kvfree(ctx->hp_contents);
+		ctx->hp_contents = NULL;
+	}
+
+	/*
 	 * Tear down firmware-tied resources while pf_mdev is still alive.
 	 * If the PF has already been unbound (dead), pf_cleanup() did the
 	 * teardown synchronously and resources_freed is already set.
 	 */
 	down_read(&vfmig->lock);
-	if (!vfmig->dead)
+	if (!vfmig->dead) {
 		vfmig_load_release_resources(ctx);
+		/*
+		 * Reset the deterministic IOVA cursor exactly once before
+		 * the staged blob is consumed by the next VF probe. Replay
+		 * advanced the cursor to (highest_iova + len) so subsequent
+		 * vfmig_iova_alloc_coherent() calls would otherwise hand
+		 * out fresh (post-replay) IOVAs instead of finding the
+		 * replayed entries via lookup-at-cursor. Done here under
+		 * vfmig->lock-read so dom can't be torn down from
+		 * SET_TRACKED { enable=0 } in parallel; ctx->iova_dom was
+		 * captured at LOAD-ioctl time and outlives the fd by the
+		 * lifetime contract documented on the field.
+		 *
+		 * Idempotent via cursor_reset_done so a double-release
+		 * (impossible in practice but cheap to guard) doesn't
+		 * scramble the cursor of an unrelated subsequent SET_TRACKED.
+		 */
+		if (ctx->iova_dom && !ctx->cursor_reset_done) {
+			vfmig_iova_reset_cursor(ctx->iova_dom);
+			ctx->cursor_reset_done = true;
+		}
+	}
 	up_read(&vfmig->lock);
 
 	mutex_lock(&vfmig->ctxs_lock);
@@ -1603,6 +1856,18 @@ static long vfmig_ioc_load_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	ctx->vf_id = arg.vf_id;
 	ctx->vhca_id = vhca_id;
 	ctx->state = VFMIG_LS_READ_HEADER;
+
+	/*
+	 * Capture the destination VF's IOVA domain handle (if any) so
+	 * the parser can replay HOST_PAGE records into it. The pointer
+	 * is stable for the fd's lifetime: SET_TRACKED { enable=0 },
+	 * sriov_disable, and PF unbind all require the destination VF to
+	 * be unbound, and binding the VF is what consumes the staged
+	 * blob -- i.e. the VF can't be bound while this fd is active.
+	 * NULL is fine and means "untracked destination, HOST_PAGE
+	 * records will be rejected by the parser as a config error".
+	 */
+	ctx->iova_dom = vfmig->pf_mdev->priv.sriov.vfs_ctx[arg.vf_id].vfmig_iova_dom;
 
 	/*
 	 * Claim the vf_id slot first so the dup check + list_add are
@@ -1714,8 +1979,38 @@ struct mlx5_vfmig_save_ctx {
 	u64 image_size;
 
 	/*
-	 * Read cursor in bytes covering [0..16) header + [16..16+image_size)
-	 * payload. Updated under io_lock.
+	 * HOST_PAGE prefix buffer. Built once at SAVE-ioctl time by
+	 * snapshotting the source VF's vfmig_iova_domain registry into a
+	 * contiguous kvmalloc'd buffer of fully-formed wire records, so
+	 * vfmig_save_drain() can stream it out alongside the FW_DATA
+	 * payload without a second registry walk under DMA-coherent
+	 * pressure. NULL if the source VF was untracked at SAVE time;
+	 * @host_pages_size is then 0 and the wire stream contains only
+	 * the FW_DATA record (i.e. byte-identical to the pre-L1 stream
+	 * shape).
+	 *
+	 * Each record on disk is:
+	 *   16 B vfmig_wire_header (record_size, flags=0, tag=HOST_PAGE)
+	 *   16 B vfmig_host_page_record (iova, len)
+	 *   len  bytes of page contents
+	 *
+	 * Captured eagerly (rather than streamed lazily during
+	 * read()) because (a) it's small -- Layer 1 produces ~4 KiB
+	 * total, Layer 2 maybe ~MB -- and (b) it lets vfmig_save_drain
+	 * remain a simple byte-cursor walk instead of a state machine.
+	 */
+	void *host_pages_buf;
+	u64 host_pages_size;
+
+	/*
+	 * Read cursor in bytes covering the concatenation:
+	 *   [0..host_pages_size)
+	 *       HOST_PAGE records snapshotted from the IOVA domain
+	 *   [host_pages_size..host_pages_size + 16)
+	 *       FW_DATA wire header
+	 *   [host_pages_size + 16..host_pages_size + 16 + image_size)
+	 *       FW state payload from image_pages[]
+	 * Updated under io_lock.
 	 */
 	u64 read_pos;
 };
@@ -1747,31 +2042,152 @@ static void vfmig_save_build_header(struct mlx5_vfmig_save_ctx *ctx,
 }
 
 /*
- * Drain into @ubuf for one read(). Reads compose the 16-byte FW_DATA
- * header (read_pos < HDR_SZ) followed by image_size bytes from the
- * staging pages. EOF is read_pos == HDR_SZ + image_size. Caller holds
- * vfmig->lock for read AND ctx->io_lock; pf_mdev must be alive (used
- * only via the page list, which is mdev-independent, so this remains
- * safe even if vfmig->dead -- but we still bail early on dead).
+ * Pass-1 callback for vfmig_iova_for_each: just sum each entry's
+ * on-wire footprint into @ctx so vfmig_save_build_host_pages_buf can
+ * size the kvmalloc.
+ */
+struct vfmig_save_hp_size_ctx {
+	u64 total;
+};
+
+static int vfmig_save_hp_count_cb(dma_addr_t iova, const void *vaddr,
+				  size_t len, void *ctx)
+{
+	struct vfmig_save_hp_size_ctx *sc = ctx;
+
+	(void)iova;
+	(void)vaddr;
+	sc->total += sizeof(struct vfmig_wire_header) +
+		     sizeof(struct vfmig_host_page_record) + len;
+	return 0;
+}
+
+/*
+ * Pass-2 callback: serialize one HOST_PAGE record into the buffer
+ * pointed to by @ctx->cursor and advance the cursor.
+ */
+struct vfmig_save_hp_emit_ctx {
+	u8 *buf;
+	u64 capacity;
+	u64 cursor;
+};
+
+static int vfmig_save_hp_emit_cb(dma_addr_t iova, const void *vaddr,
+				 size_t len, void *ctx)
+{
+	struct vfmig_save_hp_emit_ctx *ec = ctx;
+	struct vfmig_wire_header hdr;
+	struct vfmig_host_page_record sub;
+	u64 record_size = sizeof(sub) + len;
+	u64 need = sizeof(hdr) + record_size;
+
+	if (ec->cursor + need > ec->capacity)
+		return -EOVERFLOW;
+
+	hdr.record_size = cpu_to_le64(record_size);
+	hdr.flags	= 0;
+	hdr.tag		= cpu_to_le32(VFMIG_WIRE_TAG_HOST_PAGE);
+	memcpy(ec->buf + ec->cursor, &hdr, sizeof(hdr));
+	ec->cursor += sizeof(hdr);
+
+	sub.iova = cpu_to_le64(iova);
+	sub.len  = cpu_to_le64(len);
+	memcpy(ec->buf + ec->cursor, &sub, sizeof(sub));
+	ec->cursor += sizeof(sub);
+
+	memcpy(ec->buf + ec->cursor, vaddr, len);
+	ec->cursor += len;
+	return 0;
+}
+
+/*
+ * Snapshot the source VF's vfmig_iova_domain registry into a
+ * contiguous wire-format buffer of HOST_PAGE records, owned by
+ * @ctx->host_pages_buf and sized by @ctx->host_pages_size. NULL
+ * domain (untracked source) leaves both fields zero and the wire
+ * stream is byte-identical to pre-L1 (just a single FW_DATA record).
+ *
+ * Two-pass: size, then fill. This is racier than walking once with
+ * a growable buffer, but vfmig_iova_for_each takes the domain mutex
+ * each call which would have to release-and-reacquire to grow under
+ * GFP_KERNEL anyway. The cost is two registry walks at a moment
+ * when the source VF is SUSPEND_VHCA'd (so no concurrent allocs).
+ */
+static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
+					   struct vfmig_iova_domain *dom)
+{
+	struct vfmig_save_hp_size_ctx sc = {};
+	struct vfmig_save_hp_emit_ctx ec;
+	int err;
+
+	if (!dom)
+		return 0;
+
+	err = vfmig_iova_for_each(dom, vfmig_save_hp_count_cb, &sc);
+	if (err)
+		return err;
+	if (!sc.total)
+		return 0;
+
+	ctx->host_pages_buf = kvmalloc(sc.total, GFP_KERNEL);
+	if (!ctx->host_pages_buf)
+		return -ENOMEM;
+
+	ec.buf	    = ctx->host_pages_buf;
+	ec.capacity = sc.total;
+	ec.cursor   = 0;
+	err = vfmig_iova_for_each(dom, vfmig_save_hp_emit_cb, &ec);
+	if (err) {
+		kvfree(ctx->host_pages_buf);
+		ctx->host_pages_buf = NULL;
+		return err;
+	}
+	if (WARN_ON(ec.cursor != sc.total)) {
+		kvfree(ctx->host_pages_buf);
+		ctx->host_pages_buf = NULL;
+		return -EIO;
+	}
+	ctx->host_pages_size = sc.total;
+	return 0;
+}
+
+/*
+ * Drain into @ubuf for one read(). Wire layout is the concatenation:
+ *
+ *   [0..host_pages_size)
+ *       HOST_PAGE prefix records, snapshotted at SAVE-ioctl time
+ *       from the source VF's vfmig_iova_domain. Empty if the source
+ *       was untracked.
+ *   [host_pages_size..host_pages_size + 16)
+ *       16-byte FW_DATA wire header.
+ *   [host_pages_size + 16..host_pages_size + 16 + image_size)
+ *       FW state payload from image_pages[], one PAGE_SIZE chunk
+ *       at a time.
+ *
+ * EOF is total. Caller holds vfmig->lock for read AND ctx->io_lock;
+ * pf_mdev must be alive (only used transitively via the kmap of
+ * image_pages, which is mdev-independent, so this remains safe even
+ * if vfmig->dead -- the early bail happens in vfmig_save_read).
  */
 static ssize_t vfmig_save_drain(struct mlx5_vfmig_save_ctx *ctx,
 				char __user *ubuf, size_t count)
 {
+	const u64 HP_SZ  = ctx->host_pages_size;
 	const u64 HDR_SZ = sizeof(struct vfmig_wire_header);
-	u64 total = HDR_SZ + ctx->image_size;
+	const u64 FW_OFF = HP_SZ + HDR_SZ;
+	const u64 total  = FW_OFF + ctx->image_size;
 	size_t copied = 0;
 	ssize_t err = 0;
 
 	if (ctx->read_pos >= total)
 		return 0;
 
-	/* Header bytes first. */
-	if (ctx->read_pos < HDR_SZ && count) {
-		struct vfmig_wire_header hdr;
-		size_t want = min_t(size_t, count, HDR_SZ - ctx->read_pos);
+	/* Section A: HOST_PAGE prefix bytes. */
+	if (ctx->read_pos < HP_SZ && count) {
+		size_t want = min_t(size_t, count, HP_SZ - ctx->read_pos);
 
-		vfmig_save_build_header(ctx, &hdr);
-		if (copy_to_user(ubuf, ((u8 *)&hdr) + ctx->read_pos, want))
+		if (copy_to_user(ubuf, (u8 *)ctx->host_pages_buf + ctx->read_pos,
+				 want))
 			return -EFAULT;
 		ctx->read_pos += want;
 		ubuf += want;
@@ -1779,9 +2195,24 @@ static ssize_t vfmig_save_drain(struct mlx5_vfmig_save_ctx *ctx,
 		copied += want;
 	}
 
-	/* Then payload bytes. */
+	/* Section B: FW_DATA wire header. */
+	if (ctx->read_pos >= HP_SZ && ctx->read_pos < FW_OFF && count) {
+		struct vfmig_wire_header hdr;
+		u64 hoff = ctx->read_pos - HP_SZ;
+		size_t want = min_t(size_t, count, HDR_SZ - hoff);
+
+		vfmig_save_build_header(ctx, &hdr);
+		if (copy_to_user(ubuf, ((u8 *)&hdr) + hoff, want))
+			return copied ? (ssize_t)copied : -EFAULT;
+		ctx->read_pos += want;
+		ubuf += want;
+		count -= want;
+		copied += want;
+	}
+
+	/* Section C: FW data payload pages. */
 	while (count && ctx->read_pos < total) {
-		u64 payload_off = ctx->read_pos - HDR_SZ;
+		u64 payload_off = ctx->read_pos - FW_OFF;
 		u32 page_idx = payload_off >> PAGE_SHIFT;
 		size_t page_off = payload_off & (PAGE_SIZE - 1);
 		size_t want = min3((size_t)(total - ctx->read_pos), count,
@@ -1848,6 +2279,17 @@ static void vfmig_save_release_resources(struct mlx5_vfmig_save_ctx *ctx)
 	if (ctx->resources_freed)
 		return;
 	ctx->resources_freed = true;
+
+	/*
+	 * host_pages_buf is purely host memory, owned by ctx, with no
+	 * dependence on pf_mdev being alive. Drop it eagerly so the
+	 * pf_mdev==NULL early-bail below doesn't strand it.
+	 */
+	if (ctx->host_pages_buf) {
+		kvfree(ctx->host_pages_buf);
+		ctx->host_pages_buf = NULL;
+		ctx->host_pages_size = 0;
+	}
 
 	if (!pf_mdev)
 		return;
@@ -2087,6 +2529,29 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	}
 	ctx->image_size = actual_size;
 
+	/*
+	 * Snapshot the source VF's deterministic-IOVA registry into a
+	 * HOST_PAGE prefix buffer. Done here, after SUSPEND_VHCA and
+	 * before user-visible read()s start, so the snapshot is
+	 * coherent with the FW state captured by SAVE_VHCA_STATE: both
+	 * reflect the VHCA at the same quiesced point.
+	 *
+	 * vfs_ctx[].vfmig_iova_dom is read under vfmig->lock-read (held
+	 * by the ioctl dispatcher); SET_TRACKED { enable=0 } can't free
+	 * it concurrently because the source VF is currently bound (it
+	 * has to be, for SAVE_VHCA_STATE to make sense), and SET_TRACKED
+	 * rejects toggles on bound VFs with -EBUSY. NULL domain is fine
+	 * and yields a zero-byte prefix (legacy single-FW_DATA stream).
+	 */
+	err = vfmig_save_build_host_pages_buf(ctx,
+		sriov->vfs_ctx[arg.vf_id].vfmig_iova_dom);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u: build_host_pages_buf failed: %d\n",
+			       arg.vf_id, err);
+		goto err_save;
+	}
+
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
 		err = fd;
@@ -2124,6 +2589,18 @@ err_copy:
 err_anon:
 	put_unused_fd(fd);
 err_save:
+	/*
+	 * host_pages_buf may or may not have been built by this point
+	 * (depends on which goto err_save brought us here). kvfree(NULL)
+	 * is a no-op, so the unconditional drop is correct for both the
+	 * pre-build error gotos (save_vhca_state failure, size check
+	 * failure) and the post-build ones (get_unused_fd / anon_inode
+	 * failure). Without this the post-build paths would leak the
+	 * snapshot buffer on the unwind.
+	 */
+	kvfree(ctx->host_pages_buf);
+	ctx->host_pages_buf = NULL;
+	ctx->host_pages_size = 0;
 	if (ctx->image_mkey_created) {
 		mlx5_core_destroy_mkey(pf_mdev, ctx->image_mkey);
 		ctx->image_mkey_created = false;

@@ -115,34 +115,54 @@ struct vfmig_iova_domain;
 /*
  * IOVA window layout (host-virtual addresses the hardware sees).
  *
- *   VFMIG_IOVA_BASE        -- per-domain base. Picked so that
- *                             [BASE, BASE + N * PER_VF) sits
- *                             comfortably above the dma-iommu
- *                             allocator's reach (which on x86 tops
- *                             out around dma_get_required_mask(),
- *                             typically 32- or 39-bit) but well
- *                             *below* every IOMMU geometry aperture
- *                             we expect to encounter. The latter is
- *                             the load-bearing constraint:
- *                             iommu_paging_domain_alloc() returns a
- *                             domain whose geometry.aperture_end is
- *                             determined by the underlying IOMMU's
- *                             address-width (typically 48 bits on
- *                             Intel VT-d, 48 or 52 on AMD-Vi /
- *                             newer Intel with 5-level IOMMU paging),
+ *   VFMIG_IOVA_BASE        -- per-PF base. The window
+ *                             [BASE, BASE + N * PER_VF) must fit
+ *                             entirely inside the IOMMU's geometry
+ *                             aperture: iommu_paging_domain_alloc()
+ *                             returns a domain whose
+ *                             geometry.aperture_end is set by the
+ *                             underlying hardware's address width,
  *                             and iommu_map() returns -ERANGE for
- *                             any IOVA outside it.
- *                             1 TiB (2^40) is a sweet spot: ~1000x
- *                             above any plausible required_mask and
- *                             ~256x below the smallest plausible
- *                             aperture. Validated at create time
- *                             against the actual geometry; if a
- *                             future platform reports a smaller
- *                             aperture, vfmig_iova_domain_create()
- *                             will fail cleanly with -EOPNOTSUPP.
- *                             VFs are individually addressed, so the
- *                             base is identical across VFs of the
- *                             same PF.
+ *                             any IOVA outside that range. Real-
+ *                             world apertures observed:
+ *                                Intel VT-d agaw=2  -> 39-bit
+ *                                                     ([0, 0x7fffffffff])
+ *                                Intel VT-d agaw=3  -> 48-bit
+ *                                AMD-Vi             -> 48 or 52-bit
+ *                             We pick the floor of those (39 bits)
+ *                             as the binding constraint.
+ *
+ *                             4 GiB (2^32) is the chosen base:
+ *                                - safely above any 32-bit-only
+ *                                  device's dma_mask range, which
+ *                                  doesn't actually matter because
+ *                                  our unmanaged domain *replaces*
+ *                                  the default DMA domain on attach
+ *                                  (there is no co-tenancy), but
+ *                                  keeps IOVAs visually distinct
+ *                                  from anything the default
+ *                                  allocator would have produced;
+ *                                - leaves IOVA 0..4 GiB free for any
+ *                                  "sentinel zero" or low-address
+ *                                  semantics future code might want;
+ *                                - lets us pack ~126 VFs of 4 GiB
+ *                                  each before brushing the 39-bit
+ *                                  aperture ceiling, comfortably
+ *                                  more than any single-PF VF count
+ *                                  we plan to test.
+ *
+ *                             VFs of the same PF get distinct sub-
+ *                             windows (BASE + vf_id * PER_VF) so
+ *                             that an IOVA value alone identifies
+ *                             which VF it belongs to in dmesg.
+ *
+ *                             vfmig_iova_domain_create() validates
+ *                             the chosen window against the live
+ *                             aperture and fails the SET_TRACKED
+ *                             ioctl with -EOPNOTSUPP (and a printed
+ *                             diagnostic) if a future platform
+ *                             reports something even tighter than
+ *                             39 bits.
  *   VFMIG_IOVA_PER_VF      -- 4 GB of IOVA space per VF. Plenty of
  *                             room for cmd ring + MANAGE_PAGES + EQs
  *                             + UARs at typical sizes; we'll add
@@ -152,7 +172,7 @@ struct vfmig_iova_domain;
  *                             PAGE_SIZE; mlx5 hardware page size is
  *                             also 4 KB.
  */
-#define VFMIG_IOVA_BASE		0x10000000000ULL	/* 1 TiB */
+#define VFMIG_IOVA_BASE		0x100000000ULL		/* 4 GiB */
 #define VFMIG_IOVA_PER_VF	0x100000000ULL		/* 4 GiB */
 #define VFMIG_IOVA_GRANULE	PAGE_SIZE
 
