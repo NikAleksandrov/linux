@@ -469,6 +469,20 @@ struct mlx5_vf_context {
 	 */
 	u8	port_guid_valid:1;
 	u8	node_guid_valid:1;
+	/*
+	 * Set by /dev/mlx5_vfmig MARK_RESTORED ioctl on the PF mdev. Read
+	 * (and consumed) by the next mlx5_core probe of this VF in
+	 * mlx5_function_enable(), which uses it to skip SET_ISSI /
+	 * SATISFY_STARTUP_PAGES / INIT_HCA so that firmware state
+	 * previously installed by the migration plumbing survives.
+	 * @restored_vhca_id is captured at MARK_RESTORED time via
+	 * QUERY_HCA_CAP(other_function=1) and surfaced in the probe-time
+	 * log so that the VF-side message can identify the firmware vHCA
+	 * by id rather than just BDF (the BDF is already in the dev_info
+	 * prefix). See drivers/net/ethernet/mellanox/mlx5/core/vfmig.c.
+	 */
+	u8	restored:1;
+	u16	restored_vhca_id;
 	enum port_state_policy	policy;
 	struct blocking_notifier_head notifier;
 };

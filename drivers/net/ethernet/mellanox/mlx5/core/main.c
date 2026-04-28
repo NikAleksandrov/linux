@@ -1153,9 +1153,15 @@ static void mlx5_cleanup_once(struct mlx5_core_dev *dev)
 	mlx5_devcom_unregister_device(dev->priv.devc);
 }
 
-static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeout)
+static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeout,
+				bool *restored_out)
 {
+	u16 restored_vhca_id = 0;
+	bool restored = false;
 	int err;
+
+	if (restored_out)
+		*restored_out = false;
 
 	mlx5_core_info(dev, "firmware version: %d.%d.%d\n", fw_rev_maj(dev),
 		       fw_rev_min(dev), fw_rev_sub(dev));
@@ -1186,6 +1192,35 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 
 	dev->caps.embedded_cpu = mlx5_read_embedded_cpu(dev);
 	mlx5_cmd_set_state(dev, MLX5_CMDIF_STATE_UP);
+
+	/*
+	 * Restored VF bring-up. The VHCA's firmware state (caps, ISSI
+	 * version, page allocations, INIT_HCA-equivalent state) was
+	 * already populated by the migration plumbing (MARK_RESTORED
+	 * via /dev/mlx5_vfmig). Re-issuing SET_ISSI / boot-pages /
+	 * INIT_HCA on top would mutate that state. Just enable the HCA
+	 * for the kernel's own command session, start health polling,
+	 * and let mlx5_function_open()'s post_init_hca path take over
+	 * for the cap query.
+	 */
+	if (mlx5_vfmig_vf_consume_restored(dev, &restored_vhca_id)) {
+		restored = true;
+		if (restored_out)
+			*restored_out = true;
+
+		err = mlx5_core_enable_hca(dev, 0);
+		if (err) {
+			mlx5_core_err(dev, "enable hca failed\n");
+			goto err_cmd_cleanup;
+		}
+
+		mlx5_start_health_poll(dev);
+
+		mlx5_core_info(dev,
+			       "vfmig: VF (vhca_id 0x%04x) restored; SET_ISSI/boot-pages/INIT_HCA skipped\n",
+			       restored_vhca_id);
+		return 0;
+	}
 
 	err = mlx5_core_enable_hca(dev, 0);
 	if (err) {
@@ -1236,9 +1271,20 @@ static void mlx5_function_disable(struct mlx5_core_dev *dev, bool boot)
 	mlx5_cmd_disable(dev);
 }
 
-static int mlx5_function_open(struct mlx5_core_dev *dev)
+static int mlx5_function_open(struct mlx5_core_dev *dev, bool restored)
 {
 	int err;
+
+	/*
+	 * Restored VFs take a different bring-up path. Their entire VHCA
+	 * state (caps, pages, queues) was already populated by the
+	 * migration plumbing prior to probe. Skip every command that
+	 * would re-mutate VHCA state (set_hca_ctrl, set_hca_cap,
+	 * satisfy_startup_pages, INIT_HCA); mlx5_query_hca_caps still
+	 * runs so the kernel learns the post-restore cap layout.
+	 */
+	if (restored)
+		goto post_init_hca;
 
 	err = set_hca_ctrl(dev);
 	if (err) {
@@ -1264,6 +1310,7 @@ static int mlx5_function_open(struct mlx5_core_dev *dev)
 		return err;
 	}
 
+post_init_hca:
 	mlx5_set_driver_version(dev);
 
 	err = mlx5_query_hca_caps(dev);
@@ -1290,13 +1337,14 @@ static int mlx5_function_close(struct mlx5_core_dev *dev)
 
 static int mlx5_function_setup(struct mlx5_core_dev *dev, bool boot, u64 timeout)
 {
+	bool restored = false;
 	int err;
 
-	err = mlx5_function_enable(dev, boot, timeout);
+	err = mlx5_function_enable(dev, boot, timeout, &restored);
 	if (err)
 		return err;
 
-	err = mlx5_function_open(dev);
+	err = mlx5_function_open(dev, restored);
 	if (err)
 		mlx5_function_disable(dev, boot);
 	return err;
@@ -1708,7 +1756,7 @@ int mlx5_init_one_light(struct mlx5_core_dev *dev)
 	devl_lock(devlink);
 	devl_register(devlink);
 	dev->state = MLX5_DEVICE_STATE_UP;
-	err = mlx5_function_enable(dev, true, mlx5_tout_ms(dev, FW_PRE_INIT_TIMEOUT));
+	err = mlx5_function_enable(dev, true, mlx5_tout_ms(dev, FW_PRE_INIT_TIMEOUT), NULL);
 	if (err) {
 		mlx5_core_warn(dev, "mlx5_function_enable err=%d\n", err);
 		goto out;

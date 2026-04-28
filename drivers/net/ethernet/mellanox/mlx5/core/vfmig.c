@@ -37,9 +37,14 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pci.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/mlx5/device.h>
 #include <linux/mlx5/driver.h>
+#include <linux/mlx5/mlx5_ifc.h>
+#include <linux/mlx5/vport.h>
 #include <uapi/linux/mlx5_vfmig.h>
 
 #include "mlx5_core.h"
@@ -80,6 +85,241 @@ static void vfmig_pf_put(struct mlx5_vfmig_pf *vfmig)
 	kref_put(&vfmig->kref, vfmig_pf_release);
 }
 
+/* -------- ioctl handlers ------------------------------------------------- */
+
+/*
+ * QUERY_HCA_CAP(other_function=1) - PF-side query of a VF's vhca_id.
+ * Mirrors mlx5vf_cmd_get_vhca_id() in drivers/vfio/pci/mlx5/cmd.c.
+ *
+ * TODO(vfmig-dedup): hoist into mlx5_core proper and let the VFIO variant
+ * call it instead of carrying its own copy.
+ */
+static int vfmig_query_vhca_id(struct mlx5_core_dev *pf_mdev,
+			       u16 function_id, u16 *vhca_id)
+{
+	u32 in[MLX5_ST_SZ_DW(query_hca_cap_in)] = {};
+	void *out;
+	int out_size;
+	int ret;
+
+	out_size = MLX5_ST_SZ_BYTES(query_hca_cap_out);
+	out = kzalloc(out_size, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	MLX5_SET(query_hca_cap_in, in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
+	MLX5_SET(query_hca_cap_in, in, other_function, 1);
+	MLX5_SET(query_hca_cap_in, in, function_id, function_id);
+	MLX5_SET(query_hca_cap_in, in, op_mod,
+		 MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE << 1 |
+		 HCA_CAP_OPMOD_GET_CUR);
+
+	ret = mlx5_cmd_exec_inout(pf_mdev, query_hca_cap, in, out);
+	if (ret)
+		goto out;
+
+	*vhca_id = MLX5_GET(query_hca_cap_out, out,
+			    capability.cmd_hca_cap.vhca_id);
+out:
+	kfree(out);
+	return ret;
+}
+
+/*
+ * Gating capabilities for SUSPEND/SAVE/LOAD/RESUME on a VF. The PF mdev
+ * itself must report both `migration` and `vhca_resource_manager` --
+ * matches what mlx5_devlink_port_fn_migratable_set checks before
+ * letting userspace flip the per-VF migratable bit. Returns 0 if
+ * supported, -EOPNOTSUPP otherwise (with a one-line warn).
+ */
+static int vfmig_check_pf_migration_caps(struct mlx5_core_dev *pf_mdev)
+{
+	if (!MLX5_CAP_GEN(pf_mdev, migration)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: PF firmware does not advertise migration capability\n");
+		return -EOPNOTSUPP;
+	}
+	if (!MLX5_CAP_GEN(pf_mdev, vhca_resource_manager)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: PF firmware does not advertise vhca_resource_manager\n");
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+/*
+ * Pre-bind helper: idempotently set HCA_CAP_2.migratable=1 on @vf_id.
+ * Caller is expected to hold off mlx5_core's ENABLE_HCA on this VF
+ * (autoprobe=0, no manual bind yet). If the VF is already enabled,
+ * the firmware will reject the SET_HCA_CAP with "bad resource state"
+ * and we return -EBUSY.
+ *
+ * We intentionally never clear the bit again: a VF that's been
+ * migration-enabled once stays migration-enabled for the lifetime of
+ * the SR-IOV provisioning.
+ */
+static int vfmig_set_vf_migratable(struct mlx5_core_dev *pf_mdev, u32 vf_id)
+{
+	int query_sz = MLX5_ST_SZ_BYTES(query_hca_cap_out);
+	u16 vport = vf_id + 1;
+	void *query_ctx;
+	void *hca_caps;
+	int err;
+
+	query_ctx = kzalloc(query_sz, GFP_KERNEL);
+	if (!query_ctx)
+		return -ENOMEM;
+
+	err = mlx5_vport_get_other_func_cap(pf_mdev, vport, query_ctx,
+					    MLX5_CAP_GENERAL_2);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: query GENERAL_2 cap for vf %u (vport %u) failed: %d\n",
+			       vf_id, vport, err);
+		goto out;
+	}
+
+	hca_caps = MLX5_ADDR_OF(query_hca_cap_out, query_ctx, capability);
+	if (MLX5_GET(cmd_hca_cap_2, hca_caps, migratable)) {
+		err = 0;
+		goto out;
+	}
+
+	MLX5_SET(cmd_hca_cap_2, hca_caps, migratable, 1);
+	err = mlx5_vport_set_other_func_cap(pf_mdev, hca_caps, vport,
+					    MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE2);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: set GENERAL_2.migratable=1 for vf %u (vport %u) failed: %d (VF must be unbound)\n",
+			       vf_id, vport, err);
+		goto out;
+	}
+	mlx5_core_info(pf_mdev,
+		       "vfmig: enabled migratable cap for vf %u (vport %u)\n",
+		       vf_id, vport);
+out:
+	kfree(query_ctx);
+	return err;
+}
+
+static long vfmig_ioc_enable_migratable(struct mlx5_vfmig_pf *vfmig,
+					void __user *uarg)
+{
+	struct mlx5_vfmig_enable_migratable arg;
+	struct mlx5_core_sriov *sriov;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	err = vfmig_check_pf_migration_caps(vfmig->pf_mdev);
+	if (err)
+		return err;
+
+	return vfmig_set_vf_migratable(vfmig->pf_mdev, arg.vf_id);
+}
+
+static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
+				    void __user *uarg)
+{
+	struct mlx5_vfmig_mark_restored arg;
+	struct mlx5_core_sriov *sriov;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	if (sriov->vfs_ctx[arg.vf_id].restored)
+		return 0;
+
+	err = vfmig_query_vhca_id(vfmig->pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	sriov->vfs_ctx[arg.vf_id].restored_vhca_id = vhca_id;
+	sriov->vfs_ctx[arg.vf_id].restored = 1;
+	mlx5_core_info(vfmig->pf_mdev,
+		       "vfmig: marked VF %u (vhca_id 0x%04x) as restored (next probe will skip INIT_HCA)\n",
+		       arg.vf_id, vhca_id);
+	return 0;
+}
+
+static long vfmig_ioc_get_vhca_id(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	struct mlx5_vfmig_get_vhca_id arg;
+	struct mlx5_core_sriov *sriov;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	err = vfmig_query_vhca_id(vfmig->pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	arg.vhca_id = vhca_id;
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+	return 0;
+}
+
+static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
+			       void __user *uarg)
+{
+	struct mlx5_vfmig_query_vf arg;
+	struct mlx5_core_sriov *sriov;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+
+	arg.num_vfs = sriov->num_vfs;
+	if (arg.vf_id >= sriov->num_vfs) {
+		arg.vhca_id = 0;
+		arg.restored = 0;
+		if (copy_to_user(uarg, &arg, sizeof(arg)))
+			return -EFAULT;
+		return -ERANGE;
+	}
+
+	err = vfmig_query_vhca_id(vfmig->pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	arg.vhca_id = vhca_id;
+	arg.restored = sriov->vfs_ctx[arg.vf_id].restored;
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+	return 0;
+}
+
 /* -------- cdev file ops ------------------------------------------------- */
 
 static int vfmig_open(struct inode *inode, struct file *filp)
@@ -103,6 +343,7 @@ static int vfmig_release(struct inode *inode, struct file *filp)
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
+	void __user *uarg = (void __user *)arg;
 	long ret;
 
 	down_read(&vfmig->lock);
@@ -111,12 +352,23 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		goto out;
 	}
 
-	/*
-	 * No commands are wired up in this skeleton. Subsequent patches
-	 * fill in the case arms for ENABLE_MIGRATABLE / GET_VHCA_ID /
-	 * QUERY_VF / MARK_RESTORED / SAVE_VHCA_STATE / LOAD_VHCA_STATE.
-	 */
-	ret = -ENOTTY;
+	switch (cmd) {
+	case MLX5_VFMIG_IOC_ENABLE_MIGRATABLE:
+		ret = vfmig_ioc_enable_migratable(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_GET_VHCA_ID:
+		ret = vfmig_ioc_get_vhca_id(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_QUERY_VF:
+		ret = vfmig_ioc_query_vf(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_MARK_RESTORED:
+		ret = vfmig_ioc_mark_restored(vfmig, uarg);
+		break;
+	default:
+		ret = -ENOTTY;
+		break;
+	}
 out:
 	up_read(&vfmig->lock);
 	return ret;
@@ -211,6 +463,40 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 	cdev_del(&vfmig->cdev);
 
 	vfmig_pf_put(vfmig);
+}
+
+/* -------- VF probe-time hook -------------------------------------------- */
+
+bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev, u16 *vhca_id_out)
+{
+	struct pci_dev *vf_pdev = dev->pdev;
+	struct mlx5_core_dev *pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	bool restored = false;
+	int vf_id;
+
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return false;
+
+	vf_id = pci_iov_vf_id(vf_pdev);
+	if (vf_id < 0)
+		return false;
+
+	pf_mdev = mlx5_vf_get_core_dev(vf_pdev);
+	if (!pf_mdev)
+		return false;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (vf_id < sriov->num_vfs && sriov->vfs_ctx[vf_id].restored) {
+		if (vhca_id_out)
+			*vhca_id_out = sriov->vfs_ctx[vf_id].restored_vhca_id;
+		sriov->vfs_ctx[vf_id].restored_vhca_id = 0;
+		sriov->vfs_ctx[vf_id].restored = 0;
+		restored = true;
+	}
+	mlx5_vf_put_core_dev(pf_mdev);
+
+	return restored;
 }
 
 /* -------- module init/exit ---------------------------------------------- */

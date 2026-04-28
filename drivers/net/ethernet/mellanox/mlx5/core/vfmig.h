@@ -38,6 +38,25 @@
 int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev);
 
+/*
+ * Returns true iff @dev is a VF and its PF has marked it as restored.
+ * Safe to call unconditionally on any mlx5_core_dev. Internally takes
+ * and releases mlx5_vf_get_core_dev() / mlx5_vf_put_core_dev() on the
+ * PF, so it must NOT be called while already holding the PF's
+ * intf_state_mutex.
+ *
+ * On true, @vhca_id_out (if non-NULL) is populated with the VF's
+ * vhca_id captured at MARK_RESTORED time. Used purely to identify the
+ * firmware vHCA in probe-time logs.
+ *
+ * The flag is consumed (cleared) by this call so that a subsequent
+ * unbind/rebind of the same VF without an explicit MARK_RESTORED falls
+ * back to the normal probe path. This is a deliberate choice: mis-
+ * replays of probe should fail loudly rather than silently keep
+ * skipping VHCA-side bring-up commands.
+ */
+bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev, u16 *vhca_id_out);
+
 /* Module init/exit hooks for the cdev region. */
 int  mlx5_vfmig_module_init(void);
 void mlx5_vfmig_module_exit(void);
