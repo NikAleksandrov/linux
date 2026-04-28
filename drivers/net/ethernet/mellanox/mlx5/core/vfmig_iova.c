@@ -112,6 +112,20 @@ vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
 	if (vfmig_iova_find_locked(dom, iova))
 		return -EEXIST;
 
+	/*
+	 * iommu_map() rejects __GFP_HIGHMEM/COMP/DMA/DMA32 with WARN +
+	 * -EINVAL, and we additionally need page_address() to work on
+	 * the backing page (used on the SAVE/replay paths for memcpy).
+	 * Reject the offending flags here with a clear errno so callers
+	 * don't get a stack-trace-shaped surprise from the iommu layer.
+	 */
+	if (gfp & (__GFP_COMP | __GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM)) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: install_page: rejected gfp 0x%x (must not include __GFP_HIGHMEM/COMP/DMA/DMA32)\n",
+				     gfp);
+		return -EINVAL;
+	}
+
 	p = kzalloc(sizeof(*p), gfp);
 	if (!p)
 		return -ENOMEM;

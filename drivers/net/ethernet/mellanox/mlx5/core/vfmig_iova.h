@@ -237,6 +237,12 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
  * Size is rounded up to PAGE_SIZE. @gfp is honoured for the page
  * allocation in the fresh-alloc case; on the replay-hit path no
  * allocation happens and @gfp is ignored.
+ *
+ * @gfp MUST NOT include __GFP_HIGHMEM/COMP/DMA/DMA32. The first
+ * because page_address() must be valid on the backing page (used by
+ * the SAVE/replay paths); the others because iommu_map() rejects
+ * them outright. Pass GFP_KERNEL or GFP_ATOMIC. Violations return
+ * -EINVAL with a ratelimited dev_warn.
  */
 int  vfmig_iova_alloc_coherent(struct vfmig_iova_domain *dom,
 			       size_t size, gfp_t gfp,
