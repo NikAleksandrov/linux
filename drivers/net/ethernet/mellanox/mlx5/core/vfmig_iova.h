@@ -80,14 +80,14 @@
  * to per-slot auto-numbering, which is the order-based shortcut
  * scoped to a single slot.
  *
- * What this v2 still doesn't do: it doesn't notice when src and dst
+ * What this still doesn't do: it doesn't notice when src and dst
  * disagree about the *number* of allocations in a slot. The per-slot
  * cursor on the destination just keeps bumping into fresh IOVAs that
  * have no SAVE-side counterpart, and the FW dereferences something
- * that was never set up. The next patch in this series adds an
- * on-wire manifest of (slot, instance_key, len) tuples and a LOAD-
- * time cross-check that surfaces those drifts as a hard, named error
- * before any FW dereference happens.
+ * that was never set up. Detecting that requires comparing the
+ * destination's alloc_slot call sequence against the source's
+ * recorded sequence -- a follow-up that builds on top of the
+ * (slot, instance_key) wire identity introduced here.
  */
 
 #ifndef __MLX5_CORE_VFMIG_IOVA_H__
@@ -127,16 +127,15 @@ struct vfmig_iova_domain;
  *                            (one per page the FW asks for); the
  *                            sequence is deterministic per FW
  *                            version + capability set.
- *   VFMIG_SLOT_DMA_COHERENT -- catch-all for the legacy
+ *   VFMIG_SLOT_DMA_COHERENT -- catch-all for the
  *                              mlx5_dma_zalloc_coherent_node call
  *                              site (EQ buffers, UAR/DB pages, etc.)
- *                              The "DMA_COHERENT" name reflects what
- *                              this slot used to be in v1 -- a
- *                              renamed alloc_coherent. Future
- *                              revisions may split it into per-
- *                              consumer slots (EQ_BUF, UAR_PAGE,
- *                              ...); each split is an additive enum
- *                              change above (new tail enumerators).
+ *                              The name reflects which kernel API
+ *                              this slot wraps; future revisions may
+ *                              split it into per-consumer slots
+ *                              (EQ_BUF, UAR_PAGE, ...); each split
+ *                              is an additive enum change above
+ *                              (new tail enumerators).
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
@@ -331,13 +330,11 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
  *                             call sites (mlx5_ib resources) where
  *                             firmware/orchestrator hands the kernel
  *                             a stable identifier. The allocator
- *                             records the key on the registry entry
- *                             but does NOT yet enforce uniqueness or
- *                             use it for IOVA derivation -- the
- *                             upcoming on-wire manifest patch is the
- *                             first consumer that will use the key
- *                             for correctness, and that patch will
- *                             also add the collision check.
+ *                             records the key on the registry entry,
+ *                             SAVE puts it on the wire, and LOAD
+ *                             round-trips it; uniqueness enforcement
+ *                             and using the key for collision
+ *                             detection are follow-ups.
  *   - @size is rounded up to PAGE_SIZE.
  *
  * Slot validation:
@@ -379,26 +376,28 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
  * Pre-populate a registry entry at @iova with @len bytes of
  * @contents. Allocates a backing page, copies @contents in,
  * iommu_maps the page at @iova in @dom, and inserts it into the
- * registry.
+ * registry tagged with caller-provided (@slot, @instance_key).
  *
  * Used by the LOAD path to rehydrate the destination's IOVA space
  * from HOST_PAGE wire records *before* LOAD_VHCA_STATE runs. The
  * subsequent vfmig_iova_alloc_slot calls during VF probe will find
  * these entries via the per-slot cursor lookup and reuse them.
  *
- * Slot derivation: the v1-compatible HOST_PAGE wire record carries
- * (iova, len, contents) with no slot tag, so we infer the slot from
- * @iova by which sub-window it falls into. instance_key on the
- * replayed entry is set to 0 (placeholder); the destination's
- * subsequent alloc_slot call re-tags it with the real key when it
- * claims the entry. The next patch in the series adds an explicit
- * slot+instance_key on the wire and removes the inference.
+ * The wire record carries explicit (slot, instance_key) so this
+ * function takes them as parameters. The implementation still
+ * validates that @iova falls within @slot's sub-window in @dom;
+ * a mismatch returns -ERANGE because that means the source-side
+ * (slot, iova) layout no longer matches the destination's slot
+ * partitioning (e.g. VFMIG_IOVA_NR_SLOTS or VFMIG_IOVA_PER_VF
+ * differ between source and destination kernels) and we'd otherwise
+ * silently install at an unexpected slot.
  *
  * @iova must be in this domain's deterministic window and
  * PAGE_SIZE-aligned. @len must be a multiple of PAGE_SIZE. Replaying
  * twice at the same IOVA is an error (returns -EEXIST).
  */
 int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
+			    enum vfmig_iova_slot slot, u64 instance_key,
 			    dma_addr_t iova, const void *contents,
 			    size_t len);
 
@@ -464,18 +463,26 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom);
 
 /*
  * Iterate the registry in IOVA-ascending order. @cb is invoked once
- * per entry with (iova, vaddr, len, ctx). Iteration order is
- * IOVA-sorted across all slots; SAVE uses this order to emit
- * HOST_PAGE records and the destination replays them in the same
- * order, which is what the per-slot cursor-lookup correctness rests
- * on (replayed entries land at exactly the IOVAs the destination's
- * subsequent alloc_slot calls will request).
+ * per entry with (slot, instance_key, iova, vaddr, len, ctx).
+ * Iteration order is IOVA-sorted across all slots; SAVE uses this
+ * order to emit HOST_PAGE records and the destination replays them
+ * in the same order, which is what the per-slot cursor-lookup
+ * correctness rests on (replayed entries land at exactly the IOVAs
+ * the destination's subsequent alloc_slot calls will request).
+ *
+ * The @slot and @instance_key arguments reflect the registry
+ * entry's stored tags, set by an earlier vfmig_iova_alloc_slot
+ * call (or by vfmig_iova_replay_page on the destination). SAVE puts
+ * both directly on the wire so the destination can replay with the
+ * same identity rather than inferring slot from IOVA.
  *
  * @cb may not modify the registry (no alloc/free/replay calls).
  * Returning a non-zero value from @cb stops iteration and is
  * propagated as the return value.
  */
-typedef int (*vfmig_iova_for_each_fn)(dma_addr_t iova, const void *vaddr,
+typedef int (*vfmig_iova_for_each_fn)(enum vfmig_iova_slot slot,
+				      u64 instance_key,
+				      dma_addr_t iova, const void *vaddr,
 				      size_t len, void *ctx);
 int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 			 vfmig_iova_for_each_fn cb, void *ctx);
@@ -517,6 +524,8 @@ static inline int vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
 static inline void vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
 					    dma_addr_t iova, size_t size) { }
 static inline int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
+					 enum vfmig_iova_slot slot,
+					 u64 instance_key,
 					 dma_addr_t iova, const void *contents,
 					 size_t len)
 {

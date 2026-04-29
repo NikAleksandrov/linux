@@ -31,16 +31,18 @@
  *
  * @slot tags which IOVA sub-window the entry belongs to. On the SAVE
  * side it's set by alloc_slot() at create time. On the LOAD side
- * vfmig_iova_replay_page() derives it from the IOVA (HOST_PAGE wire
- * records carry no explicit slot in this revision); the destination's
- * subsequent alloc_slot() call rewrites the field with what the
- * caller actually passed, in case the auto-derivation was wrong (it
- * shouldn't be -- the per-slot windows are disjoint -- but we keep
- * the rewrite cheap and defensive).
+ * vfmig_iova_replay_page() takes the slot directly as a parameter
+ * (sourced from the HOST_PAGE wire record) and the IOVA is
+ * cross-checked against the destination's slot partitioning so any
+ * source/destination disagreement about NR_SLOTS / SLOT_BYTES /
+ * PER_VF surfaces as -ERANGE before we install anything.
  *
  * @instance_key is the per-slot identifier described in the
- * vfmig_iova.h header doc. Set to 0 on replay, rewritten by
- * alloc_slot when the caller claims the entry.
+ * vfmig_iova.h header doc. SAVE emits the source's value on the
+ * wire and replay_page restores it verbatim; the destination's
+ * subsequent alloc_slot() call must pass the same key (or 0 to
+ * accept the per-slot auto-numbering, which lines up with the
+ * source's replayed sequence by construction).
  */
 struct vfmig_iova_page {
 	struct list_head node;	/* dom->pages, sorted by iova ascending */
@@ -571,11 +573,19 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 			goto out_unlock;
 		}
 		/*
-		 * Re-tag the replayed entry with the real slot/key the
-		 * caller is claiming. Replay tags entries with derived
-		 * slot + key=0; this is the point where the destination
-		 * binds the wire-derived placeholder to the caller's
-		 * intent.
+		 * Replayed entries already carry the source's
+		 * (slot, instance_key) under the v2 wire format, so the
+		 * caller's slot is expected to match p->slot here (the
+		 * cursor walk wouldn't have landed on a mismatched-slot
+		 * entry anyway). Caller's instance_key may legitimately
+		 * differ from the replayed value when the caller passes
+		 * 0 to take the per-slot auto-numbering: in that case
+		 * the auto-assigned key matches the source's only when
+		 * both kernels execute the same alloc sequence in this
+		 * slot, which is exactly what subsequent patches detect.
+		 * For now we keep the rewrite cheap and overwrite with
+		 * what the caller passed. Patch 3b will turn a key
+		 * mismatch into -EPROTO.
 		 */
 		p->slot		= slot;
 		p->instance_key	= instance_key;
@@ -642,41 +652,43 @@ out_unlock:
 }
 
 int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
+			   enum vfmig_iova_slot slot, u64 instance_key,
 			   dma_addr_t iova, const void *contents,
 			   size_t len)
 {
 	struct vfmig_iova_page *p;
-	enum vfmig_iova_slot slot;
+	enum vfmig_iova_slot iova_slot;
 	int err;
 
 	if (!dom || !contents)
 		return -EINVAL;
 
-	/*
-	 * The v1-compatible HOST_PAGE wire record carries no slot tag.
-	 * Derive the slot from the IOVA's position within the per-VF
-	 * window. Anything that lands outside a deterministic slot
-	 * (transient arena range, or out-of-window entirely) is
-	 * a wire record we cannot place: fail loudly so the LOAD ioctl
-	 * surfaces the malformed blob.
-	 */
-	slot = vfmig_iova_slot_from_iova(dom, (u64)iova);
-	if (slot == VFMIG_SLOT_INVALID) {
+	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_IOVA_NR_SLOTS) {
 		dev_warn(&dom->vf_pdev->dev,
-			 "vfmig_iova: vf %u replay: IOVA 0x%llx is not in any deterministic slot window\n",
-			 dom->vf_id, (u64)iova);
+			 "vfmig_iova: vf %u replay: slot %u out of range\n",
+			 dom->vf_id, slot);
+		return -EINVAL;
+	}
+
+	/*
+	 * Cross-check that the wire-claimed slot agrees with the slot
+	 * the destination's IOVA partitioning would assign to this
+	 * @iova. A mismatch means the source and destination disagree
+	 * about VFMIG_IOVA_NR_SLOTS / VFMIG_IOVA_SLOT_BYTES /
+	 * VFMIG_IOVA_PER_VF (i.e. wire-incompatible kernel build
+	 * options); the deterministic guarantee is broken and we must
+	 * not silently install at an unexpected slot.
+	 */
+	iova_slot = vfmig_iova_slot_from_iova(dom, (u64)iova);
+	if (iova_slot != slot) {
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u replay: wire claims slot %u for IOVA 0x%llx but destination partitioning maps it to slot %u\n",
+			 dom->vf_id, slot, (u64)iova, iova_slot);
 		return -ERANGE;
 	}
 
 	mutex_lock(&dom->lock);
-	/*
-	 * instance_key=0 placeholder: the replayed entry doesn't yet
-	 * have a caller-side identity. The destination's first
-	 * alloc_slot call that lands at this IOVA (via the per-slot
-	 * cursor lookup) will overwrite slot/instance_key with what the
-	 * caller actually passed.
-	 */
-	err = vfmig_iova_install_page_locked(dom, slot, /*instance_key=*/0,
+	err = vfmig_iova_install_page_locked(dom, slot, instance_key,
 					     iova, len, GFP_KERNEL, &p);
 	if (err)
 		goto out_unlock;
@@ -724,7 +736,8 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 
 	mutex_lock(&dom->lock);
 	list_for_each_entry(p, &dom->pages, node) {
-		ret = cb(p->iova, p->vaddr, p->len, ctx);
+		ret = cb(p->slot, p->instance_key,
+			 p->iova, p->vaddr, p->len, ctx);
 		if (ret)
 			break;
 	}
