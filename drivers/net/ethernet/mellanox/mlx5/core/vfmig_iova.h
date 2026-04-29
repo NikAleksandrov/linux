@@ -449,17 +449,56 @@ void vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
 			      dma_addr_t iova, size_t size);
 
 /*
- * Reset every per-slot bump cursor to its slot's base IOVA, and
- * reset every per-slot auto-key counter to 0. Called once on the
+ * Reset every per-slot bump cursor to its slot's base IOVA, reset
+ * every per-slot auto-key counter to 0, and reset every per-slot
+ * alloc-counter (used by drift detection) to 0. Called once on the
  * destination after all HOST_PAGE records have been replayed but
  * before VF probe starts: subsequent vfmig_iova_alloc_slot calls
  * will then walk each slot from its bottom and find the replayed
  * entries.
  *
+ * @expected_count is NOT reset -- it's the source's recorded
+ * footprint and is frozen by vfmig_iova_arm_drift_detection().
+ *
  * Idempotent. Safe to call on a domain that's never been allocated
  * from.
  */
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom);
+
+/*
+ * Arm at-probe drift detection on @dom.
+ *
+ * Called by the LOAD path exactly once after every HOST_PAGE
+ * record has been replayed AND the wire manifest CRC32 has
+ * verified. From that point onward, vfmig_iova_alloc_slot
+ * enforces:
+ *
+ *   - Pinned/auto sequence consistency on cursor HIT: the caller's
+ *     resolved instance_key (auto-bumped if 0 was passed) must
+ *     equal the replayed entry's recorded key. A mismatch means
+ *     the destination's call sequence in this slot interleaves
+ *     pinned and auto allocations differently from the source.
+ *
+ *   - Extra-alloc rejection on cursor MISS: if the slot ever had
+ *     any replays (expected_count > 0), the destination is asking
+ *     for an alloc the source didn't have at SAVE time -- a
+ *     kernel-side change has added an allocation in this slot.
+ *
+ * Either path returns -EPROTO. The first occurrence per domain
+ * also drops a kernel stack via dump_stack() so the offending
+ * call site is identifiable in dmesg.
+ *
+ * Slots with expected_count == 0 (source never used the slot) are
+ * unrestricted -- runtime allocations after probe completes (e.g.
+ * dynamic FW_PAGE growth via MANAGE_PAGES) still go through this
+ * function and would otherwise spuriously fire if the source
+ * happened not to have any allocations in that slot at SAVE time.
+ *
+ * Idempotent. Safe to call on a domain with no replays (every
+ * subsequent alloc is then in a slot with expected_count == 0,
+ * i.e. unrestricted).
+ */
+void vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom);
 
 /*
  * Iterate the registry in IOVA-ascending order. @cb is invoked once
@@ -532,6 +571,8 @@ static inline int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 	return -EOPNOTSUPP;
 }
 static inline void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom) { }
+static inline void
+vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom) { }
 
 #endif /* CONFIG_MLX5_VFMIG */
 

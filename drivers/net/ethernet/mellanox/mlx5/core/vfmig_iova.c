@@ -147,6 +147,50 @@ struct vfmig_iova_domain {
 	unsigned int	     n_pages;
 
 	struct vfmig_transient_arena transient;
+
+	/*
+	 * At-probe drift detection.
+	 *
+	 * vfmig_iova_arm_drift_detection() flips @drift_armed once
+	 * the LOAD path has finished replaying every promised
+	 * HOST_PAGE record AND verified the wire manifest CRC32. From
+	 * that point onward, vfmig_iova_alloc_slot enforces:
+	 *
+	 *   - HIT (cursor lookup found a replayed entry): the
+	 *     caller's instance_key (or the auto-bumped key, if the
+	 *     caller passed 0) must equal the replayed entry's key.
+	 *     A mismatch means the destination's pinned-vs-auto
+	 *     allocation sequence in this slot has drifted from the
+	 *     source's.
+	 *
+	 *   - MISS (cursor walked past every replayed entry in this
+	 *     slot, would normally fall through to a fresh alloc): if
+	 *     the slot ever had any replays (expected_count > 0), the
+	 *     destination is asking for an alloc the source didn't
+	 *     have at SAVE time -- a kernel-side change has added an
+	 *     allocation in this slot.
+	 *
+	 * Both fail fast with -EPROTO. dev_err() prints the offending
+	 * (slot, key, IOVA, size) tuple. dump_stack() is fired once
+	 * per domain via @drift_reported so the first offending call
+	 * site is identifiable in dmesg without a stack-trace flood
+	 * if probe-time alloc_slot churn keeps tripping the same
+	 * mismatch.
+	 *
+	 * @expected_count[s] is the number of HOST_PAGE records we
+	 * replayed into slot s; bumped by vfmig_iova_replay_page.
+	 * @alloc_count[s] is the number of alloc_slot HITs (and, for
+	 * accounting only, MISSes) processed since the last
+	 * vfmig_iova_reset_cursor.
+	 *
+	 * If @drift_armed is false (legacy / fresh-VF / SET_TRACKED-
+	 * but-no-LOAD path), no checks fire and alloc_slot has the
+	 * same behaviour as before this patch.
+	 */
+	bool		     drift_armed;
+	bool		     drift_reported;
+	u32		     expected_count[VFMIG_IOVA_NR_SLOTS];
+	u32		     alloc_count[VFMIG_IOVA_NR_SLOTS];
 };
 
 static inline u64
@@ -519,6 +563,7 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	struct vfmig_iova_page *p;
 	size_t aligned;
 	u64 iova, slot_end;
+	u64 caller_key;
 	int err;
 
 	if (!dom || !iova_out || !vaddr_out || size == 0)
@@ -535,7 +580,12 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	 * counter, so adding allocations in another slot doesn't
 	 * perturb this slot's keys. Caller-pinned (non-zero) keys are
 	 * recorded as-is and don't bump the counter.
+	 *
+	 * caller_key remembers the pre-resolution value so the drift
+	 * diagnostic on HIT mismatch can distinguish a 0/auto caller
+	 * from a pinned caller.
 	 */
+	caller_key = instance_key;
 	if (instance_key == 0)
 		instance_key = ++dom->next_auto_key[slot];
 
@@ -557,11 +607,14 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	 * position, but if it doesn't we error out rather than silently
 	 * hand back a too-small or too-big mapping.
 	 *
-	 * The order-based determinism is now scoped to a single slot:
+	 * The order-based determinism is scoped to a single slot:
 	 * a missing or extra alloc in slot X drifts only slot X's
-	 * cursor; slots Y, Z stay put. Drift detection across the
-	 * slot's expected sequence still requires the on-wire manifest,
-	 * which the next patch in the series adds.
+	 * cursor; slots Y, Z stay put. When @drift_armed is set
+	 * (i.e. the destination is restoring from a SAVE blob), HIT
+	 * additionally checks that the caller's resolved instance_key
+	 * matches the replayed entry's, and MISS in a slot that
+	 * carried any replays is rejected outright as kernel-side
+	 * drift.
 	 */
 	p = vfmig_iova_find_locked(dom, iova);
 	if (p) {
@@ -572,27 +625,56 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 			err = -EINVAL;
 			goto out_unlock;
 		}
+
+		if (dom->drift_armed && p->instance_key != instance_key) {
+			dev_err(&dom->vf_pdev->dev,
+				"vfmig_iova: vf %u slot %u DRIFT: caller passed key %s (resolved 0x%llx) but replayed entry at IOVA 0x%llx carries key 0x%llx; pinned/auto sequence diverged from source\n",
+				dom->vf_id, slot,
+				caller_key == 0 ? "0/auto" : "pinned",
+				(unsigned long long)instance_key,
+				(unsigned long long)iova,
+				(unsigned long long)p->instance_key);
+			if (!dom->drift_reported) {
+				dom->drift_reported = true;
+				dump_stack();
+			}
+			err = -EPROTO;
+			goto out_unlock;
+		}
+
 		/*
-		 * Replayed entries already carry the source's
-		 * (slot, instance_key) under the v2 wire format, so the
-		 * caller's slot is expected to match p->slot here (the
-		 * cursor walk wouldn't have landed on a mismatched-slot
-		 * entry anyway). Caller's instance_key may legitimately
-		 * differ from the replayed value when the caller passes
-		 * 0 to take the per-slot auto-numbering: in that case
-		 * the auto-assigned key matches the source's only when
-		 * both kernels execute the same alloc sequence in this
-		 * slot, which is exactly what subsequent patches detect.
-		 * For now we keep the rewrite cheap and overwrite with
-		 * what the caller passed. Patch 3b will turn a key
-		 * mismatch into -EPROTO.
+		 * Re-tag is now expected to be a no-op (slot is fixed
+		 * by cursor position; instance_key matches per the
+		 * armed check above). Kept unconditional for the
+		 * non-armed case where the source's wire records still
+		 * supplied the canonical key on replay; we just echo it
+		 * back to make it explicit that the entry is now
+		 * "owned" by this caller.
 		 */
 		p->slot		= slot;
 		p->instance_key	= instance_key;
 		*iova_out  = p->iova;
 		*vaddr_out = p->vaddr;
 		dom->cursor[slot] = iova + aligned;
+		dom->alloc_count[slot]++;
 		err = 0;
+		goto out_unlock;
+	}
+
+	if (dom->drift_armed && dom->expected_count[slot] > 0) {
+		dev_err(&dom->vf_pdev->dev,
+			"vfmig_iova: vf %u slot %u DRIFT: alloc beyond source's footprint (replays=%u, claimed=%u, requested key 0x%llx size %zu at cursor 0x%llx); kernel-side added an alloc in this slot\n",
+			dom->vf_id, slot,
+			dom->expected_count[slot],
+			dom->alloc_count[slot],
+			(unsigned long long)instance_key,
+			aligned,
+			(unsigned long long)iova);
+		if (!dom->drift_reported) {
+			dom->drift_reported = true;
+			dump_stack();
+		}
+		err = -EPROTO;
 		goto out_unlock;
 	}
 
@@ -602,6 +684,7 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 		goto out_unlock;
 
 	dom->cursor[slot] = iova + aligned;
+	dom->alloc_count[slot]++;
 	*iova_out  = p->iova;
 	*vaddr_out = p->vaddr;
 	err = 0;
@@ -609,6 +692,29 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 out_unlock:
 	mutex_unlock(&dom->lock);
 	return err;
+}
+
+void vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom)
+{
+	unsigned int s;
+	u32 total = 0;
+
+	if (!dom)
+		return;
+	mutex_lock(&dom->lock);
+	if (!dom->drift_armed) {
+		dom->drift_armed = true;
+		for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++)
+			total += dom->expected_count[s];
+		dev_info(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u drift detection armed (replays: cmd_ring=%u fw_page=%u dma_coherent=%u, total=%u)\n",
+			 dom->vf_id,
+			 dom->expected_count[VFMIG_SLOT_CMD_RING],
+			 dom->expected_count[VFMIG_SLOT_FW_PAGE],
+			 dom->expected_count[VFMIG_SLOT_DMA_COHERENT],
+			 total);
+	}
+	mutex_unlock(&dom->lock);
 }
 
 void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
@@ -688,12 +794,28 @@ int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 	}
 
 	mutex_lock(&dom->lock);
+
+	/*
+	 * Replay after the domain has been armed for drift detection
+	 * is anomalous: the LOAD path arms exactly once, after every
+	 * HOST_PAGE record has been parsed and the wire CRC has
+	 * verified. A late replay would mean expected_count[slot]
+	 * grows after we've already declared the source's footprint,
+	 * which would let a later (kernel-added) alloc HIT this entry
+	 * and mask the drift. Refuse it.
+	 */
+	if (WARN_ON_ONCE(dom->drift_armed)) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
 	err = vfmig_iova_install_page_locked(dom, slot, instance_key,
 					     iova, len, GFP_KERNEL, &p);
 	if (err)
 		goto out_unlock;
 
 	memcpy(p->vaddr, contents, len);
+	dom->expected_count[slot]++;
 
 	/*
 	 * Push the slot's cursor past the highest-replayed IOVA in
@@ -721,6 +843,14 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 		dom->cursor[s] = vfmig_iova_slot_base(dom,
 				(enum vfmig_iova_slot)s);
 		dom->next_auto_key[s] = 0;
+		/*
+		 * Per-slot alloc accounting is reset alongside the
+		 * cursor so the destination's claim sequence starts
+		 * from zero on each VF probe arc. expected_count is
+		 * NOT reset: it's the source's recorded footprint, set
+		 * once at LOAD time and frozen by drift_armed.
+		 */
+		dom->alloc_count[s] = 0;
 	}
 	mutex_unlock(&dom->lock);
 }

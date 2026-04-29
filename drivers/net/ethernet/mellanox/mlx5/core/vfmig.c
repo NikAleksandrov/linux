@@ -1635,6 +1635,25 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 			return -EINVAL;
 		}
 
+		/*
+		 * Tracked source with zero HOST_PAGE records: no
+		 * replays will arrive, so the manifest CRC -- which is
+		 * folded over zero bytes on the SAVE side -- must be
+		 * the initial crc32_le value of 0. Verify here and arm
+		 * drift detection immediately, since the HP_REPLAY arm
+		 * point will never be reached.
+		 */
+		if (ctx->iova_dom && ctx->hp_expected == 0) {
+			if (ctx->manifest_crc_want != 0) {
+				mlx5_core_warn(ctx->vfmig->pf_mdev,
+					       "vfmig: vf %u: stream header declares 0 HOST_PAGE records but non-zero manifest CRC 0x%08x\n",
+					       ctx->vf_id,
+					       ctx->manifest_crc_want);
+				return -EPROTO;
+			}
+			vfmig_iova_arm_drift_detection(ctx->iova_dom);
+		}
+
 		ctx->state = VFMIG_LS_READ_HEADER;
 		*progressed = true;
 		return 0;
@@ -1811,15 +1830,24 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 		 * content check isn't this CRC's job. Either way the
 		 * destination IOVA domain now disagrees with what the
 		 * source intended -- abort before FW_DATA stages.
+		 *
+		 * On a pass, this is also the arming point for at-probe
+		 * drift detection: every HOST_PAGE record has been
+		 * replayed and the source's per-slot footprint is now
+		 * frozen in dom->expected_count[]. Subsequent
+		 * vfmig_iova_alloc_slot calls during VF probe will
+		 * compare against it.
 		 */
-		if (ctx->hp_seen == ctx->hp_expected &&
-		    ctx->manifest_crc_have != ctx->manifest_crc_want) {
-			mlx5_core_warn(ctx->vfmig->pf_mdev,
-				       "vfmig: vf %u: manifest CRC mismatch (have 0x%08x, want 0x%08x); HOST_PAGE identity stream corrupted\n",
-				       ctx->vf_id,
-				       ctx->manifest_crc_have,
-				       ctx->manifest_crc_want);
-			return -EPROTO;
+		if (ctx->hp_seen == ctx->hp_expected) {
+			if (ctx->manifest_crc_have != ctx->manifest_crc_want) {
+				mlx5_core_warn(ctx->vfmig->pf_mdev,
+					       "vfmig: vf %u: manifest CRC mismatch (have 0x%08x, want 0x%08x); HOST_PAGE identity stream corrupted\n",
+					       ctx->vf_id,
+					       ctx->manifest_crc_have,
+					       ctx->manifest_crc_want);
+				return -EPROTO;
+			}
+			vfmig_iova_arm_drift_detection(ctx->iova_dom);
 		}
 
 		ctx->state = VFMIG_LS_READ_HEADER;
