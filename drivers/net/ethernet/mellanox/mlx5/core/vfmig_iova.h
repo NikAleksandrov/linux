@@ -177,6 +177,20 @@ struct vfmig_iova_domain;
 #define VFMIG_IOVA_GRANULE	PAGE_SIZE
 
 /*
+ * Transient sub-window: the topmost slice of each VF's IOVA window,
+ * reserved for vfmig_iova_transient_get/put (see below). Sized to hold
+ * worst-case in-flight transient allocations -- today only the cmd
+ * mailbox cache, whose ceiling is ~3900 pages. 16 MiB = 4096 pages
+ * leaves headroom for additional future transient call sites.
+ *
+ * The deterministic bump cursor used by vfmig_iova_alloc_coherent is
+ * capped at (VFMIG_IOVA_PER_VF - VFMIG_IOVA_TRANSIENT_BYTES) so the
+ * two never collide; an alloc_coherent attempt to grow into the
+ * transient range returns -ENOSPC.
+ */
+#define VFMIG_IOVA_TRANSIENT_BYTES	(16ULL << 20)	/* 16 MiB */
+
+/*
  * Allocate + attach a per-VF unmanaged paging domain.
  *
  * @vf_pdev:	the VF's pci_dev. Must currently be unbound; caller
@@ -280,6 +294,53 @@ int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			    size_t len);
 
 /*
+ * Acquire one DMA-coherent region from the per-VF domain's pre-mapped
+ * transient arena.
+ *
+ * "Transient" means: lives at most across one firmware command, never
+ * recorded in the SAVE manifest, IOVA NOT stable across migration.
+ * Use only for buffers the firmware dereferences in-flight and never
+ * retains a reference to past command completion (today: cmd.c
+ * mailbox indirection pages).
+ *
+ * @size is rounded up to PAGE_SIZE. Sizes above PAGE_SIZE are not
+ * supported in this revision and return -EINVAL with a ratelimited
+ * dev_warn -- the only current caller is cmd mailboxes which are
+ * exactly PAGE_SIZE. Multi-size-class support can be added later
+ * without changing the public API.
+ *
+ * Behaviour:
+ *   - Hot path:   pop a page off the arena's freelist; no iommu_map,
+ *                 no alloc_pages.
+ *   - Slow path:  the freelist is empty AND the arena hasn't reached
+ *                 its ceiling (VFMIG_IOVA_TRANSIENT_BYTES). Allocate
+ *                 a fresh page, iommu_map it at the next arena IOVA,
+ *                 hand it back. @gfp is honoured for the page
+ *                 allocation here.
+ *   - Failure:    arena at its ceiling AND freelist empty -> -ENOMEM.
+ *
+ * @gfp constraints match vfmig_iova_alloc_coherent: must NOT include
+ * __GFP_HIGHMEM/COMP/DMA/DMA32. Pass GFP_KERNEL or GFP_ATOMIC.
+ *
+ * Page contents are NOT zeroed; callers that need zeroing do it
+ * themselves.
+ */
+int  vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
+			      size_t size, gfp_t gfp,
+			      void **vaddr_out, dma_addr_t *iova_out);
+
+/*
+ * Return a region previously obtained from vfmig_iova_transient_get()
+ * to the freelist. @size MUST match the size passed to _get().
+ *
+ * Safe with @dom == NULL (no-op). An @iova outside the arena's
+ * sub-window is treated as a caller bug: WARN and ignore (so the
+ * arena's accounting can't be corrupted by a stray free).
+ */
+void vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
+			      dma_addr_t iova, size_t size);
+
+/*
  * Reset the bump cursor to the domain's base IOVA. Called once on
  * the destination after all HOST_PAGE records have been replayed
  * but before VF probe starts: subsequent vfmig_iova_alloc_coherent
@@ -331,6 +392,15 @@ static inline int vfmig_iova_alloc_coherent(struct vfmig_iova_domain *dom,
 	return -EOPNOTSUPP;
 }
 static inline void vfmig_iova_free_coherent(struct vfmig_iova_domain *dom,
+					    dma_addr_t iova, size_t size) { }
+static inline int vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
+					   size_t size, gfp_t gfp,
+					   void **vaddr_out,
+					   dma_addr_t *iova_out)
+{
+	return -EOPNOTSUPP;
+}
+static inline void vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
 					    dma_addr_t iova, size_t size) { }
 static inline int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 					 dma_addr_t iova, const void *contents,

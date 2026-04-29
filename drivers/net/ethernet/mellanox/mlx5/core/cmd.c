@@ -1446,37 +1446,37 @@ static struct mlx5_cmd_mailbox *alloc_cmd_box(struct mlx5_core_dev *dev,
 	if (vfmig_dom) {
 		/*
 		 * Tracked VF: route mailbox-block backing through the
-		 * per-VF deterministic IOVA allocator. dma_alloc_coherent
-		 * is unusable here because attaching our unmanaged IOMMU
-		 * domain leaves the device's *default* DMA domain stale
-		 * but still nominally selectable, so dma-iommu would hand
-		 * back IOVAs that don't translate in the actually-attached
-		 * domain. FW would then fault on every non-inline command
-		 * (e.g. QUERY_ISSI's 4 KiB output mailbox).
+		 * per-VF transient arena. dma_alloc_coherent is unusable
+		 * here because attaching our unmanaged IOMMU domain leaves
+		 * the device's *default* DMA domain stale but still
+		 * nominally selectable, so dma-iommu would hand back IOVAs
+		 * that don't translate in the actually-attached domain. FW
+		 * would then fault on every non-inline command (e.g.
+		 * QUERY_ISSI's 4 KiB output mailbox).
+		 *
+		 * Mailbox IOVAs do not need source/destination determinism
+		 * (mailboxes are per-cmd, not referenced by FW between
+		 * commands) and are not recorded in the SAVE manifest.
+		 * The transient arena gives us iommu_map-once,
+		 * freelist-recycle semantics: the only iommu_map cost is
+		 * the first time we hand out a particular page; subsequent
+		 * get/put are O(1) freelist ops with no IOMMU work.
 		 *
 		 * Page-per-mailbox is wasteful by a factor of ~7x against
 		 * the 576-byte mlx5_cmd_prot_block size, but the cmd
 		 * cache's worst-case footprint (~3900 mailboxes from
-		 * cmd_cache_num_ent[]) is ~16 MiB -- well under 1 %% of
-		 * the 4 GiB IOVA window. Mailbox IOVAs do not need
-		 * source/destination determinism (mailboxes are per-cmd,
-		 * not referenced by FW between commands), so the bump-
-		 * only allocator's IOVA-leak-on-free is benign at this
-		 * layer; long-running workloads on tracked VFs would
-		 * eventually exhaust the window after ~1M command frees.
-		 * The structured slot store (R2 in the layered restore
-		 * plan) is the proper fix and lands before any real
-		 * production use.
+		 * cmd_cache_num_ent[]) fits inside the arena ceiling
+		 * (VFMIG_IOVA_TRANSIENT_BYTES, 4096 pages == 16 MiB).
 		 */
 		dma_addr_t iova;
 		void *vaddr;
 		int err;
 
-		err = vfmig_iova_alloc_coherent(vfmig_dom, PAGE_SIZE,
-						flags, &iova, &vaddr);
+		err = vfmig_iova_transient_get(vfmig_dom, PAGE_SIZE,
+					       flags, &vaddr, &iova);
 		if (err) {
 			mlx5_core_dbg(dev,
-				      "vfmig: alloc_cmd_box: vfmig_iova_alloc_coherent: %d\n",
+				      "vfmig: alloc_cmd_box: vfmig_iova_transient_get: %d\n",
 				      err);
 			kfree(mailbox);
 			return ERR_PTR(err);
@@ -1506,7 +1506,7 @@ static void free_cmd_box(struct mlx5_core_dev *dev,
 	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
 
 	if (vfmig_dom) {
-		vfmig_iova_free_coherent(vfmig_dom, mailbox->dma, PAGE_SIZE);
+		vfmig_iova_transient_put(vfmig_dom, mailbox->dma, PAGE_SIZE);
 	} else {
 		dma_pool_free(dev->cmd.pool, mailbox->buf, mailbox->dma);
 	}
