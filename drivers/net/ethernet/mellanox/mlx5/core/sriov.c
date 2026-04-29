@@ -219,13 +219,13 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	 * -> mlx5_unregister_device -> mlx5_ib_remove (destroying GSI
 	 * QP, MR cache, etc.) -> mlx5_function_disable -> mlx5_cmd_disable.
 	 * Many of those teardown steps allocate or free DMA buffers via
-	 * mlx5_dma_free_coherent_node / vfmig_iova_free_coherent, which
+	 * mlx5_dma_free_coherent_node / vfmig_iova_free_slot, which
 	 * dereference the per-VF IOVA domain. The domain MUST outlive
 	 * those derefs.
 	 *
 	 * So we drop the IOVA domains *after* pci_disable_sriov returns,
 	 * by which point every VF is fully unbound and no caller can
-	 * reach into vfmig_iova_free_coherent() any more. Reversing this
+	 * reach into vfmig_iova_free_slot() any more. Reversing this
 	 * order is a use-after-free: the in-flight destroy_qp/destroy_cq
 	 * paths from mlx5_ib unwind would dereference the freed domain
 	 * struct (NULL deref at the dom->lock mutex pointer).

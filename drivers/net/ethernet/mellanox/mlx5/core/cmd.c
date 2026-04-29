@@ -2451,11 +2451,15 @@ static int alloc_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 	 * SAVE on one host and a LOAD on another. The default DMA path
 	 * is preserved for everything else (PFs, untracked VFs).
 	 *
-	 * vfmig_iova_alloc_coherent() returns PAGE_SIZE-aligned IOVAs
-	 * by construction (the bump cursor advances at PAGE_SIZE granule
-	 * and PAGE_SIZE >= MLX5_ADAPTER_PAGE_SIZE on all supported
-	 * architectures), so the unalign-and-retry dance the default
-	 * path does is unnecessary here.
+	 * vfmig_iova_alloc_slot() returns PAGE_SIZE-aligned IOVAs by
+	 * construction (the per-slot bump cursor advances at PAGE_SIZE
+	 * granule and PAGE_SIZE >= MLX5_ADAPTER_PAGE_SIZE on all
+	 * supported architectures), so the unalign-and-retry dance the
+	 * default path does is unnecessary here.
+	 *
+	 * Slot: VFMIG_SLOT_CMD_RING (singleton). instance_key=0 picks
+	 * up the per-slot auto-numbering, which yields key=1 for this
+	 * one-and-only allocation.
 	 */
 	vfmig_dom = mlx5_vf_get_vfmig_iova_domain(dev);
 	if (vfmig_dom) {
@@ -2463,8 +2467,10 @@ static int alloc_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 		void *vaddr;
 		int err;
 
-		err = vfmig_iova_alloc_coherent(vfmig_dom, MLX5_ADAPTER_PAGE_SIZE,
-						GFP_KERNEL, &iova, &vaddr);
+		err = vfmig_iova_alloc_slot(vfmig_dom, VFMIG_SLOT_CMD_RING,
+					    /*instance_key=*/0,
+					    MLX5_ADAPTER_PAGE_SIZE,
+					    GFP_KERNEL, &iova, &vaddr);
 		if (err)
 			return err;
 		cmd->vfmig_iova_dom = vfmig_dom;
@@ -2510,8 +2516,9 @@ static int alloc_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 static void free_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 {
 	if (cmd->vfmig_iova_dom) {
-		vfmig_iova_free_coherent(cmd->vfmig_iova_dom, cmd->alloc_dma,
-					 cmd->alloc_size);
+		vfmig_iova_free_slot(cmd->vfmig_iova_dom,
+				     VFMIG_SLOT_CMD_RING,
+				     cmd->alloc_dma, cmd->alloc_size);
 		cmd->vfmig_iova_dom = NULL;
 		return;
 	}

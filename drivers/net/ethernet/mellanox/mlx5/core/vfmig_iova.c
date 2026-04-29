@@ -28,6 +28,19 @@
  * One backing page (or higher-order compound page) registered in a
  * domain. iova/len identify the IOMMU mapping; page/vaddr are the
  * host-side handles. Length is always a multiple of PAGE_SIZE.
+ *
+ * @slot tags which IOVA sub-window the entry belongs to. On the SAVE
+ * side it's set by alloc_slot() at create time. On the LOAD side
+ * vfmig_iova_replay_page() derives it from the IOVA (HOST_PAGE wire
+ * records carry no explicit slot in this revision); the destination's
+ * subsequent alloc_slot() call rewrites the field with what the
+ * caller actually passed, in case the auto-derivation was wrong (it
+ * shouldn't be -- the per-slot windows are disjoint -- but we keep
+ * the rewrite cheap and defensive).
+ *
+ * @instance_key is the per-slot identifier described in the
+ * vfmig_iova.h header doc. Set to 0 on replay, rewritten by
+ * alloc_slot when the caller claims the entry.
  */
 struct vfmig_iova_page {
 	struct list_head node;	/* dom->pages, sorted by iova ascending */
@@ -35,6 +48,8 @@ struct vfmig_iova_page {
 	size_t		 len;
 	struct page	*page;
 	void		*vaddr;
+	enum vfmig_iova_slot slot;
+	u64		 instance_key;
 };
 
 /*
@@ -95,23 +110,77 @@ struct vfmig_iova_domain {
 
 	/*
 	 * Per-VF IOVA window. The full hardware-visible range is
-	 * [base, base + VFMIG_IOVA_PER_VF); @end is the *deterministic*
-	 * sub-window's upper bound (= base + PER_VF - TRANSIENT_BYTES),
-	 * leaving the top TRANSIENT_BYTES reserved for the transient
-	 * arena. vfmig_iova_alloc_coherent's bump cursor honours @end
-	 * and returns -ENOSPC at that boundary; the arena owns
-	 * [end, base + PER_VF).
+	 * [base, base + VFMIG_IOVA_PER_VF). The first
+	 *   VFMIG_IOVA_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES
+	 * == VFMIG_IOVA_PER_VF - VFMIG_IOVA_TRANSIENT_BYTES bytes are the
+	 * deterministic range, partitioned across the slot windows; the
+	 * remaining top TRANSIENT_BYTES belong to the transient arena.
+	 *
+	 * Slot N's window is
+	 *   [base + N * SLOT_BYTES, base + (N+1) * SLOT_BYTES).
+	 * Slot 0 (VFMIG_SLOT_INVALID) is reserved and never allocated
+	 * from. alloc_slot honours each slot's window and returns
+	 * -ENOSPC at the slot boundary.
 	 */
 	u64		     base;
-	u64		     end;
 
 	struct mutex	     lock;
-	u64		     cursor;	/* next fresh IOVA */
+	/*
+	 * Per-slot bump cursor. cursor[N] is the next fresh IOVA in
+	 * slot N's window, valid in [slot_base(N), slot_base(N+1)).
+	 * Initialized to slot_base(N) at domain create. Reset back to
+	 * slot_base(N) by vfmig_iova_reset_cursor() after replay.
+	 */
+	u64		     cursor[VFMIG_IOVA_NR_SLOTS];
+	/*
+	 * Per-slot auto-key counter. Incremented on each alloc_slot
+	 * call that passes instance_key == 0. Reset to 0 by
+	 * vfmig_iova_reset_cursor() so the destination's claim sequence
+	 * matches the source's. Skipped when the caller passes a non-
+	 * zero (caller-pinned) key.
+	 */
+	u64		     next_auto_key[VFMIG_IOVA_NR_SLOTS];
+
 	struct list_head     pages;	/* of vfmig_iova_page, sorted */
 	unsigned int	     n_pages;
 
 	struct vfmig_transient_arena transient;
 };
+
+static inline u64
+vfmig_iova_slot_base(const struct vfmig_iova_domain *dom,
+		     enum vfmig_iova_slot slot)
+{
+	return dom->base + (u64)slot * VFMIG_IOVA_SLOT_BYTES;
+}
+
+static inline u64
+vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
+		    enum vfmig_iova_slot slot)
+{
+	return dom->base + (u64)(slot + 1) * VFMIG_IOVA_SLOT_BYTES;
+}
+
+/*
+ * Inverse of vfmig_iova_slot_base(): which slot does @iova fall into,
+ * or VFMIG_SLOT_INVALID if it's outside any deterministic slot
+ * window. The deterministic range is exactly
+ * [base, base + NR_SLOTS * SLOT_BYTES); anything above belongs to the
+ * transient arena (or is out of range entirely).
+ */
+static enum vfmig_iova_slot
+vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
+{
+	u64 off, idx;
+
+	if (iova < dom->base)
+		return VFMIG_SLOT_INVALID;
+	off = iova - dom->base;
+	idx = off / VFMIG_IOVA_SLOT_BYTES;
+	if (idx >= VFMIG_IOVA_NR_SLOTS)
+		return VFMIG_SLOT_INVALID;
+	return (enum vfmig_iova_slot)idx;
+}
 
 /* dom->lock held. Returns the entry mapped at exactly @iova, or NULL. */
 static struct vfmig_iova_page *
@@ -150,13 +219,19 @@ vfmig_iova_insert_locked(struct vfmig_iova_domain *dom,
  * dom->lock held. Allocate a backing page or higher-order compound,
  * iommu_map it at @iova for @len bytes, and append the registry
  * entry. Does NOT advance the cursor; callers do that themselves
- * because the meaning of "advance" differs between alloc_coherent and
+ * because the meaning of "advance" differs between alloc_slot and
  * replay.
+ *
+ * @slot/@instance_key are stamped on the new entry. @slot is also
+ * used to validate that @iova falls inside that slot's window
+ * ([slot_base, slot_end)); a callsite passing the wrong slot for an
+ * IOVA returns -ERANGE.
  *
  * Returns 0 with *out_p set on success, negative errno otherwise.
  */
 static int
 vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
+			       enum vfmig_iova_slot slot, u64 instance_key,
 			       u64 iova, size_t len, gfp_t gfp,
 			       struct vfmig_iova_page **out_p)
 {
@@ -168,7 +243,10 @@ vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
 	    !IS_ALIGNED(len, VFMIG_IOVA_GRANULE) ||
 	    len == 0)
 		return -EINVAL;
-	if (iova < dom->base || iova + len > dom->end)
+	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR)
+		return -EINVAL;
+	if (iova < vfmig_iova_slot_base(dom, slot) ||
+	    iova + len > vfmig_iova_slot_end(dom, slot))
 		return -ERANGE;
 	if (vfmig_iova_find_locked(dom, iova))
 		return -EEXIST;
@@ -197,9 +275,11 @@ vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
 		err = -ENOMEM;
 		goto err_free_p;
 	}
-	p->vaddr = page_address(p->page);
-	p->iova	 = iova;
-	p->len	 = len;
+	p->vaddr	= page_address(p->page);
+	p->iova		= iova;
+	p->len		= len;
+	p->slot		= slot;
+	p->instance_key	= instance_key;
 
 	err = iommu_map(dom->iommu_dom, iova, page_to_phys(p->page), len,
 			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp);
@@ -260,16 +340,30 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	dom->vf_id  = vf_id;
 	dom->base   = base;
 	/*
-	 * @end is the bump cursor's upper bound. Reserve the top
-	 * VFMIG_IOVA_TRANSIENT_BYTES of the per-VF window for the
-	 * transient arena so the two never collide. The full HW-visible
-	 * range stays [base, base + VFMIG_IOVA_PER_VF) and is what we
-	 * validate against the IOMMU aperture below.
+	 * Per-slot bump cursors: each starts at its slot's window base.
+	 * Slot 0 (VFMIG_SLOT_INVALID) gets a cursor too, to keep the
+	 * indexing trivial -- alloc_slot rejects SLOT_INVALID before it
+	 * ever touches cursor[0]. next_auto_key[] is zero-initialized
+	 * by kzalloc above; first auto-assignment yields key 1.
 	 */
-	dom->end    = base + VFMIG_IOVA_PER_VF - VFMIG_IOVA_TRANSIENT_BYTES;
-	dom->cursor = base;
+	{
+		unsigned int s;
 
-	dom->transient.base      = dom->end;
+		for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++)
+			dom->cursor[s] = vfmig_iova_slot_base(dom,
+					(enum vfmig_iova_slot)s);
+	}
+
+	/*
+	 * Transient arena owns [det_end, det_end + TRANSIENT_BYTES),
+	 * where det_end is the upper bound of the deterministic range.
+	 * det_end equals base + NR_SLOTS * SLOT_BYTES by construction
+	 * (see SLOT_BYTES definition); using the slot helper keeps the
+	 * arithmetic in one place.
+	 */
+	dom->transient.base      = vfmig_iova_slot_end(dom,
+					(enum vfmig_iova_slot)
+					(VFMIG_IOVA_NR_SLOTS - 1));
 	dom->transient.end       = base + VFMIG_IOVA_PER_VF;
 	dom->transient.cursor    = dom->transient.base;
 	dom->transient.max_pages = VFMIG_IOVA_TRANSIENT_MAX_PAGES;
@@ -309,8 +403,8 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	 */
 	/*
 	 * Validate the FULL window (deterministic + transient) against
-	 * the IOMMU aperture, not just the bump cursor's upper bound:
-	 * the arena's iommu_map() calls happen above @dom->end.
+	 * the IOMMU aperture. The deterministic upper bound is the end
+	 * of the last slot, which is also the transient arena's base.
 	 */
 	if (dom->base < dom->iommu_dom->geometry.aperture_start ||
 	    dom->transient.end - 1 > dom->iommu_dom->geometry.aperture_end) {
@@ -326,8 +420,9 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	dom->vf_pdev = pci_dev_get(vf_pdev);
 
 	dev_info(&vf_pdev->dev,
-		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (deterministic) + [0x%llx, 0x%llx) (transient) within IOMMU aperture [0x%llx, 0x%llx]\n",
-		 vf_id, dom->base, dom->end,
+		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (deterministic, %u slots x 0x%llx) + [0x%llx, 0x%llx) (transient) within IOMMU aperture [0x%llx, 0x%llx]\n",
+		 vf_id, dom->base, dom->transient.base,
+		 VFMIG_IOVA_NR_SLOTS, (u64)VFMIG_IOVA_SLOT_BYTES,
 		 dom->transient.base, dom->transient.end,
 		 dom->iommu_dom->geometry.aperture_start,
 		 dom->iommu_dom->geometry.aperture_end);
@@ -414,67 +509,89 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 	kfree(dom);
 }
 
-int vfmig_iova_alloc_coherent(struct vfmig_iova_domain *dom,
-			      size_t size, gfp_t gfp,
-			      dma_addr_t *iova_out, void **vaddr_out)
+int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
+			  enum vfmig_iova_slot slot, u64 instance_key,
+			  size_t size, gfp_t gfp,
+			  dma_addr_t *iova_out, void **vaddr_out)
 {
 	struct vfmig_iova_page *p;
 	size_t aligned;
-	u64 iova;
+	u64 iova, slot_end;
 	int err;
 
 	if (!dom || !iova_out || !vaddr_out || size == 0)
+		return -EINVAL;
+	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR)
 		return -EINVAL;
 
 	aligned = ALIGN(size, VFMIG_IOVA_GRANULE);
 
 	mutex_lock(&dom->lock);
-	iova = dom->cursor;
 
-	if (iova + aligned > dom->end) {
+	/*
+	 * Auto-assign instance_key if the caller passed 0. Per-slot
+	 * counter, so adding allocations in another slot doesn't
+	 * perturb this slot's keys. Caller-pinned (non-zero) keys are
+	 * recorded as-is and don't bump the counter.
+	 */
+	if (instance_key == 0)
+		instance_key = ++dom->next_auto_key[slot];
+
+	iova = dom->cursor[slot];
+	slot_end = vfmig_iova_slot_end(dom, slot);
+	if (iova + aligned > slot_end) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u slot %u exhausted at cursor 0x%llx (slot_end 0x%llx, asked %zu)\n",
+				     dom->vf_id, slot, iova, slot_end,
+				     aligned);
 		err = -ENOSPC;
 		goto out_unlock;
 	}
 
 	/*
-	 * Lookup-or-alloc at the cursor. If an entry already exists at
-	 * @iova it must have come from a prior replay; we expect the
-	 * size to match what the source had at this allocation slot,
-	 * but if it doesn't we error out rather than silently hand back
-	 * a too-small or too-big mapping.
+	 * Lookup-or-alloc at the per-slot cursor. If an entry already
+	 * exists at @iova it must have come from a prior replay; we
+	 * expect the size to match what the source had at this slot
+	 * position, but if it doesn't we error out rather than silently
+	 * hand back a too-small or too-big mapping.
 	 *
-	 * Note: this lookup-by-cursor is the load-bearing piece of v1's
-	 * order-based determinism shortcut. See the "Determinism
-	 * contract" block at the top of vfmig_iova.h. The size check
-	 * below is the one defensive cross-check we have without a slot
-	 * identity; order drift between source and destination is NOT
-	 * detected here -- a missing source-side allocation just shifts
-	 * everything by one slot with all sizes still matching, and we'd
-	 * silently hand the FW a buffer at the wrong IOVA. v2's slot
-	 * store (vfmig_iova_alloc_slot) is the proper fix; landing it is
-	 * a hard prerequisite for Layer 3 per the plan document.
+	 * The order-based determinism is now scoped to a single slot:
+	 * a missing or extra alloc in slot X drifts only slot X's
+	 * cursor; slots Y, Z stay put. Drift detection across the
+	 * slot's expected sequence still requires the on-wire manifest,
+	 * which the next patch in the series adds.
 	 */
 	p = vfmig_iova_find_locked(dom, iova);
 	if (p) {
 		if (p->len != aligned) {
 			dev_warn(&dom->vf_pdev->dev,
-				 "vfmig_iova: vf %u replay/alloc size mismatch at IOVA 0x%llx: replayed %zu, requested %zu\n",
-				 dom->vf_id, iova, p->len, aligned);
+				 "vfmig_iova: vf %u slot %u replay/alloc size mismatch at IOVA 0x%llx: replayed %zu, requested %zu\n",
+				 dom->vf_id, slot, iova, p->len, aligned);
 			err = -EINVAL;
 			goto out_unlock;
 		}
+		/*
+		 * Re-tag the replayed entry with the real slot/key the
+		 * caller is claiming. Replay tags entries with derived
+		 * slot + key=0; this is the point where the destination
+		 * binds the wire-derived placeholder to the caller's
+		 * intent.
+		 */
+		p->slot		= slot;
+		p->instance_key	= instance_key;
 		*iova_out  = p->iova;
 		*vaddr_out = p->vaddr;
-		dom->cursor = iova + aligned;
+		dom->cursor[slot] = iova + aligned;
 		err = 0;
 		goto out_unlock;
 	}
 
-	err = vfmig_iova_install_page_locked(dom, iova, aligned, gfp, &p);
+	err = vfmig_iova_install_page_locked(dom, slot, instance_key,
+					     iova, aligned, gfp, &p);
 	if (err)
 		goto out_unlock;
 
-	dom->cursor = iova + aligned;
+	dom->cursor[slot] = iova + aligned;
 	*iova_out  = p->iova;
 	*vaddr_out = p->vaddr;
 	err = 0;
@@ -484,28 +601,36 @@ out_unlock:
 	return err;
 }
 
-void vfmig_iova_free_coherent(struct vfmig_iova_domain *dom,
-			      dma_addr_t iova, size_t size)
+void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
+			  enum vfmig_iova_slot slot,
+			  dma_addr_t iova, size_t size)
 {
 	struct vfmig_iova_page *p;
 	size_t aligned;
 
 	if (!dom)
 		return;
+	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR) {
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: free_slot: bad slot %u for IOVA 0x%llx\n",
+			 slot, (u64)iova);
+		return;
+	}
 	aligned = ALIGN(size, VFMIG_IOVA_GRANULE);
 
 	mutex_lock(&dom->lock);
 	p = vfmig_iova_find_locked(dom, iova);
 	if (!p) {
 		dev_warn(&dom->vf_pdev->dev,
-			 "vfmig_iova: vf %u free of unknown IOVA 0x%llx\n",
-			 dom->vf_id, (u64)iova);
+			 "vfmig_iova: vf %u free of unknown IOVA 0x%llx (slot %u)\n",
+			 dom->vf_id, (u64)iova, slot);
 		goto out_unlock;
 	}
+	WARN_ON_ONCE(p->slot != slot);
 	if (p->len != aligned) {
 		dev_warn(&dom->vf_pdev->dev,
-			 "vfmig_iova: vf %u free size mismatch at IOVA 0x%llx: have %zu, asked %zu\n",
-			 dom->vf_id, (u64)iova, p->len, aligned);
+			 "vfmig_iova: vf %u free size mismatch at IOVA 0x%llx (slot %u): have %zu, asked %zu\n",
+			 dom->vf_id, (u64)iova, slot, p->len, aligned);
 		/* still proceed: the entry is what it is */
 	}
 	list_del(&p->node);
@@ -521,26 +646,52 @@ int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			   size_t len)
 {
 	struct vfmig_iova_page *p;
+	enum vfmig_iova_slot slot;
 	int err;
 
 	if (!dom || !contents)
 		return -EINVAL;
 
+	/*
+	 * The v1-compatible HOST_PAGE wire record carries no slot tag.
+	 * Derive the slot from the IOVA's position within the per-VF
+	 * window. Anything that lands outside a deterministic slot
+	 * (transient arena range, or out-of-window entirely) is
+	 * a wire record we cannot place: fail loudly so the LOAD ioctl
+	 * surfaces the malformed blob.
+	 */
+	slot = vfmig_iova_slot_from_iova(dom, (u64)iova);
+	if (slot == VFMIG_SLOT_INVALID) {
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u replay: IOVA 0x%llx is not in any deterministic slot window\n",
+			 dom->vf_id, (u64)iova);
+		return -ERANGE;
+	}
+
 	mutex_lock(&dom->lock);
-	err = vfmig_iova_install_page_locked(dom, iova, len, GFP_KERNEL, &p);
+	/*
+	 * instance_key=0 placeholder: the replayed entry doesn't yet
+	 * have a caller-side identity. The destination's first
+	 * alloc_slot call that lands at this IOVA (via the per-slot
+	 * cursor lookup) will overwrite slot/instance_key with what the
+	 * caller actually passed.
+	 */
+	err = vfmig_iova_install_page_locked(dom, slot, /*instance_key=*/0,
+					     iova, len, GFP_KERNEL, &p);
 	if (err)
 		goto out_unlock;
 
 	memcpy(p->vaddr, contents, len);
 
 	/*
-	 * Push the cursor past the highest-replayed IOVA so a later
-	 * vfmig_iova_reset_cursor() resets to base, not "ahead of
-	 * everything"; and so that if no reset is issued, fresh allocs
-	 * still don't collide with replayed ranges.
+	 * Push the slot's cursor past the highest-replayed IOVA in
+	 * THAT slot so a later vfmig_iova_reset_cursor() resets to the
+	 * slot's base, not "ahead of everything in the slot"; and so
+	 * that if no reset is issued, fresh allocs in this slot still
+	 * don't collide with replayed ranges.
 	 */
-	if (iova + len > dom->cursor)
-		dom->cursor = iova + len;
+	if (iova + len > dom->cursor[slot])
+		dom->cursor[slot] = iova + len;
 
 out_unlock:
 	mutex_unlock(&dom->lock);
@@ -549,10 +700,16 @@ out_unlock:
 
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 {
+	unsigned int s;
+
 	if (!dom)
 		return;
 	mutex_lock(&dom->lock);
-	dom->cursor = dom->base;
+	for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++) {
+		dom->cursor[s] = vfmig_iova_slot_base(dom,
+				(enum vfmig_iova_slot)s);
+		dom->next_auto_key[s] = 0;
+	}
 	mutex_unlock(&dom->lock);
 }
 

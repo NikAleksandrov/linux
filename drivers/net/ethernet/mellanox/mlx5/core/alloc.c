@@ -76,25 +76,29 @@ static void *mlx5_dma_zalloc_coherent_node(struct mlx5_core_dev *dev,
 		 * CREATE_EQ on a tracked VF without this hook.
 		 *
 		 * NUMA hint: ignored on the vfmig path. vfmig_iova_alloc_
-		 * coherent uses alloc_pages() (no node hint), so we pay a
+		 * slot uses alloc_pages() (no node hint), so we pay a
 		 * potential NUMA-locality cost to keep the deterministic-
 		 * IOVA invariant. EQ buffers are small and allocated once
 		 * per probe; the hit is negligible.
 		 *
-		 * The single-page-per-allocation cost vs dma_pool-style
-		 * sub-allocation is the same trade-off documented in
-		 * alloc_cmd_box: 4 GiB IOVA window, ~tens of allocations
-		 * here, well under 1 %% of the window.
+		 * Slot: VFMIG_SLOT_DMA_COHERENT -- catch-all for the legacy
+		 * mlx5_dma_zalloc_coherent_node call site (EQ buffers,
+		 * UAR/DB pages). instance_key=0 picks up per-slot auto-
+		 * numbering. Future revisions may split this into per-
+		 * consumer slots (EQ_BUF, UAR_PAGE) so that addition of a
+		 * new EQ doesn't shift UAR IOVAs.
 		 */
 		dma_addr_t iova;
 		void *vaddr;
 		int err;
 
-		err = vfmig_iova_alloc_coherent(vfmig_dom, size, GFP_KERNEL,
-						&iova, &vaddr);
+		err = vfmig_iova_alloc_slot(vfmig_dom,
+					    VFMIG_SLOT_DMA_COHERENT,
+					    /*instance_key=*/0, size,
+					    GFP_KERNEL, &iova, &vaddr);
 		if (err) {
 			mlx5_core_warn(dev,
-				       "vfmig: dma_zalloc_coherent_node: vfmig_iova_alloc_coherent(size=%zu): %d\n",
+				       "vfmig: dma_zalloc_coherent_node: vfmig_iova_alloc_slot(size=%zu): %d\n",
 				       size, err);
 			return NULL;
 		}
@@ -127,7 +131,8 @@ static void mlx5_dma_free_coherent_node(struct mlx5_core_dev *dev,
 	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
 
 	if (vfmig_dom) {
-		vfmig_iova_free_coherent(vfmig_dom, dma_handle, size);
+		vfmig_iova_free_slot(vfmig_dom, VFMIG_SLOT_DMA_COHERENT,
+				     dma_handle, size);
 		return;
 	}
 	dma_free_coherent(mlx5_core_dma_dev(dev), size, cpu_handle,

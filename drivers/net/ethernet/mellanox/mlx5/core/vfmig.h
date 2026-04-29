@@ -181,7 +181,7 @@ bool mlx5_vf_is_vfmig_tracked(struct mlx5_core_dev *dev);
  * allocated for it; otherwise return NULL.
  *
  * Probe-time DMA hook used by mlx5_cmd_enable, pages.c, etc. to route
- * coherent allocations through vfmig_iova_alloc_coherent() instead of
+ * coherent allocations through vfmig_iova_alloc_slot() instead of
  * dma_alloc_coherent() so that source/destination IOVAs match across a
  * SAVE/LOAD round-trip. Callers stash the returned pointer alongside
  * the allocation so the matching free path can dispatch to the right

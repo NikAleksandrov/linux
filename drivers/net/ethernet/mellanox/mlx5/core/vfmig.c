@@ -106,7 +106,7 @@ struct vfmig_wire_header {
  * side, by the time the FW_DATA record is staged into the
  * pending_load slot, every IOVA the FW state references already maps
  * to a populated page in the destination's domain. The destination
- * VF probe's first vfmig_iova_alloc_coherent() will find the
+ * VF probe's first vfmig_iova_alloc_slot() will find the
  * replayed entry at the cursor and reuse it, instead of allocating
  * a fresh empty page.
  *
@@ -595,7 +595,7 @@ static struct pci_dev *vfmig_get_vf_pdev(struct pci_dev *pf_pdev, u32 vf_id)
  *     and set the flag. After this point dma_alloc_coherent on
  *     this VF will fail (the dma-iommu-managed default DMA domain
  *     is displaced); only callers routed through
- *     vfmig_iova_alloc_coherent() will resolve to a valid IOVA.
+ *     vfmig_iova_alloc_slot() will resolve to a valid IOVA.
  *   - On enable=0: clear the flag, detach + free the domain, NULL
  *     out the pointer. Restores the device's default DMA domain;
  *     subsequent normal mlx5_core probes work as before.
@@ -1766,7 +1766,7 @@ static int vfmig_load_release(struct inode *inode, struct file *filp)
 		 * Reset the deterministic IOVA cursor exactly once before
 		 * the staged blob is consumed by the next VF probe. Replay
 		 * advanced the cursor to (highest_iova + len) so subsequent
-		 * vfmig_iova_alloc_coherent() calls would otherwise hand
+		 * vfmig_iova_alloc_slot() calls would otherwise hand
 		 * out fresh (post-replay) IOVAs instead of finding the
 		 * replayed entries via lookup-at-cursor. Done here under
 		 * vfmig->lock-read so dom can't be torn down from
@@ -3167,10 +3167,10 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
  * vfmig_pf_drop_pending_loads_locked() but for vfs_ctx[].vfmig_iova_dom.
  *
  * Ordering contract (CRITICAL — get this wrong and you get a UAF in
- * vfmig_iova_free_coherent on teardown):
+ * vfmig_iova_free_slot on teardown):
  *
  *   The IOVA domain MUST outlive every code path on the VF side that
- *   can call vfmig_iova_alloc_coherent() / vfmig_iova_free_coherent().
+ *   can call vfmig_iova_alloc_slot() / vfmig_iova_free_slot().
  *   On the sriov_numvfs=0 path that means we run AFTER
  *   pci_disable_sriov() has finished -- i.e. after every VF has been
  *   fully unbound (mlx5_core remove_one -> mlx5_unregister_device ->

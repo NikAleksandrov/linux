@@ -19,10 +19,12 @@
  *      (one we fully own; not the dma-iommu-managed one).
  *   2. Lay out a 4 GB IOVA window per VF at a high, well-known base
  *      (VFMIG_IOVA_BASE) so the source's IOVAs are reproducible.
- *   3. Provide a bump allocator (vfmig_iova_alloc_coherent) that the
- *      mlx5_core probe path uses *instead of* dma_alloc_coherent for
- *      every DMA buffer the firmware will record an IOVA for. Same
- *      sequence of calls on source and destination -> same IOVAs.
+ *   3. Provide a slot-tagged allocator (vfmig_iova_alloc_slot) that
+ *      the mlx5_core probe path uses *instead of* dma_alloc_coherent
+ *      for every DMA buffer the firmware will record an IOVA for. Each
+ *      caller declares which kind of allocation it is (CMD_RING,
+ *      FW_PAGE, DMA_COHERENT, ...) and gets a deterministic IOVA from
+ *      that slot's dedicated sub-window.
  *   4. SAVE walks this domain's page registry, emits one HOST_PAGE
  *      wire record per entry. LOAD parses them and replays each entry
  *      via vfmig_iova_replay_page() *before* LOAD_VHCA_STATE runs;
@@ -52,53 +54,40 @@
  * dma_alloc_coherent on this device WILL FAIL -- the dma-iommu
  * fast-path expects an IOMMU_DOMAIN_DMA. That's intentional: any
  * mlx5_core probe-time allocation that hasn't been converted to
- * vfmig_iova_alloc_coherent will fail loudly rather than silently
- * stash the wrong IOVA in the firmware's view of the world. The
- * conversion lands incrementally per the layered restore plan
+ * vfmig_iova_alloc_slot will fail loudly rather than silently stash
+ * the wrong IOVA in the firmware's view of the world. The conversion
+ * lands incrementally per the layered restore plan
  * (cursor_plans/mlx5_vfmig_iova_layered_restore_*.plan.md):
  *   Layer 1: cmd ring;
  *   Layer 2: MANAGE_PAGES (boot pages, FW-driven page-give);
  *   Layer 3: EQs + UARs;
  *   Layer 4: user resources.
  *
- * Determinism contract (v1 shortcut -- READ THIS)
- * -----------------------------------------------
- * vfmig_iova_alloc_coherent() does NOT change allocation semantics
- * at the call site. It looks just like dma_alloc_coherent: caller
- * passes a size, gets back (iova, vaddr), and passes no identifier
- * for *which* allocation this is. The IOVA we hand back is whatever
- * the per-VF bump cursor currently points at.
+ * Determinism contract
+ * --------------------
+ * Every converted call site declares which slot its allocation
+ * belongs to (enum vfmig_iova_slot). Each slot owns its own
+ * VFMIG_IOVA_SLOT_BYTES sub-window of the per-VF IOVA range and its
+ * own bump cursor. Adding, removing, or reordering allocations in one
+ * slot CANNOT shift IOVAs in another slot -- the per-slot windows are
+ * a fixed partition.
  *
- * That means source/destination IOVA equivalence rests entirely on
- * caller discipline: the same converted call sites must execute in
- * the same order with the same sizes on both sides of the migration.
- * Any reorder, addition, removal, or size change between source and
- * destination probe paths drifts the cursor and silently misroutes
- * IOVAs -- the destination FW then dereferences a buffer at the
- * wrong address with no immediately-visible error.
+ * Within a single slot, source/destination IOVA equivalence still
+ * rests on call-site discipline: same set of allocations of the same
+ * sizes in the same order. The instance_key argument lets the caller
+ * pin a specific (slot, key) -> IOVA mapping when it has a stable
+ * identifier (e.g. a firmware-assigned handle); passing 0 falls back
+ * to per-slot auto-numbering, which is the order-based shortcut
+ * scoped to a single slot.
  *
- * Why we accept this in v1: Layer 1 has exactly one converted call
- * site (the cmd ring); Layer 2 adds MANAGE_PAGES which are also
- * order-stable in practice. Building the proper structured store
- * (below) before validating the IOVA-preservation hypothesis on
- * Layer 1 risks scaffolding for an approach that may not work.
- *
- * The intended v2: every converted site gets a stable slot identity
- * (enum vfmig_iova_slot + an instance index). Allocator becomes
- * vfmig_iova_alloc_slot(dom, slot, instance, size, ...). IOVA is
- * derived from (slot, instance), and registry / wire records are
- * keyed by the same. Order, missing-on-one-side, and size mismatches
- * all become loud, specific errors. The bump cursor and
- * lookup-at-cursor logic in alloc_coherent go away.
- *
- * v2 is a hard-required follow-up before Layer 3, not a "nice to
- * have". See the "Architectural shortcut: order-based determinism"
- * section of the plan document for the full rationale and the
- * proposed slot enum sketch.
- *
- * The one defensive cross-check we keep at this site: a registry hit
- * at the cursor whose recorded length differs from the requested
- * size returns -EINVAL. That catches size drift but not order drift.
+ * What this v2 still doesn't do: it doesn't notice when src and dst
+ * disagree about the *number* of allocations in a slot. The per-slot
+ * cursor on the destination just keeps bumping into fresh IOVAs that
+ * have no SAVE-side counterpart, and the FW dereferences something
+ * that was never set up. The next patch in this series adds an
+ * on-wire manifest of (slot, instance_key, len) tuples and a LOAD-
+ * time cross-check that surfaces those drifts as a hard, named error
+ * before any FW dereference happens.
  */
 
 #ifndef __MLX5_CORE_VFMIG_IOVA_H__
@@ -109,6 +98,53 @@
 struct mlx5_core_dev;
 struct pci_dev;
 struct vfmig_iova_domain;
+
+/*
+ * Slot identity. Each value names one *category* of converted
+ * allocation; the (slot, instance_key) pair plus size identifies a
+ * specific allocation within that category. Defined here (outside the
+ * CONFIG_MLX5_VFMIG block below) so both the real declarations and
+ * the !CONFIG inline stubs can reference the type.
+ *
+ * Adding new values:
+ *   - Always append before VFMIG_SLOT_NR. NEVER renumber existing
+ *     enumerators -- the numeric value is the slot's IOVA base
+ *     offset within the per-VF window, and stable IOVAs are the
+ *     point of this whole subsystem.
+ *   - Stay below VFMIG_IOVA_NR_SLOTS. Bumping NR_SLOTS itself
+ *     repartitions every existing slot's window and is a wire-
+ *     incompatible change.
+ *
+ * Slot semantics:
+ *   VFMIG_SLOT_INVALID    -- sentinel. No call site should ever pass
+ *                            this; alloc_slot rejects it with
+ *                            -EINVAL.
+ *   VFMIG_SLOT_CMD_RING   -- cmd ring DMA buffer. Singleton per VF
+ *                            (one ring), allocated by mlx5_cmd_enable
+ *                            during probe.
+ *   VFMIG_SLOT_FW_PAGE    -- firmware-owned page backing for
+ *                            MANAGE_PAGES. Many allocations per VF
+ *                            (one per page the FW asks for); the
+ *                            sequence is deterministic per FW
+ *                            version + capability set.
+ *   VFMIG_SLOT_DMA_COHERENT -- catch-all for the legacy
+ *                              mlx5_dma_zalloc_coherent_node call
+ *                              site (EQ buffers, UAR/DB pages, etc.)
+ *                              The "DMA_COHERENT" name reflects what
+ *                              this slot used to be in v1 -- a
+ *                              renamed alloc_coherent. Future
+ *                              revisions may split it into per-
+ *                              consumer slots (EQ_BUF, UAR_PAGE,
+ *                              ...); each split is an additive enum
+ *                              change above (new tail enumerators).
+ */
+enum vfmig_iova_slot {
+	VFMIG_SLOT_INVALID	= 0,
+	VFMIG_SLOT_CMD_RING	= 1,
+	VFMIG_SLOT_FW_PAGE	= 2,
+	VFMIG_SLOT_DMA_COHERENT	= 3,
+	VFMIG_SLOT_NR,	/* count, must stay <= VFMIG_IOVA_NR_SLOTS */
+};
 
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 
@@ -183,12 +219,47 @@ struct vfmig_iova_domain;
  * mailbox cache, whose ceiling is ~3900 pages. 16 MiB = 4096 pages
  * leaves headroom for additional future transient call sites.
  *
- * The deterministic bump cursor used by vfmig_iova_alloc_coherent is
- * capped at (VFMIG_IOVA_PER_VF - VFMIG_IOVA_TRANSIENT_BYTES) so the
- * two never collide; an alloc_coherent attempt to grow into the
- * transient range returns -ENOSPC.
+ * The deterministic part of the per-VF window (everything below this
+ * sub-window) is partitioned across VFMIG_IOVA_NR_SLOTS slot windows;
+ * see VFMIG_IOVA_SLOT_BYTES below. An alloc_slot attempt that would
+ * grow into the transient range (i.e. past slot N-1's end) returns
+ * -ENOSPC.
  */
 #define VFMIG_IOVA_TRANSIENT_BYTES	(16ULL << 20)	/* 16 MiB */
+
+/*
+ * Per-VF slot fan-out for the deterministic allocator.
+ *
+ * The per-VF deterministic range (VFMIG_IOVA_PER_VF -
+ * VFMIG_IOVA_TRANSIENT_BYTES bytes, == 4080 MiB) is split into
+ * VFMIG_IOVA_NR_SLOTS equal sub-windows of VFMIG_IOVA_SLOT_BYTES
+ * (== 510 MiB) each. Slot N occupies
+ *   [base + N * SLOT_BYTES, base + (N+1) * SLOT_BYTES).
+ * Slot 0 is reserved for VFMIG_SLOT_INVALID -- its IOVA range is
+ * never allocated from. Real allocations come from slots 1..NR-1.
+ *
+ * Sized for headroom rather than measured worst case: 510 MiB / slot
+ * is wildly more than any current call site needs (FW_PAGE peaks at
+ * ~32 MiB on a fully-used VF). The headroom is cheap because slot
+ * sub-windows consume IOVA space, not physical memory; a slot with
+ * one allocation costs one mapped page just like before.
+ *
+ * The 8-slot fan-out is a deliberate over-provision: it lets us add
+ * up to 4 more named slots in future revisions without renumbering
+ * existing slots. Renumbering would change the IOVA bases of
+ * already-deployed slots -- breaking SAVE/LOAD compatibility. New
+ * slots get appended at the next free index; existing slots' bases
+ * stay put.
+ */
+#define VFMIG_IOVA_NR_SLOTS		8U
+#define VFMIG_IOVA_SLOT_BYTES \
+	((VFMIG_IOVA_PER_VF - VFMIG_IOVA_TRANSIENT_BYTES) / VFMIG_IOVA_NR_SLOTS)
+
+/*
+ * (Slot identity is enum vfmig_iova_slot, defined outside the
+ *  #if IS_ENABLED(CONFIG_MLX5_VFMIG) block above so the !CONFIG
+ *  inline stubs can reference it in their function signatures.)
+ */
 
 /*
  * Allocate + attach a per-VF unmanaged paging domain.
@@ -225,54 +296,84 @@ int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
 
 /*
- * Lookup-or-allocate a coherent DMA region in @dom at the next
- * deterministic IOVA position.
+ * Lookup-or-allocate a deterministic DMA-coherent region in @dom from
+ * the IOVA sub-window owned by @slot.
  *
- *   Source flow (no replay):  every call creates a fresh page,
- *                             registers it, iommu_maps it, returns
- *                             (iova, vaddr).
- *   Destination flow (post-replay): @dom's bump cursor has been
- *                             reset to BASE by replay; this call
- *                             finds the already-replayed entry at
- *                             that IOVA and returns its (iova,
- *                             vaddr) without allocating a new page.
+ *   Source flow (no replay):    creates a fresh page, registers it
+ *                               with (slot, instance_key) tagging,
+ *                               iommu_maps it, returns (iova, vaddr).
+ *   Destination flow (post-replay): @dom's per-slot cursor has been
+ *                               reset to that slot's base by
+ *                               vfmig_iova_reset_cursor(); this call
+ *                               finds the already-replayed entry at
+ *                               that IOVA and returns its (iova,
+ *                               vaddr) without allocating a new page.
  *
- * Either way the cursor advances by ALIGN(size, VFMIG_IOVA_GRANULE).
+ * Either way @slot's per-slot cursor advances by ALIGN(size,
+ * VFMIG_IOVA_GRANULE).
  *
- * v1 CALLER CONTRACT (see file-top "Determinism contract" block):
- * probe-time allocators MUST call this in the SAME ORDER and with
- * the SAME SIZES on source and destination, or IOVAs drift silently.
- * The API has no slot-id parameter on purpose: v1 ships the bump
- * cursor as-is so we can validate the IOVA-preservation hypothesis
- * (Layer 1 keystone) before investing in the structured slot store
- * v2 will introduce (vfmig_iova_alloc_slot). Treat the "no slot id"
- * as a temporary state, not a permanent design.
+ * Determinism contract:
+ *   - @slot identifies the IOVA sub-window. Different slots have
+ *     disjoint IOVA ranges; growth in one slot can never shift
+ *     another slot's IOVAs.
+ *   - @instance_key disambiguates multiple allocations within the
+ *     same slot. Two modes:
+ *       instance_key == 0  -> per-slot auto-numbering. The allocator
+ *                             assigns the next sequence number from a
+ *                             per-slot counter. Determinism within a
+ *                             slot then rests on call-site discipline:
+ *                             same set of allocations of the same
+ *                             sizes in the same order. Suitable for
+ *                             singletons (CMD_RING) and for stable-
+ *                             order multi-instance call sites
+ *                             (FW_PAGE, today's DMA_COHERENT pool).
+ *       instance_key != 0  -> caller-pinned. Reserved for future
+ *                             call sites (mlx5_ib resources) where
+ *                             firmware/orchestrator hands the kernel
+ *                             a stable identifier. The allocator
+ *                             records the key on the registry entry
+ *                             but does NOT yet enforce uniqueness or
+ *                             use it for IOVA derivation -- the
+ *                             upcoming on-wire manifest patch is the
+ *                             first consumer that will use the key
+ *                             for correctness, and that patch will
+ *                             also add the collision check.
+ *   - @size is rounded up to PAGE_SIZE.
  *
- * Size is rounded up to PAGE_SIZE. @gfp is honoured for the page
- * allocation in the fresh-alloc case; on the replay-hit path no
- * allocation happens and @gfp is ignored.
+ * Slot validation:
+ *   - @slot in (VFMIG_SLOT_INVALID, VFMIG_SLOT_NR), else -EINVAL.
  *
  * @gfp MUST NOT include __GFP_HIGHMEM/COMP/DMA/DMA32. The first
  * because page_address() must be valid on the backing page (used by
  * the SAVE/replay paths); the others because iommu_map() rejects
  * them outright. Pass GFP_KERNEL or GFP_ATOMIC. Violations return
  * -EINVAL with a ratelimited dev_warn.
+ *
+ * Other returns:
+ *   -ENOSPC   per-slot window exhausted
+ *   -ERANGE   computed IOVA outside the slot's window (kernel bug)
  */
-int  vfmig_iova_alloc_coherent(struct vfmig_iova_domain *dom,
-			       size_t size, gfp_t gfp,
-			       dma_addr_t *iova_out, void **vaddr_out);
+int  vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
+			   enum vfmig_iova_slot slot, u64 instance_key,
+			   size_t size, gfp_t gfp,
+			   dma_addr_t *iova_out, void **vaddr_out);
 
 /*
- * Free a previously-allocated coherent region. Unmaps from the
+ * Free a previously-allocated slot region. Unmaps from the
  * iommu_domain, frees the backing pages, removes from the registry.
- * The IOVA range is NOT reclaimed for re-use -- the bump cursor
- * never goes backwards. For the Layer 0/1 caller set (cmd ring,
- * MANAGE_PAGES) total volume is bounded; long-running migration
- * workloads that thrash allocations would leak fragmentation, which
- * we'll address if a real workload demands it.
+ * The IOVA range is NOT reclaimed for re-use -- per-slot bump cursors
+ * never go backwards. For the current caller set total volume is
+ * bounded; long-running migration workloads that thrash allocations
+ * would leak fragmentation, which we'll address if a real workload
+ * demands it.
+ *
+ * @slot is what the caller passed to vfmig_iova_alloc_slot(); we
+ * cross-check it against the recorded slot tag and WARN_ON_ONCE on
+ * mismatch (caller bug; the free still proceeds).
  */
-void vfmig_iova_free_coherent(struct vfmig_iova_domain *dom,
-			      dma_addr_t iova, size_t size);
+void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
+			  enum vfmig_iova_slot slot,
+			  dma_addr_t iova, size_t size);
 
 /*
  * Pre-populate a registry entry at @iova with @len bytes of
@@ -282,12 +383,20 @@ void vfmig_iova_free_coherent(struct vfmig_iova_domain *dom,
  *
  * Used by the LOAD path to rehydrate the destination's IOVA space
  * from HOST_PAGE wire records *before* LOAD_VHCA_STATE runs. The
- * subsequent vfmig_iova_alloc_coherent calls during VF probe will
- * find these entries via the cursor lookup and reuse them.
+ * subsequent vfmig_iova_alloc_slot calls during VF probe will find
+ * these entries via the per-slot cursor lookup and reuse them.
  *
- * @iova must be in this domain's window and PAGE_SIZE-aligned. @len
- * must be a multiple of PAGE_SIZE. Replaying twice at the same IOVA
- * is an error (returns -EEXIST).
+ * Slot derivation: the v1-compatible HOST_PAGE wire record carries
+ * (iova, len, contents) with no slot tag, so we infer the slot from
+ * @iova by which sub-window it falls into. instance_key on the
+ * replayed entry is set to 0 (placeholder); the destination's
+ * subsequent alloc_slot call re-tags it with the real key when it
+ * claims the entry. The next patch in the series adds an explicit
+ * slot+instance_key on the wire and removes the inference.
+ *
+ * @iova must be in this domain's deterministic window and
+ * PAGE_SIZE-aligned. @len must be a multiple of PAGE_SIZE. Replaying
+ * twice at the same IOVA is an error (returns -EEXIST).
  */
 int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			    dma_addr_t iova, const void *contents,
@@ -319,7 +428,7 @@ int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
  *                 allocation here.
  *   - Failure:    arena at its ceiling AND freelist empty -> -ENOMEM.
  *
- * @gfp constraints match vfmig_iova_alloc_coherent: must NOT include
+ * @gfp constraints match vfmig_iova_alloc_slot: must NOT include
  * __GFP_HIGHMEM/COMP/DMA/DMA32. Pass GFP_KERNEL or GFP_ATOMIC.
  *
  * Page contents are NOT zeroed; callers that need zeroing do it
@@ -341,11 +450,12 @@ void vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
 			      dma_addr_t iova, size_t size);
 
 /*
- * Reset the bump cursor to the domain's base IOVA. Called once on
- * the destination after all HOST_PAGE records have been replayed
- * but before VF probe starts: subsequent vfmig_iova_alloc_coherent
- * calls will then walk the registry from the bottom and find the
- * replayed entries.
+ * Reset every per-slot bump cursor to its slot's base IOVA, and
+ * reset every per-slot auto-key counter to 0. Called once on the
+ * destination after all HOST_PAGE records have been replayed but
+ * before VF probe starts: subsequent vfmig_iova_alloc_slot calls
+ * will then walk each slot from its bottom and find the replayed
+ * entries.
  *
  * Idempotent. Safe to call on a domain that's never been allocated
  * from.
@@ -354,11 +464,12 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom);
 
 /*
  * Iterate the registry in IOVA-ascending order. @cb is invoked once
- * per entry with (iova, vaddr, len, ctx). Iteration order is the
- * order SAVE will emit HOST_PAGE records, which (for v1) is the
- * same order entries were created -- meaning the destination's
- * replay observes the source's allocation order, which is what we
- * need for cursor-lookup correctness.
+ * per entry with (iova, vaddr, len, ctx). Iteration order is
+ * IOVA-sorted across all slots; SAVE uses this order to emit
+ * HOST_PAGE records and the destination replays them in the same
+ * order, which is what the per-slot cursor-lookup correctness rests
+ * on (replayed entries land at exactly the IOVAs the destination's
+ * subsequent alloc_slot calls will request).
  *
  * @cb may not modify the registry (no alloc/free/replay calls).
  * Returning a non-zero value from @cb stops iteration and is
@@ -384,15 +495,18 @@ static inline int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	return -EOPNOTSUPP;
 }
 static inline void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom) { }
-static inline int vfmig_iova_alloc_coherent(struct vfmig_iova_domain *dom,
-					    size_t size, gfp_t gfp,
-					    dma_addr_t *iova_out,
-					    void **vaddr_out)
+static inline int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
+					enum vfmig_iova_slot slot,
+					u64 instance_key,
+					size_t size, gfp_t gfp,
+					dma_addr_t *iova_out,
+					void **vaddr_out)
 {
 	return -EOPNOTSUPP;
 }
-static inline void vfmig_iova_free_coherent(struct vfmig_iova_domain *dom,
-					    dma_addr_t iova, size_t size) { }
+static inline void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
+					enum vfmig_iova_slot slot,
+					dma_addr_t iova, size_t size) { }
 static inline int vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
 					   size_t size, gfp_t gfp,
 					   void **vaddr_out,
