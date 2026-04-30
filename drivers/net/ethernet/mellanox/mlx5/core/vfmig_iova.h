@@ -127,21 +127,58 @@ struct vfmig_iova_domain;
  *                            (one per page the FW asks for); the
  *                            sequence is deterministic per FW
  *                            version + capability set.
- *   VFMIG_SLOT_DMA_COHERENT -- catch-all for the
+ *   VFMIG_SLOT_DMA_COHERENT -- legacy catch-all for the
  *                              mlx5_dma_zalloc_coherent_node call
- *                              site (EQ buffers, UAR/DB pages, etc.)
- *                              The name reflects which kernel API
- *                              this slot wraps; future revisions may
- *                              split it into per-consumer slots
- *                              (EQ_BUF, UAR_PAGE, ...); each split
- *                              is an additive enum change above
- *                              (new tail enumerators).
+ *                              site, retained for two reasons:
+ *                                a) the existing exported
+ *                                   mlx5_frag_buf_alloc_node /
+ *                                   mlx5_db_alloc_node ABI is used
+ *                                   by mlx5_ib, vfio_pci_mlx5, and
+ *                                   vdpa, and those out-of-tree-ish
+ *                                   consumers haven't yet been
+ *                                   converted to the slot-aware
+ *                                   variants. Their allocations
+ *                                   land here without breaking
+ *                                   linkage.
+ *                                b) renumbering existing slots is a
+ *                                   wire-incompatible change.
+ *                              In-tree mlx5_core call sites have all
+ *                              moved to one of the per-purpose slots
+ *                              below; this slot's window stays
+ *                              partitioned but is unused on the
+ *                              tracked-VF probe path until a future
+ *                              layer plumbs the user-resource paths
+ *                              through their own slots.
+ *   VFMIG_SLOT_EQ_BUF       -- EQ frag buffers allocated by eq.c via
+ *                              mlx5_frag_buf_alloc_node_slot. One
+ *                              alloc per EQ; a small fixed set per
+ *                              probe (cmd EQ, async EQ, completion
+ *                              EQs). Splitting EQ traffic out from
+ *                              DB_PAGE / FRAG_BUF means adding a new
+ *                              EQ doesn't shift WQ or doorbell
+ *                              IOVAs.
+ *   VFMIG_SLOT_FRAG_BUF     -- generic queue frag buffers (WQs, CQs,
+ *                              SQs, RQs) allocated by wq.c via
+ *                              mlx5_frag_buf_alloc_node_slot.
+ *                              Variable count per probe depending on
+ *                              configured channels / queue sizes.
+ *   VFMIG_SLOT_DB_PAGE      -- doorbell pgdir pages allocated by
+ *                              mlx5_alloc_db_pgdir. Each pgdir page
+ *                              hosts up to db_per_page (~ 64 on a
+ *                              64-byte cache line) shared doorbells.
+ *                              All db_alloc_node callers (internal
+ *                              and external) funnel here -- the
+ *                              page is the same kind of resource
+ *                              regardless of who asked.
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
 	VFMIG_SLOT_CMD_RING	= 1,
 	VFMIG_SLOT_FW_PAGE	= 2,
 	VFMIG_SLOT_DMA_COHERENT	= 3,
+	VFMIG_SLOT_EQ_BUF	= 4,
+	VFMIG_SLOT_FRAG_BUF	= 5,
+	VFMIG_SLOT_DB_PAGE	= 6,
 	VFMIG_SLOT_NR,	/* count, must stay <= VFMIG_IOVA_NR_SLOTS */
 };
 

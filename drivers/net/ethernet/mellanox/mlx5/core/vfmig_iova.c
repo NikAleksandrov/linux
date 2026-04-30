@@ -707,11 +707,14 @@ void vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom)
 		for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++)
 			total += dom->expected_count[s];
 		dev_info(&dom->vf_pdev->dev,
-			 "vfmig_iova: vf %u drift detection armed (replays: cmd_ring=%u fw_page=%u dma_coherent=%u, total=%u)\n",
+			 "vfmig_iova: vf %u drift detection armed (replays: cmd_ring=%u fw_page=%u dma_coherent=%u eq_buf=%u frag_buf=%u db_page=%u, total=%u)\n",
 			 dom->vf_id,
 			 dom->expected_count[VFMIG_SLOT_CMD_RING],
 			 dom->expected_count[VFMIG_SLOT_FW_PAGE],
 			 dom->expected_count[VFMIG_SLOT_DMA_COHERENT],
+			 dom->expected_count[VFMIG_SLOT_EQ_BUF],
+			 dom->expected_count[VFMIG_SLOT_FRAG_BUF],
+			 dom->expected_count[VFMIG_SLOT_DB_PAGE],
 			 total);
 	}
 	mutex_unlock(&dom->lock);
