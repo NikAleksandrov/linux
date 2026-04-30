@@ -90,17 +90,38 @@ struct mlx5_vfmig_get_vhca_id {
  * MLX5_VFMIG_IOC_QUERY_VF:
  *   Diagnostic snapshot of one VF on the owning PF. Returns the VF's
  *   live vhca_id (queried via QUERY_HCA_CAP(other_function=1)), the
- *   "restored" bit currently latched on the PF, and the total number
- *   of VFs the PF has provisioned. Userspace iterates 0..num_vfs-1 to
- *   enumerate; that's intentionally cheaper to maintain than a
- *   variable-length list ioctl.
+ *   "restored" and "tracked" bits currently latched on the PF, and
+ *   the total number of VFs the PF has provisioned. Userspace
+ *   iterates 0..num_vfs-1 to enumerate; that's intentionally cheaper
+ *   to maintain than a variable-length list ioctl.
+ *
+ *   Output fields:
+ *     vhca_id:   live VHCA identifier from
+ *                QUERY_HCA_CAP(other_function=1).
+ *     restored:  1 if MLX5_VFMIG_IOC_MARK_RESTORED was issued for
+ *                this VF (i.e. its next probe should skip the
+ *                ENABLE_HCA / SET_ISSI / boot-pages / INIT_HCA
+ *                sequence and apply the staged LOAD blob instead).
+ *     tracked:   1 if MLX5_VFMIG_IOC_SET_TRACKED { enable=1 } is
+ *                currently in effect for this VF -- i.e. its
+ *                per-VF unmanaged IOMMU domain is allocated and
+ *                attached, and probe-time DMA buffers will route
+ *                through the deterministic IOVA allocator instead
+ *                of dma_alloc_coherent. CRIU's mlx5_sriov_vfmig
+ *                plugin uses this at startup to discover which
+ *                PFs/VFs are eligible for save/restore without
+ *                binding any driver. Returned as 0 on out-of-range
+ *                vf_id (alongside -ERANGE), so it's safe to read
+ *                in the error-path.
  */
 struct mlx5_vfmig_query_vf {
 	__u32 vf_id;		/* in  */
 	__u32 num_vfs;		/* out: total VFs provisioned on this PF */
 	__u16 vhca_id;		/* out */
 	__u8  restored;		/* out: 1 if MARK_RESTORED was issued */
-	__u8  reserved;
+	__u8  tracked;		/* out: 1 if SET_TRACKED { enable=1 }
+				 *      currently in effect on this VF
+				 */
 };
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
@@ -253,6 +274,14 @@ struct mlx5_vfmig_enable_migratable {
  *   has unknown bits, -EBUSY per the above, -ENODEV if the PF is
  *   gone, -EOPNOTSUPP if the platform has no IOMMU coverage for the
  *   VF's pci_dev (no IOMMU group, etc.).
+ *
+ *   The flag's current state is observable via
+ *   MLX5_VFMIG_IOC_QUERY_VF -- the @tracked output field on
+ *   struct mlx5_vfmig_query_vf reflects whether SET_TRACKED is in
+ *   effect for a given vf_id without requiring the caller to bind
+ *   the VF or otherwise touch it. Userspace orchestrators (e.g.
+ *   CRIU's mlx5_sriov_vfmig plugin) rely on QUERY_VF for cheap
+ *   discovery of vfmig-eligible VFs at startup.
  */
 struct mlx5_vfmig_set_tracked {
 	__u32 vf_id;	/* in  */

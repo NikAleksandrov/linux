@@ -892,8 +892,14 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.reserved)
-		return -EINVAL;
+
+	/*
+	 * The byte that used to be @reserved is now @tracked (out).
+	 * No input check on it -- the kernel always overwrites the
+	 * field on success or on -ERANGE -- so old userspace that
+	 * happens to have a non-zero byte in there still gets a clean
+	 * answer instead of -EINVAL.
+	 */
 
 	sriov = &vfmig->pf_mdev->priv.sriov;
 
@@ -901,6 +907,7 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	if (arg.vf_id >= sriov->num_vfs) {
 		arg.vhca_id = 0;
 		arg.restored = 0;
+		arg.tracked = 0;
 		if (copy_to_user(uarg, &arg, sizeof(arg)))
 			return -EFAULT;
 		return -ERANGE;
@@ -911,7 +918,17 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 		return err;
 
 	arg.vhca_id = vhca_id;
+	/*
+	 * @restored and @tracked are read without explicit locking,
+	 * matching the rest of the QUERY_VF path. They are u8 flags
+	 * that toggle only via the SET_TRACKED / MARK_RESTORED
+	 * ioctls, and a torn read just produces a one-cycle stale
+	 * answer for a userspace observer that's racing those ioctls
+	 * against this query. Stable values during the typical
+	 * "userspace orchestrator polls QUERY_VF at init" use case.
+	 */
 	arg.restored = sriov->vfs_ctx[arg.vf_id].restored;
+	arg.tracked = sriov->vfs_ctx[arg.vf_id].vfmig_tracked;
 	if (copy_to_user(uarg, &arg, sizeof(arg)))
 		return -EFAULT;
 	return 0;

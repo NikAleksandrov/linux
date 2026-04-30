@@ -124,8 +124,9 @@ static int do_query(int fd, unsigned int vf_id)
 		perror("QUERY_VF");
 		return 1;
 	}
-	printf("vf %u vhca_id 0x%04x restored=%u (num_vfs=%u)\n",
-	       vf_id, info.vhca_id, info.restored, info.num_vfs);
+	printf("vf %u vhca_id 0x%04x restored=%u tracked=%u (num_vfs=%u)\n",
+	       vf_id, info.vhca_id, info.restored, info.tracked,
+	       info.num_vfs);
 	return 0;
 }
 
@@ -147,7 +148,8 @@ static int do_list(int fd)
 		return 0;
 	}
 
-	printf("%-6s %-9s %s\n", "vf_id", "vhca_id", "restored");
+	printf("%-6s %-9s %-9s %s\n",
+	       "vf_id", "vhca_id", "restored", "tracked");
 	for (i = 0; i < n; i++) {
 		err = query_one(fd, i, &info);
 		if (err) {
@@ -156,8 +158,8 @@ static int do_list(int fd)
 				i, strerror(errno));
 			continue;
 		}
-		printf("%-6u 0x%04x    %u\n",
-		       i, info.vhca_id, info.restored);
+		printf("%-6u 0x%04x    %-9u %u\n",
+		       i, info.vhca_id, info.restored, info.tracked);
 	}
 	return 0;
 }
