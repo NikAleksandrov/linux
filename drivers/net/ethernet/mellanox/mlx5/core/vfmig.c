@@ -743,9 +743,20 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 	desired = (arg.enable == 1);
 
 	if (!!vfs_ctx->vfmig_tracked == desired) {
-		mlx5_core_dbg(pf_mdev,
-			      "vfmig: SET_TRACKED vf %u: already %d, no-op\n",
-			      arg.vf_id, desired);
+		/*
+		 * Promoted from mlx5_core_dbg to mlx5_core_info on
+		 * purpose: a "successful" SET_TRACKED that was actually
+		 * a silent no-op is the exact symptom of running
+		 * userspace against a stale mlx5_core.ko (e.g. kernel
+		 * rebuilt but module not re-installed/reloaded). Without
+		 * a default-visible breadcrumb, the next QUERY_VF or
+		 * LOAD_VHCA_STATE failure is very hard to attribute to
+		 * version skew. The line is one-per-explicit-call, not
+		 * a hot path, so the noise cost is negligible.
+		 */
+		mlx5_core_info(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u: already %d, no-op\n",
+			       arg.vf_id, desired);
 		return 0;
 	}
 
