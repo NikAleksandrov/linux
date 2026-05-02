@@ -1264,21 +1264,36 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 			goto err_cmd_cleanup;
 		}
 
-		err = mlx5_core_enable_hca(dev, 0);
-		if (err) {
-			/*
-			 * Any error here is informational: either FW
-			 * reports "already enabled" (LOAD restored a VHCA
-			 * the source had already brought up), or the
-			 * post-LOAD cmd ring is dead and this command
-			 * timed out. Either way, log and let the next
-			 * VHCA-targeted command (mlx5_query_hca_caps in
-			 * mlx5_function_open) surface the real state.
-			 */
-			mlx5_core_warn(dev,
-				       "vfmig: post-LOAD ENABLE_HCA(self) returned %d for vhca_id 0x%04x; continuing\n",
-				       err, restored_vhca_id);
-		}
+		/*
+		 * Skip ENABLE_HCA(self) entirely on a restored VF.
+		 * LOAD_VHCA_STATE (issued on the PF mdev upstream of us
+		 * via mlx5_vfmig_vf_apply_pending_load) leaves the VHCA
+		 * in the lifecycle state captured by the source --
+		 * typically ACTIVE, or STOPPED if the SAVE was taken
+		 * with MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED. Either way
+		 * the FW already considers this VHCA enabled.
+		 *
+		 * Pre-this-patch we kept the call as a try-and-ignore
+		 * out of paranoia about LOAD landing the VHCA in some
+		 * not-quite-ACTIVE state we hadn't catalogued. Empirical
+		 * result across all M2 testing: every restored probe
+		 * gets bad-parameter syndrome 0x5d52ee here ("VHCA
+		 * already enabled"), and every restored probe also runs
+		 * to completion afterwards. The call is unnecessary
+		 * and the recurring -22 warn line just clutters dmesg
+		 * and trains operators to ignore mlx5_core_warn lines
+		 * on restored VFs -- which is exactly the wrong reflex
+		 * to build, since the next L4 patches will start
+		 * surfacing genuine restored-VF mlx5_ib failures here.
+		 *
+		 * If a future LOAD-state contract change ever requires
+		 * an explicit ENABLE_HCA on the destination, that is a
+		 * FW protocol regression that should be surfaced as an
+		 * error rather than papered over here.
+		 */
+		mlx5_core_dbg(dev,
+			      "vfmig: skipping ENABLE_HCA(self) on restored vhca_id 0x%04x; LOAD_VHCA_STATE already enabled it\n",
+			      restored_vhca_id);
 
 		mlx5_start_health_poll(dev);
 
