@@ -1233,6 +1233,19 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 		if (restored_out)
 			*restored_out = true;
 
+		/*
+		 * Latch the "this mdev is a restored VF" bit on our own
+		 * priv so consumers outside mlx5_core (e.g. mlx5_ib) can
+		 * interrogate it via mlx5_vf_is_restored() without having
+		 * to walk back to the PF's sriov.vfs_ctx[] -- which gets
+		 * cleared by mlx5_vfmig_vf_consume_restored() above.
+		 *
+		 * Stays set for the lifetime of this mdev; cleared
+		 * implicitly when the mdev is freed and reallocated on the
+		 * next sriov_numvfs cycle.
+		 */
+		dev->priv.vfmig_self_restored = true;
+
 		err = mlx5_vfmig_vf_apply_pending_load(dev);
 		if (err) {
 			mlx5_core_err(dev,

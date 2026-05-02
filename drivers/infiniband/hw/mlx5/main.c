@@ -3039,6 +3039,22 @@ int mlx5_ib_dev_res_cq_init(struct mlx5_ib_dev *dev)
 	struct ib_cq *cq;
 	int ret = 0;
 
+	/*
+	 * Restored VFs (M2 contract) come up with their VHCA's FW-side
+	 * objects already populated by LOAD_VHCA_STATE, including whatever
+	 * dev_res-class objects the source had. Allocating fresh ones here
+	 * would either succeed and leak (the source's still own those FW
+	 * IDs) or fail loudly; either way we don't want it. Refuse the
+	 * lazy init so the caller (mlx5_ib_create_qp / create_srq) returns
+	 * cleanly without ever issuing CREATE_CQ / ALLOC_PD.
+	 *
+	 * In M2 a restored VF is netdev/ULP-free and RDMA-disabled at the
+	 * kernel level; user-space verbs restore (Rung 3) will rebind the
+	 * captured FW objects directly via QUERY_*-based RESTORE_* verbs
+	 * rather than going through the dev_res lazy-create path.
+	 */
+	if (mlx5_vf_is_restored(dev->mdev))
+		return -EOPNOTSUPP;
 
 	/*
 	 * devr->c0 is set once, never changed until device unload.
@@ -3083,6 +3099,30 @@ int mlx5_ib_dev_res_srq_init(struct mlx5_ib_dev *dev)
 	struct ib_srq_init_attr attr;
 	struct ib_srq *s0, *s1;
 	int ret = 0;
+
+	/*
+	 * See the matching comment in mlx5_ib_dev_res_cq_init(). On a
+	 * restored VF the dev_res XRC SRQs (devr->s0/s1) and their backing
+	 * CQ/PD belong to the source -- recreating them would post
+	 * CREATE_SRQ to FW, which (empirically, CX-7 / FW 28.48.1000)
+	 * returns syndrome 0x32624 because the FW already has those
+	 * objects on this VHCA. The bail-out path from that failure is
+	 * also what triggered the cmd_ent refcount underflow we tracked
+	 * separately; even ignoring the syndrome, we don't want the
+	 * commands to fly.
+	 *
+	 * The only in-tree caller that actually depends on this resource
+	 * during probe is the GSI QP1 setup in ib_core's create_mad_qp(),
+	 * which calls into mlx5_ib_create_qp() -> here. Returning
+	 * -EOPNOTSUPP makes ib_mad_init_device() leave the port out of
+	 * the MAD agent list (one residual "Couldn't open port 1" in
+	 * dmesg from ib_core; the caller is in ib_core, not us). Port 1
+	 * stays DOWN, ib_register_device() succeeds, and the user-visible
+	 * /dev/infiniband/uverbsN appears so the restored CRIU process
+	 * can later open it.
+	 */
+	if (mlx5_vf_is_restored(dev->mdev))
+		return -EOPNOTSUPP;
 
 	/*
 	 * devr->s1 is set once, never changed until device unload.
@@ -3144,20 +3184,42 @@ static int mlx5_ib_dev_res_init(struct mlx5_ib_dev *dev)
 	if (!MLX5_CAP_GEN(dev->mdev, xrc))
 		return -EOPNOTSUPP;
 
+	/*
+	 * Restored VFs already have the source's XRCDs (and the rest of
+	 * dev_res's FW objects) materialised on this VHCA via
+	 * LOAD_VHCA_STATE. Don't allocate fresh ones -- they'd take new FW
+	 * IDs that nothing on the destination references, leak the
+	 * source's IDs, and run the risk of bumping into per-VHCA limits.
+	 * Still init the mutexes so the matching res_cleanup path and the
+	 * lazy cq_init/srq_init early-returns above don't hit uninited
+	 * locks. devr->xrcdn0/xrcdn1 stay zero on restored VFs, which is
+	 * fine: nothing reads them while srq_init returns -EOPNOTSUPP.
+	 */
+	mutex_init(&devr->cq_lock);
+	mutex_init(&devr->srq_lock);
+
+	if (mlx5_vf_is_restored(dev->mdev)) {
+		mlx5_ib_dbg(dev,
+			    "vfmig: restored VF -- skipping dev_res XRCD allocation; FW carries source's XRCDs\n");
+		return 0;
+	}
+
 	ret = mlx5_cmd_xrcd_alloc(dev->mdev, &devr->xrcdn0, 0);
 	if (ret)
-		return ret;
+		goto err_mutex_destroy;
 
 	ret = mlx5_cmd_xrcd_alloc(dev->mdev, &devr->xrcdn1, 0);
 	if (ret) {
 		mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn0, 0);
-		return ret;
+		goto err_mutex_destroy;
 	}
 
-	mutex_init(&devr->cq_lock);
-	mutex_init(&devr->srq_lock);
-
 	return 0;
+
+err_mutex_destroy:
+	mutex_destroy(&devr->srq_lock);
+	mutex_destroy(&devr->cq_lock);
+	return ret;
 }
 
 static void mlx5_ib_dev_res_cleanup(struct mlx5_ib_dev *dev)
@@ -3169,8 +3231,15 @@ static void mlx5_ib_dev_res_cleanup(struct mlx5_ib_dev *dev)
 		ib_destroy_srq(devr->s1);
 		ib_destroy_srq(devr->s0);
 	}
-	mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn1, 0);
-	mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn0, 0);
+	/*
+	 * Mirror the dev_res_init skip on restored VFs: nothing was
+	 * allocated, nothing to dealloc. Posting XRCD_DEALLOC against IDs
+	 * we never owned would be a real FW error.
+	 */
+	if (!mlx5_vf_is_restored(dev->mdev)) {
+		mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn1, 0);
+		mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn0, 0);
+	}
 	/* After p0/c0 init, they are not unset during the device lifetime. */
 	if (devr->c0) {
 		ib_destroy_cq(devr->c0);

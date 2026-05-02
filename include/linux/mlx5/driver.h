@@ -703,6 +703,22 @@ struct mlx5_priv {
 	 * core/vfmig.c.
 	 */
 	struct mlx5_vfmig_pf *vfmig;
+
+	/*
+	 * Per-VF-mdev "this VF was brought up via the vfmig restore path"
+	 * latch. Set in mlx5_function_enable() after the
+	 * mlx5_vfmig_vf_consume_restored() branch has fired; stays set for
+	 * the lifetime of this mdev. Read via mlx5_vf_is_restored() so that
+	 * subsystems outside mlx5_core (mlx5_ib in particular) can refuse to
+	 * post FW commands that would mutate VHCA state already installed
+	 * by LOAD_VHCA_STATE.
+	 *
+	 * Lives on the VF mdev's own priv (not on the PF's
+	 * sriov.vfs_ctx[].restored, which is consumed-and-cleared during
+	 * probe) so that consumers can interrogate it at any point in the
+	 * mdev's lifetime without coordinating with the PF.
+	 */
+	bool	vfmig_self_restored;
 };
 
 enum mlx5_device_state {
@@ -1291,6 +1307,23 @@ static inline bool mlx5_core_is_pf(const struct mlx5_core_dev *dev)
 static inline bool mlx5_core_is_vf(const struct mlx5_core_dev *dev)
 {
 	return dev->coredev_type == MLX5_COREDEV_VF;
+}
+
+/*
+ * Returns true iff this mdev is a VF that was brought up via the vfmig
+ * restore path (mlx5_vfmig_vf_consume_restored() fired during probe and
+ * LOAD_VHCA_STATE was applied to the underlying VHCA). Latched in
+ * priv.vfmig_self_restored for the lifetime of the mdev.
+ *
+ * Consumers should treat a "true" answer as "this VHCA's FW state was
+ * inherited from the source -- do NOT post commands that recreate or
+ * reconfigure top-level objects FW already considers populated."
+ *
+ * Always false on PFs and on VFs probed via the normal path.
+ */
+static inline bool mlx5_vf_is_restored(const struct mlx5_core_dev *dev)
+{
+	return dev->priv.vfmig_self_restored;
 }
 
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
