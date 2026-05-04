@@ -294,4 +294,66 @@ struct mlx5_vfmig_set_tracked {
 #define MLX5_VFMIG_IOC_SET_TRACKED \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x07, struct mlx5_vfmig_set_tracked)
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_UID:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- NOT PART OF THE M2/M3 RESTORE
+ *       CONTRACT. ***
+ *
+ *   Issues a CREATE_UCTX(VF) immediately followed by DESTROY_UCTX(VF)
+ *   on a *bound* VF and returns the @uid the firmware handed back.
+ *   The point is to read the firmware's per-VHCA uctx-table allocator
+ *   high-water-mark without having to drive a real ucontext from
+ *   user space, so we can answer the L4 Rung 3 question:
+ *
+ *       "Does LOAD_VHCA_STATE preserve the source's uctx-id space, or
+ *        does the destination's allocator start fresh from 0?"
+ *
+ *   Methodology:
+ *     - Source post-bind: ioctl(PROBE_UID, vf_id) -> U_src_1, U_src_2.
+ *       The two values reveal whether the VHCA already has live UIDs
+ *       (gap from 0 -> U_src_1) and whether allocation is monotonic
+ *       (U_src_2 == U_src_1 + 1 typically).
+ *     - SAVE the source VHCA, transport blob, LOAD on destination.
+ *     - Destination post-bind: ioctl(PROBE_UID, vf_id) -> U_dst_1.
+ *       - U_dst_1 >  U_src_2  ==> FW preserved source's uctx table
+ *                                 across LOAD (good for "uid persistence").
+ *       - U_dst_1 <= U_src_1  ==> FW reset uctx table on LOAD
+ *                                 (uid identity is *not* preserved;
+ *                                  R3 must use a different binding
+ *                                  mechanism than uid-on-the-wire).
+ *
+ *   This ioctl is used only to *answer* an empirical question about
+ *   firmware behaviour during R3 design. The R3 user-context restore
+ *   path will not reuse this surface; it will go through dedicated
+ *   uverbs verbs that bind ib_uobjects to existing FW objects via
+ *   QUERY_*. Once L4 Rung 3 design lands, this ioctl can be removed
+ *   without breaking any in-tree consumer.
+ *
+ *   The VF must currently be bound to mlx5_core (i.e. its mdev is
+ *   "interface up"); otherwise -ENODEV is returned. This is by design
+ *   -- CREATE_UCTX has no other_function form, so the command must
+ *   be issued by the VF's own mdev.
+ *
+ *   Returns 0 with @uid populated on success; -EINVAL if vf_id is
+ *   out of range or any reserved field is non-zero; -ENODEV if the
+ *   VF is not currently bound to mlx5_core or its interface is down;
+ *   any negative firmware-error code if CREATE_UCTX itself fails.
+ *   On a CREATE_UCTX success followed by a DESTROY_UCTX failure the
+ *   ioctl logs at warn level and returns the allocated @uid (FW
+ *   leaks the uctx until the VHCA is torn down -- acceptable for a
+ *   debug ioctl on a controlled experiment).
+ */
+struct mlx5_vfmig_probe_uid {
+	__u32 vf_id;		/* in  */
+	__u32 reserved;		/* in: must be 0 */
+	__u16 uid;		/* out: uid returned by CREATE_UCTX
+				 *      and immediately released by
+				 *      DESTROY_UCTX on the same VHCA.
+				 */
+	__u16 reserved2;	/* out: zeroed */
+	__u32 reserved3;	/* out: zeroed */
+};
+#define MLX5_VFMIG_IOC_PROBE_UID \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x08, struct mlx5_vfmig_probe_uid)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

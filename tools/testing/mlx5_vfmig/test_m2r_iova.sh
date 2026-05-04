@@ -242,6 +242,18 @@ sleep 1
 PRE=$(snapshot_vf "$VF" "PRE")
 echo "$PRE"
 
+# Optional UID probe hook (PROBE_UID=1). Issues CREATE_UCTX +
+# DESTROY_UCTX against the just-bound source VF and emits the
+# allocated uid as a sentinel-tagged line we can grep for from
+# probe_uar_persistence.sh and friends. Cheap, no firmware state
+# left behind.
+if [ "${PROBE_UID:-0}" = "1" ]; then
+    SRC_UID_OUT=$(sudo "$TOOL" "$PF" probe_uid 0 || true)
+    echo "[probe_uid src] $SRC_UID_OUT"
+    SRC_UID_OUT2=$(sudo "$TOOL" "$PF" probe_uid 0 || true)
+    echo "[probe_uid src] $SRC_UID_OUT2"
+fi
+
 # Sanity log: confirm the IOVA hook actually fired for the cmd ring.
 echo "--- cmd ring IOVA registry sanity (expect at least one HOST_PAGE entry) ---"
 sudo dmesg | grep -E 'vfmig_iova: vf 0 domain attached|vfmig: cmd ring at iova' | tail -10 || true
@@ -383,6 +395,17 @@ unset rc
 
 echo "--- dmesg after LOAD+BIND ---"
 sudo dmesg | tail -60
+
+# Optional UID probe hook on the destination side (paired with the
+# source-side hook in Phase A). If the source uid space is preserved
+# across LOAD_VHCA_STATE, the destination's first probe should land
+# strictly above the source's high-water-mark; if FW reset the table
+# the destination's first probe should match the source's first
+# probe.
+if [ "${PROBE_UID:-0}" = "1" ] && [ -e "$(vf_path $VF2)/driver" ]; then
+    DST_UID_OUT=$(sudo "$TOOL" "$PF" probe_uid 0 || true)
+    echo "[probe_uid dst] $DST_UID_OUT"
+fi
 
 # Hard-fail on the legacy baseline failure: 60s ENABLE_HCA timeout.
 # If this still appears, L1b's HOST_PAGE replay isn't actually being

@@ -825,6 +825,129 @@ out_unlock:
 	return err;
 }
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_UID handler -- experimental.
+ *
+ * Issues CREATE_UCTX(VF) + immediate DESTROY_UCTX(VF) on the bound
+ * VF mdev and returns the uid the firmware allocated. The point of
+ * the round-trip is to read FW's per-VHCA uctx-id allocator
+ * high-water-mark *without* having to drive a real ucontext from
+ * user space, so we can answer "did LOAD_VHCA_STATE preserve the
+ * source's uctx-id space?" with a single ioctl on src and dst.
+ *
+ * VF mdev lookup
+ *   CREATE_UCTX has no other_function variant; the command must
+ *   target the VF's own VHCA via its own mdev's cmdif. We:
+ *     1. Resolve the VF's pci_dev from (pf_pdev, vf_id) via
+ *        vfmig_get_vf_pdev() (refcounted, must put on exit).
+ *     2. Take the VF pci_dev's device_lock so ->dev.driver and
+ *        drvdata are stable -- this is the same lock the PCI core
+ *        takes around probe/remove.
+ *     3. Match the bound driver by name (KBUILD_MODNAME) rather
+ *        than by pci_driver pointer; mlx5_core_driver is static in
+ *        main.c and we don't want to add a back-door export just
+ *        for this debug ioctl.
+ *     4. Fetch vf_mdev via pci_get_drvdata() and verify
+ *        MLX5_INTERFACE_STATE_UP -- the cmdif is only valid then.
+ *
+ * Why we destroy immediately
+ *   We're probing the *allocator state*, not creating a usable
+ *   uctx. Holding a uid alive across the ioctl would (a) leak it
+ *   on every probe, and (b) perturb the allocator we're trying to
+ *   measure. Destroy-on-the-spot makes back-to-back ioctls return
+ *   adjacent values that reveal monotonicity vs reuse. If the
+ *   DESTROY_UCTX itself fails after a successful CREATE_UCTX (it
+ *   shouldn't on healthy FW), we log and return success with the
+ *   measured uid -- the leaked uctx survives only until the next
+ *   sriov_numvfs=0 cycle, which is acceptable for an experimental
+ *   debug surface.
+ */
+static long vfmig_ioc_probe_uid(struct mlx5_vfmig_pf *vfmig,
+				void __user *uarg)
+{
+	u32 in[MLX5_ST_SZ_DW(create_uctx_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(create_uctx_out)] = {};
+	u32 din[MLX5_ST_SZ_DW(destroy_uctx_in)] = {};
+	u32 dout[MLX5_ST_SZ_DW(destroy_uctx_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_uid arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	u16 uid;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_uid: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_uid: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	MLX5_SET(create_uctx_in, in, opcode, MLX5_CMD_OP_CREATE_UCTX);
+	err = mlx5_cmd_exec(vf_mdev, in, sizeof(in), out, sizeof(out));
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_uid: CREATE_UCTX on vf %u failed %d\n",
+			       arg.vf_id, err);
+		goto out_unlock;
+	}
+
+	uid = MLX5_GET(create_uctx_out, out, uid);
+
+	MLX5_SET(destroy_uctx_in, din, opcode, MLX5_CMD_OP_DESTROY_UCTX);
+	MLX5_SET(destroy_uctx_in, din, uid, uid);
+	err = mlx5_cmd_exec(vf_mdev, din, sizeof(din), dout, sizeof(dout));
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_uid: DESTROY_UCTX(vf=%u, uid=%u) failed %d -- uctx leaked until VHCA teardown\n",
+			       arg.vf_id, uid, err);
+		err = 0; /* we still return the measured uid */
+	}
+
+	mlx5_core_info(pf_mdev,
+		       "vfmig: probe_uid: vf %u CREATE_UCTX returned uid=%u\n",
+		       arg.vf_id, uid);
+
+	arg.uid = uid;
+	arg.reserved2 = 0;
+	arg.reserved3 = 0;
+
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
 static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 				    void __user *uarg)
 {
@@ -3136,6 +3259,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_SET_TRACKED:
 		ret = vfmig_ioc_set_tracked(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_PROBE_UID:
+		ret = vfmig_ioc_probe_uid(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

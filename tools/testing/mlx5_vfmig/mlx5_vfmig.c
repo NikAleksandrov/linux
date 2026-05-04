@@ -50,6 +50,30 @@ static int do_enable_migratable(int fd, unsigned int vf_id)
 	return 0;
 }
 
+/*
+ * EXPERIMENTAL: probe the firmware's per-VHCA uctx-id allocator on a
+ * bound VF by issuing CREATE_UCTX + immediate DESTROY_UCTX from the
+ * PF. Used to answer "did LOAD_VHCA_STATE preserve the source's
+ * uctx-id space?" empirically. See
+ * include/uapi/linux/mlx5_vfmig.h for methodology.
+ */
+static int do_probe_uid(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_probe_uid arg = { .vf_id = vf_id };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_UID, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core (PROBE_UID requires the VF mdev to be interface-up)\n",
+				vf_id);
+		else
+			perror("PROBE_UID");
+		return 1;
+	}
+	printf("vf %u: probe_uid -> uid=%u\n", vf_id, arg.uid);
+	return 0;
+}
+
 static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
 {
 	struct mlx5_vfmig_set_tracked arg = {
@@ -376,6 +400,7 @@ static void usage(const char *argv0)
 		"  save_vhca_state  <vf_id> <blob_path> [keep_suspended]\n"
 		"  enable_migratable <vf_id>\n"
 		"  set_tracked       <vf_id> <0|1>\n"
+		"  probe_uid         <vf_id>     (experimental)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
 }
@@ -448,6 +473,10 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_set_tracked(fd, strtoul(argv[3], NULL, 0),
 				     strtoul(argv[4], NULL, 0));
+	} else if (verb_eq(verb, "probe_uid")) {
+		if (argc != 4)
+			goto badargs;
+		ret = do_probe_uid(fd, strtoul(argv[3], NULL, 0));
 	} else {
 		fprintf(stderr, "unknown verb: %s\n", verb);
 		ret = 2;
