@@ -77,12 +77,42 @@ echo 'format "vfmig: restored VF -- skipping dev_res" +p' \
     | sudo tee "$DD_FILE" >/dev/null
 
 # --- Step 2: drive the round-trip --------------------------------------
+#
+# We read the kernel log via `journalctl --dmesg --since=$START` rather
+# than plain `dmesg`. This is deliberate: test_m2r_iova.sh issues
+# `dmesg -C` between Phase A and Phase D to keep its own per-phase
+# tails legible, which would otherwise wipe the source's bfreg log
+# before this script has a chance to read it. journald's kmsg journal
+# is *not* affected by `dmesg -C` and keeps the full kernel-log
+# history regardless. If journald is not running on this box
+# (`systemctl is-active systemd-journald` says inactive) the script
+# falls back to plain dmesg with a loud warning -- that case is the
+# only one in which a single-host run can lose the source reading.
 
 cd "$SCRIPT_DIR"
 
-echo "+++ running test_m2r_iova.sh ROLE=both +++"
+START_TS=$(date '+%Y-%m-%d %H:%M:%S')
+USE_JOURNAL=0
+if systemctl is-active --quiet systemd-journald 2>/dev/null; then
+    USE_JOURNAL=1
+fi
+
+echo "+++ running test_m2r_iova.sh ROLE=both PROBE_UID=1 +++"
 sudo dmesg -C
-sudo PF="$PF" ROLE=both ./test_m2r_iova.sh
+# PROBE_UID=1 makes the harness call `mlx5_vfmig probe_uid 0` after
+# both the source bind (Phase A) and the destination bind (Phase D),
+# emitting "[probe_uid src]" / "[probe_uid dst]" lines we can parse
+# alongside the bfreg log to answer both the UAR and UID persistence
+# questions in a single round-trip.
+sudo PF="$PF" ROLE=both PROBE_UID=1 ./test_m2r_iova.sh | tee /tmp/probe_uar_test.log
+
+read_kmsg() {
+    if [ "$USE_JOURNAL" = "1" ]; then
+        sudo journalctl --dmesg --since="$START_TS" --no-pager 2>/dev/null
+    else
+        sudo dmesg
+    fi
+}
 
 # --- Step 3: extract the bfreg lines ----------------------------------
 #
@@ -92,23 +122,29 @@ sudo PF="$PF" ROLE=both ./test_m2r_iova.sh
 #   - one from Phase D's destination bind (with "(restored VF)" suffix)
 
 echo
-echo "==== bfreg observations (raw dmesg) ===="
-sudo dmesg | grep -E 'post-alloc kernel bfreg' || {
-    echo "FAIL: no bfreg log lines in dmesg"
+echo "==== bfreg observations (raw kernel log) ===="
+if ! read_kmsg | grep -E 'post-alloc kernel bfreg'; then
+    echo "FAIL: no bfreg log lines in kernel log"
     echo "Likely causes:"
     echo "  - /lib/modules mlx5_core is stale (predates this experiment)"
     echo "  - dynamic_debug write was rejected (printed an error above)"
     echo "  - mlx5_load() ran before dynamic_debug took effect"
+    if [ "$USE_JOURNAL" = "0" ]; then
+        echo "  - systemd-journald is not running, so the source bfreg log"
+        echo "    was almost certainly wiped by test_m2r_iova.sh's"
+        echo "    in-Phase-D 'dmesg -C'. Enable journald or hand-instrument"
+        echo "    test_m2r_iova.sh to avoid that."
+    fi
     exit 1
-}
+fi
 
 echo
 echo "==== UAR persistence verdict ===="
 
 # Pull the two readings. The destination one carries "(restored VF)";
 # the source one does not.
-SRC_LINE=$(sudo dmesg | grep 'post-alloc kernel bfreg' | grep -v '(restored VF)' | tail -n1 || true)
-DST_LINE=$(sudo dmesg | grep 'post-alloc kernel bfreg' | grep    '(restored VF)' | tail -n1 || true)
+SRC_LINE=$(read_kmsg | grep 'post-alloc kernel bfreg' | grep -v '(restored VF)' | tail -n1 || true)
+DST_LINE=$(read_kmsg | grep 'post-alloc kernel bfreg' | grep    '(restored VF)' | tail -n1 || true)
 
 if [ -z "$SRC_LINE" ] || [ -z "$DST_LINE" ]; then
     echo "WARN: missing one or both readings:"
@@ -159,4 +195,65 @@ else
     echo "              in libmlx5 (unpalatable -- libibverbs ABI)"
     echo "          (c) capture-and-replay UAR ids inside the vfmig blob"
     echo "              (extends LOAD_VHCA_STATE semantics)"
+fi
+
+# --- Step 4: UID persistence verdict (PROBE_UID=1 hook) ---------------
+#
+# test_m2r_iova.sh emitted three `[probe_uid src|dst] vf 0: probe_uid -> uid=N`
+# lines on stdout (which we tee'd to /tmp/probe_uar_test.log):
+#   - two on the source side (back-to-back to read the allocator's
+#     monotonic step / reuse behaviour),
+#   - one on the destination side post-LOAD.
+#
+# Comparison rubric is the same shape as the UAR one: dst > src_max
+# means FW preserves the uctx table across LOAD; dst <= src_min means
+# FW reset it.
+
+echo
+echo "==== uctx (uid) persistence verdict ===="
+if [ ! -s /tmp/probe_uar_test.log ]; then
+    echo "WARN: /tmp/probe_uar_test.log empty -- can't read probe_uid lines"
+else
+    SRC_UIDS=$(grep -E '\[probe_uid src\]' /tmp/probe_uar_test.log | \
+               sed -nE 's/.*uid=([0-9]+).*/\1/p')
+    DST_UID=$(grep -E '\[probe_uid dst\]' /tmp/probe_uar_test.log  | \
+              sed -nE 's/.*uid=([0-9]+).*/\1/p' | tail -n1)
+
+    if [ -z "$SRC_UIDS" ] || [ -z "$DST_UID" ]; then
+        echo "WARN: missing one or both readings:"
+        echo "  src: ${SRC_UIDS:-<none>}"
+        echo "  dst: ${DST_UID:-<none>}"
+    else
+        SRC_MIN=$(echo "$SRC_UIDS" | sort -n | head -n1)
+        SRC_MAX=$(echo "$SRC_UIDS" | sort -n | tail -n1)
+        echo "  source     : uids=$(echo $SRC_UIDS | tr '\n' ' ')"
+        echo "  destination: uid=$DST_UID"
+
+        if   [ "$DST_UID" -gt "$SRC_MAX" ]; then
+            echo
+            echo "PASS-A: destination uid ($DST_UID) is strictly above the"
+            echo "        source's high-water-mark ($SRC_MAX). FW kept the"
+            echo "        source's uctx table reserved across LOAD; uid"
+            echo "        identity could be preserved at R3."
+        elif [ "$DST_UID" = "$SRC_MAX" ] || [ "$DST_UID" = "$SRC_MIN" ]; then
+            echo
+            echo "AMBIG : destination uid ($DST_UID) lies inside the source's"
+            echo "        observed range [$SRC_MIN..$SRC_MAX]. On a same-VHCA"
+            echo "        single-host round-trip (this is one) FW could have"
+            echo "        either (i) preserved + reused our just-released"
+            echo "        slot, or (ii) reset the table and started fresh"
+            echo "        from the same low number we got the first time."
+            echo "        SINGLE-HOST CAN'T DISTINGUISH THESE. Re-run the"
+            echo "        experiment cross-host (provision a fresh VF on a"
+            echo "        different machine, LOAD into it) and compare:"
+            echo "          - dst > src_max  -> FW preserves uctx table"
+            echo "          - dst == 0/1      -> FW resets uctx table"
+        else
+            echo
+            echo "FAIL  : destination uid ($DST_UID) is below the source's"
+            echo "        minimum ($SRC_MIN). FW most likely reset the uctx"
+            echo "        table on LOAD_VHCA_STATE. R3 cannot use FW uid"
+            echo "        as the cross-migration identity."
+        fi
+    fi
 fi
