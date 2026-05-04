@@ -1466,6 +1466,38 @@ static int mlx5_load(struct mlx5_core_dev *dev)
 		return err;
 	}
 
+	/*
+	 * vfmig UAR-identity probe: on a tracked VF this prints the
+	 * FW UAR id (bfreg.up->index) and the bfreg slot within it
+	 * (bfreg.index) that mlx5_alloc_bfreg() just got back from
+	 * ALLOC_UAR. Comparing the values across SAVE+LOAD on a
+	 * tracked VF tells us empirically whether LOAD_VHCA_STATE
+	 * preserves the source's UAR id space:
+	 *
+	 *   - same uar.index on src and dst  ==> FW preserved (or
+	 *     reallocated to the same id, which is the same thing
+	 *     from a CRIU restore standpoint as long as it is
+	 *     deterministic);
+	 *   - dst.uar.index > src.uar.index  ==> FW reserved the
+	 *     source's UARs and handed us a fresh one above the
+	 *     high-water-mark (good news: the source's user-side
+	 *     UARs still exist on dst and could be re-mapped at
+	 *     RESTORE_CONTEXT time);
+	 *   - dst.uar.index == 0 / lower     ==> FW threw the
+	 *     source's UARs away (bad news: R3's UAR-identity-
+	 *     preservation assumption falls apart and we need a
+	 *     different design or an FW protocol change).
+	 *
+	 * Plain dbg-level so it's only noisy when explicitly enabled
+	 * via dynamic_debug while the experiment is running. Drop
+	 * this once the L4 R3 UAR question is answered for good.
+	 */
+	mlx5_core_dbg(dev,
+		      "vfmig: post-alloc kernel bfreg: uar.index=%u bfreg.index=%u%s\n",
+		      dev->priv.bfreg.up ? dev->priv.bfreg.up->index : 0xffffffff,
+		      dev->priv.bfreg.index,
+		      mlx5_vf_is_restored(dev) ? " (restored VF)" : "");
+
 	mlx5_events_start(dev);
 	mlx5_pagealloc_start(dev);
 
