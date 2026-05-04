@@ -2362,11 +2362,23 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 	default:
 		if (init_attr->srq) {
 			MLX5_SET(qpc, qpc, xrcd, devr->xrcdn0);
-			MLX5_SET(qpc, qpc, srqn_rmpn_xrqn, to_msrq(init_attr->srq)->msrq.srqn);
-		} else {
+			MLX5_SET(qpc, qpc, srqn_rmpn_xrqn,
+				 to_msrq(init_attr->srq)->msrq.srqn);
+		} else if (devr->s1) {
 			MLX5_SET(qpc, qpc, xrcd, devr->xrcdn1);
-			MLX5_SET(qpc, qpc, srqn_rmpn_xrqn, to_msrq(devr->s1)->msrq.srqn);
+			MLX5_SET(qpc, qpc, srqn_rmpn_xrqn,
+				 to_msrq(devr->s1)->msrq.srqn);
 		}
+		/*
+		 * else: dev_res's default XRC SRQ has not been lazy-
+		 * initialised (no XRC-class QP has been created yet on
+		 * this device, or this is a restored VF where dev_res
+		 * stays uninitialised by design -- see the gate in
+		 * mlx5_ib_create_qp() above). FW does not consume
+		 * qpc.xrcd or qpc.srqn_rmpn_xrqn when the QP is not XRC
+		 * and has no SRQ configured, so leaving these fields
+		 * zero is correct.
+		 */
 	}
 
 	if (init_attr->send_cq)
@@ -3261,13 +3273,42 @@ int mlx5_ib_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	enum ib_qp_type type;
 	int err;
 
-	err = mlx5_ib_dev_res_srq_init(dev);
-	if (err)
-		return err;
-
 	err = check_qp_type(dev, attr, &type);
 	if (err)
 		return err;
+
+	/*
+	 * dev_res's XRC default SRQs (devr->s0/s1) and the PD/CQ/XRCDs
+	 * that back them are only consumed by XRC-class QPs and by GSI
+	 * QP1. Other QP types either supply their own SRQ via
+	 * init_attr->srq or have qpc.srqn / qpc.xrcd left zero (FW
+	 * does not consume those qpc fields when the QP is not XRC and
+	 * has no SRQ).
+	 *
+	 * Defer the lazy dev_res init to the types that actually need
+	 * it. The previous unconditional call at function entry forced
+	 * three FW round-trips (CREATE_PD, CREATE_CQ, CREATE_SRQ x2)
+	 * on the very first QP create regardless of type, and -- more
+	 * importantly for the vfmig restore path -- it returns
+	 * -EOPNOTSUPP on a restored VF (see mlx5_ib_dev_res_srq_init in
+	 * main.c), which would block all RC/UD/UC user QP creation
+	 * even though those types have no functional dependency on
+	 * dev_res. With the gate moved here, plain user verbs work on
+	 * a restored VF; XRC and GSI continue to fail as documented in
+	 * the L4 Rung 1 contract until L4 Rung 2 imports the source's
+	 * dev_res FW objects.
+	 */
+	switch (type) {
+	case IB_QPT_XRC_INI:
+	case IB_QPT_XRC_TGT:
+	case IB_QPT_GSI:
+		err = mlx5_ib_dev_res_srq_init(dev);
+		if (err)
+			return err;
+		break;
+	default:
+		break;
+	}
 
 	err = check_valid_flow(dev, pd, attr, udata);
 	if (err)
