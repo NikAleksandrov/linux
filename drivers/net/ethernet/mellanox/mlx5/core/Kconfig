@@ -38,6 +38,61 @@ config MLX5_VFMIG
 
 	  If unsure, say Y.
 
+config MLX5_VFMIG_IOVA_PER_VF_GIB
+	int "MLX5 vfmig: per-VF deterministic IOVA window size, in GiB"
+	depends on MLX5_VFMIG
+	range 1 65536
+	default 128
+	help
+	  Size, in GiB, of the deterministic IOVA window allocated to each
+	  tracked VF. The window starts at a high, fixed base and is
+	  partitioned into 8 equal sub-windows for slot-tagged allocations
+	  (cmd ring, FW pages, EQ buffers, frag bufs, doorbell pages, etc.)
+	  with a small transient arena reserved at the top.
+
+	  This caps the total IOVA budget for kernel-side mlx5_core DMA
+	  allocations on a tracked VF. Once the user-space ib_umem_get path
+	  is hooked into this allocator, the same window also caps user
+	  RDMA buffers (MR / CQ / QP / SRQ buffers + doorbell records)
+	  per VF; sized that way it is roughly
+	  (peak concurrent MR pages + peak CQ + WQ buffers) per VF.
+
+	  The default of 128 is sized for typical user RDMA workloads
+	  including modest HPC/AI MR pools, while still leaving room for
+	  meaningful VF density on a 39-bit aperture (~3 VFs at 128 GiB).
+	  Raise it for workloads that pin very large MRs concurrently per
+	  VF (multi-hundred-GiB buffer pools); lower it (e.g. to 4) when
+	  you need to pack many VFs into a tight IOMMU aperture and
+	  per-VF user buffer headroom is not load-bearing.
+
+	  Tradeoff (address space, not memory): each PF reserves
+	  totalvfs * PER_VF of IOMMU virtual address space. Raising this
+	  only costs you supported VFs when the result doesn't fit the
+	  IOMMU aperture; on tight 39-bit apertures (Intel VT-d agaw=2,
+	  ~508 GiB usable) PER_VF=64 fits ~7 VFs, whereas on 48-bit
+	  apertures (agaw=3 / AMD-Vi default) the SR-IOV hardware cap is
+	  the binding constraint long before the aperture. Page tables
+	  are demand-allocated per actually-mapped IOVA, so unused window
+	  space costs no physical memory.
+
+	  The real upper bound is the live IOMMU aperture, not the Kconfig
+	  range. vfmig_iova_domain_create() validates each VF's window
+	  against geometry.aperture_end at SET_TRACKED time and fails with
+	  -EOPNOTSUPP + a printed diagnostic if it doesn't fit. Observed
+	  apertures: Intel VT-d agaw=2 -> 39-bit (512 GiB total);
+	  agaw=3 -> 48-bit (256 TiB); AMD-Vi -> 48-52-bit. With the default
+	  base of 4 GiB, N * PER_VF must fit in (aperture_end - 4 GiB).
+	  The Kconfig range is a sanity ceiling against typos; 65536 GiB
+	  (64 TiB) is comfortably above any realistic single-VF workload
+	  and below the practical limit of a 48-bit aperture.
+
+	  Wire-format compatibility: SAVE blobs are interchangeable only
+	  between source and destination kernels built with the same value
+	  here. A LOAD whose source used a different per-VF size will fail
+	  with -ERANGE on the slot-vs-IOVA cross-check.
+
+	  If unsure, leave at 128.
+
 config MLX5_FPGA
 	bool "Mellanox Technologies Innova support"
 	depends on MLX5_CORE

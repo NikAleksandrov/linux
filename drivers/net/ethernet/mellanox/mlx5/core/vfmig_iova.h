@@ -235,17 +235,26 @@ enum vfmig_iova_slot {
  *                             diagnostic) if a future platform
  *                             reports something even tighter than
  *                             39 bits.
- *   VFMIG_IOVA_PER_VF      -- 4 GB of IOVA space per VF. Plenty of
- *                             room for cmd ring + MANAGE_PAGES + EQs
- *                             + UARs at typical sizes; we'll add
- *                             accounting if a real workload pushes
- *                             past this.
+ *   VFMIG_IOVA_PER_VF      -- IOVA space per VF, configurable via
+ *                             CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB
+ *                             (Kconfig int in GiB; default 4).
+ *                             Plenty of room at the default for cmd
+ *                             ring + MANAGE_PAGES + EQs + UARs at
+ *                             typical sizes; raise if/when the user
+ *                             ib_umem_get path is hooked through this
+ *                             allocator and pinned MR pages dominate.
+ *
+ *                             Wire compatibility: SAVE/LOAD across
+ *                             kernels built with different values is
+ *                             rejected at slot-vs-IOVA cross-check
+ *                             time (vfmig_iova_replay_page).
  *   VFMIG_IOVA_GRANULE     -- minimum allocation alignment. Matches
  *                             PAGE_SIZE; mlx5 hardware page size is
  *                             also 4 KB.
  */
 #define VFMIG_IOVA_BASE		0x100000000ULL		/* 4 GiB */
-#define VFMIG_IOVA_PER_VF	0x100000000ULL		/* 4 GiB */
+#define VFMIG_IOVA_PER_VF \
+	((u64)CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB << 30)
 #define VFMIG_IOVA_GRANULE	PAGE_SIZE
 
 /*
@@ -290,6 +299,11 @@ enum vfmig_iova_slot {
 #define VFMIG_IOVA_NR_SLOTS		8U
 #define VFMIG_IOVA_SLOT_BYTES \
 	((VFMIG_IOVA_PER_VF - VFMIG_IOVA_TRANSIENT_BYTES) / VFMIG_IOVA_NR_SLOTS)
+
+static_assert(VFMIG_IOVA_PER_VF > VFMIG_IOVA_TRANSIENT_BYTES,
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: per-VF window must exceed the transient arena (16 MiB)");
+static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: each of the 8 deterministic slots must be >= 8 MiB to host worst-case kernel allocations");
 
 /*
  * (Slot identity is enum vfmig_iova_slot, defined outside the
