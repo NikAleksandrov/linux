@@ -64,6 +64,17 @@ PING_LOCAL_CIDR=${PING_LOCAL_CIDR:-}
 PING_TARGET=${PING_TARGET:-}
 PING_COUNT=${PING_COUNT:-5}
 
+# Optional RDMA pingpong smoke test. PINGPONG=1 enables an
+# ibv_rc_pingpong self-loopback in Phase A (source bind, treated
+# as must-pass: catches the R1.5 'FW ignores qpc.xrcd/qpc.srqn for
+# non-XRC-non-SRQ QP' assumption regressing) and Phase D
+# (destination bind, treated as best-effort: until L4 R2/R3 lands
+# the destination's mlx5_ib port 1 doesn't open and pingpong is
+# expected to fail at modify-QP-to-RTR -- we run it anyway for
+# diagnostic value and to show the failure mode shifts as R2/R3
+# are implemented).
+PINGPONG=${PINGPONG:-0}
+
 case "$ROLE" in
     source|destination|both) ;;
     *) echo "ROLE must be one of: source, destination, both"; exit 2 ;;
@@ -200,6 +211,106 @@ snapshot_vf() {
     echo "[$label] bdf=$bdf netdev=$ifname mac=$mac state=$state vhca_id=$vhca"
 }
 
+# Walk /sys/class/infiniband/ and find the ib_device whose
+# `device` symlink points at $bdf. Empty stdout + non-zero return on
+# miss. The mlx5_ib auxiliary driver creates these as soon as the VF
+# binds (see L4 R1 -- the ib_device registers even on a restored VF
+# even though port 1 won't open).
+find_ib_dev_for_pci() {
+    local bdf=$1
+    local d pci
+    for d in /sys/class/infiniband/*; do
+        [ -e "$d/device" ] || continue
+        pci=$(basename "$(readlink "$d/device")")
+        if [ "$pci" = "$bdf" ]; then
+            basename "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Optional ibv_rc_pingpong self-loopback against $ibdev.
+#
+# This drives an actual RC QP through INIT->RTR->RTS->RTS data exchange
+# -- the smallest end-to-end test of the RDMA datapath that doesn't
+# require XRC/SRQ. The command requires rdma-core's perftest helper
+# (`apt install perftest libibverbs-utils ibverbs-utils`).
+#
+# We run server and client in two background processes targeting the
+# same ib_device on TCP loopback -- this is what `man ibv_rc_pingpong`
+# documents as the self-test pattern.
+#
+# Args:
+#   $1 = ib_device name (e.g. "mlx5_2")
+#   $2 = label printed on success/failure
+#   $3 = expectation: "must-pass" (return 1 on failure) or "best-effort"
+#        (return 0 even on failure, just log).
+# Returns:
+#   0  pingpong exchange completed cleanly OR best-effort failure
+#   1  must-pass failure
+#   2  ibv_rc_pingpong not installed (always non-fatal; logs and returns 0)
+pingpong_self_loopback() {
+    local ibdev=$1 label=$2 expect=${3:-best-effort}
+    local logdir port server_pid client_rc
+
+    if ! command -v ibv_rc_pingpong >/dev/null; then
+        echo "  WARN: ibv_rc_pingpong not installed; skipping $label"
+        echo "        (apt install ibverbs-utils  /  dnf install libibverbs-utils)"
+        return 0
+    fi
+
+    logdir=$(mktemp -d)
+    # Random-ish port to avoid clashing with a previous run that
+    # didn't clean up. ibv_rc_pingpong defaults to 18515.
+    port=$(( 18000 + RANDOM % 1000 ))
+
+    echo "  $label: ibv_rc_pingpong -d $ibdev -p $port self-loopback"
+
+    # Server: backgrounds, listens on $port, handles one client and exits.
+    sudo ibv_rc_pingpong -d "$ibdev" -p "$port" -i 1 -n 100 \
+        > "$logdir/server.log" 2>&1 &
+    server_pid=$!
+
+    # Give the server a moment to bind its listen socket.
+    sleep 1
+
+    # Client: connects to 127.0.0.1:$port. We bound the timeout
+    # generously: a healthy pingpong completes in well under 5s.
+    set +e
+    sudo timeout 30 ibv_rc_pingpong -d "$ibdev" -p "$port" -i 1 -n 100 \
+        127.0.0.1 > "$logdir/client.log" 2>&1
+    client_rc=$?
+    set -e
+
+    # Reap the server. If it's still running it's blocked accepting --
+    # client died before connecting -- tear it down explicitly.
+    if kill -0 "$server_pid" 2>/dev/null; then
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    else
+        wait "$server_pid" 2>/dev/null || true
+    fi
+
+    if [ "$client_rc" -eq 0 ]; then
+        echo "  PASS: $label completed (n=100 RC pingpongs on $ibdev)"
+        rm -rf "$logdir"
+        return 0
+    fi
+
+    echo "  $expect FAIL: $label rc=$client_rc"
+    echo "  -- client log ($logdir/client.log) --"
+    sed 's/^/    /' "$logdir/client.log"
+    echo "  -- server log ($logdir/server.log) --"
+    sed 's/^/    /' "$logdir/server.log"
+    rm -rf "$logdir"
+
+    if [ "$expect" = "must-pass" ]; then
+        return 1
+    fi
+    return 0
+}
+
 # --- Phase A: provision SOURCE with set_tracked + migratable ----------
 #
 # Ordering: autoprobe=0 -> sriov_numvfs=1 -> set_tracked -> enable_migratable -> bind.
@@ -252,6 +363,48 @@ if [ "${PROBE_UID:-0}" = "1" ]; then
     echo "[probe_uid src] $SRC_UID_OUT"
     SRC_UID_OUT2=$(sudo "$TOOL" "$PF" probe_uid 0 || true)
     echo "[probe_uid src] $SRC_UID_OUT2"
+fi
+
+# Optional RDMA datapath check on the source-side (non-restored,
+# but tracked) VF.
+#
+# Treated as best-effort, NOT must-pass. The reason is subtle and
+# worth documenting in-line so a future reader doesn't try to "fix"
+# the test by re-promoting it:
+#
+#   The vfmig v1 deterministic IOVA allocator hooks a curated set of
+#   mlx5_core allocation sites (cmd ring, MANAGE_PAGES, EQ buffers,
+#   frag bufs, DB pages, DMA_COHERENT slots). Other DMA paths --
+#   crucially mlx5_ib_reg_user_mr's ib_umem_get -> dma_map_sgtable
+#   path for user-MR backing pages -- are NOT hooked. On a tracked
+#   VF those calls go through the kernel's default DMA-IOMMU path
+#   against our unmanaged domain and produce IOVAs that are never
+#   installed in our domain's page tables. FW dereferences them
+#   during the UMR PAS update and returns IB_WC_MW_BIND_ERR (vendor
+#   syndrome 0x25, "memory bind error"), which surfaces in user
+#   space as ibv_reg_mr failing with "Couldn't register MR".
+#
+#   This is independent of L4 R1 / R1.5 / the netdev gate -- it's a
+#   pre-existing v1 allocator coverage gap that the pingpong test
+#   simply happens to be the first thing to exercise. The fix lives
+#   in v2 (extend allocator to cover user-MR DMA-map; same shape of
+#   work as R3 MR rebinding). Tracked under the
+#   v1_allocator_user_mr_dma_gap todo.
+#
+#   When the v2 allocator lands, this expectation can be flipped to
+#   "must-pass" again. Until then, treat the actual rc as a
+#   diagnostic data point.
+if [ "$PINGPONG" = "1" ]; then
+    src_ibdev=$(find_ib_dev_for_pci "$VF") || src_ibdev=""
+    if [ -n "$src_ibdev" ]; then
+        echo "=== Phase A.1: ibv_rc_pingpong self-loopback (source, best-effort) ==="
+        echo "  NOTE: failure here is the v1 allocator's user-MR DMA gap, not"
+        echo "        an R1.5 regression. See in-line comment in this script."
+        pingpong_self_loopback "$src_ibdev" \
+            "Phase A.1 (tracked VF $VF / $src_ibdev)" "best-effort"
+    else
+        echo "WARN: no ib_device for $VF; skipping Phase A.1 pingpong"
+    fi
 fi
 
 # Sanity log: confirm the IOVA hook actually fired for the cmd ring.
@@ -405,6 +558,36 @@ sudo dmesg | tail -60
 if [ "${PROBE_UID:-0}" = "1" ] && [ -e "$(vf_path $VF2)/driver" ]; then
     DST_UID_OUT=$(sudo "$TOOL" "$PF" probe_uid 0 || true)
     echo "[probe_uid dst] $DST_UID_OUT"
+fi
+
+# Optional RDMA datapath check on the restored VF. Treated as
+# best-effort: TWO independent reasons it's expected to fail today:
+#
+#   1) L4 R1 mlx5_ib port-1 gating: Couldn't create ib_mad QP1 ->
+#      Couldn't open port 1, so ibv_query_port returns IB_PORT_DOWN
+#      (or fails outright) and pingpong can't even modify a QP
+#      to RTR. Failure mode shifts to "connect timeout" once R2
+#      imports the dev_res FW objects and port 1 opens.
+#   2) v1 allocator user-MR DMA gap (same as Phase A.1): even if
+#      port 1 were open, ibv_reg_mr would still return ENOMEM/EIO
+#      with the "memory bind error" UMR completion before any QP
+#      transition happens. Resolved by v2 allocator's user-MR
+#      coverage.
+#
+# We still run it because the failure mode is a useful regression
+# signal: a *crash* here on a tracked-and-restored VF (rather than
+# a clean error return) would be genuinely interesting. The
+# original mlx5e_poll_tx_cq FIFO-underflow crash that motivated the
+# netdev gate was exactly such a failure.
+if [ "$PINGPONG" = "1" ] && [ -e "$(vf_path $VF2)/driver" ]; then
+    dst_ibdev=$(find_ib_dev_for_pci "$VF2") || dst_ibdev=""
+    if [ -n "$dst_ibdev" ]; then
+        echo "=== Phase D.1: ibv_rc_pingpong self-loopback (restored, best-effort) ==="
+        pingpong_self_loopback "$dst_ibdev" \
+            "Phase D.1 (restored VF $VF2 / $dst_ibdev)" "best-effort"
+    else
+        echo "WARN: no ib_device for $VF2; skipping Phase D.1 pingpong"
+    fi
 fi
 
 # Hard-fail on the legacy baseline failure: 60s ENABLE_HCA timeout.
