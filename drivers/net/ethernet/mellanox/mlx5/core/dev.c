@@ -303,6 +303,54 @@ static void adev_release(struct device *dev)
 	priv->adev[idx] = NULL;
 }
 
+/*
+ * v0 vfmig restored-VF scope: skip the netdev/eth-rep auxiliary
+ * protocols on a VF mdev that was brought up via the vfmig restore
+ * path. Rationale:
+ *
+ *   mlx5e (the netdev driver) creates its own SQs/RQs/CQs and
+ *   reserved kernel MKEYs at probe time, but FW's per-VHCA MKEY /
+ *   QP / CQ tables on a restored VF still carry the source's
+ *   IOVAs. The mismatch shows up at first TX as syndrome 0x4 +
+ *   vendor 0x51 (lkey violation / address translation miss) on
+ *   the netdev TX QP, followed by a mlx5e_poll_tx_cq() FIFO
+ *   underflow assertion (`*fifo->pc == *fifo->cc` at txrx.h:359)
+ *   and a NULL-deref BUG. The mlx5_ib side has the analogous
+ *   problem and is gated separately at L4 R1; this is the
+ *   netdev-side analog of that gate.
+ *
+ *   v0 of the vfmig CRIU path is RDMA-only by design -- the user
+ *   is migrating an RDMA application, the netdev face on the same
+ *   VHCA is incidental. Keeping mlx5_core/mlx5_ib up while
+ *   suppressing mlx5e is the cleanest backstop until M3+ extends
+ *   MR rebinding (or the moral equivalent) to the netdev's kernel
+ *   MKEYs.
+ *
+ *   The IB protocol stays enabled here so mlx5_ib still attaches
+ *   (with its own dev_res/QP1 gating internal to mlx5_ib_dev_res_*
+ *   from L4 R1). DPLL / FWCTL / VNET / IB-REP are left untouched
+ *   -- they are either PF-only or have their own is_supported
+ *   gates that already exclude restored VFs.
+ *
+ *   When this function returns true, the ETH/ETH-REP adev simply
+ *   never gets added; mlx5_detach_device() sees priv->adev[i] ==
+ *   NULL and skips it cleanly. No cleanup branches required.
+ */
+static bool mlx5_adev_idx_skip_on_restored_vf(struct mlx5_core_dev *dev,
+					      int idx)
+{
+	if (!mlx5_vf_is_restored(dev))
+		return false;
+
+	switch (idx) {
+	case MLX5_INTERFACE_PROTOCOL_ETH:
+	case MLX5_INTERFACE_PROTOCOL_ETH_REP:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static struct mlx5_adev *add_adev(struct mlx5_core_dev *dev, int idx)
 {
 	const char *suffix = mlx5_adev_devices[idx].suffix;
@@ -367,6 +415,13 @@ int mlx5_attach_device(struct mlx5_core_dev *dev)
 	for (i = 0; i < ARRAY_SIZE(mlx5_adev_devices); i++) {
 		if (!priv->adev[i]) {
 			bool is_supported = false;
+
+			if (mlx5_adev_idx_skip_on_restored_vf(dev, i)) {
+				mlx5_core_info(dev,
+					       "vfmig: restored VF -- skipping adev[%d] (%s)\n",
+					       i, mlx5_adev_devices[i].suffix);
+				continue;
+			}
 
 			if (mlx5_adev_devices[i].is_enabled) {
 				bool enabled;
@@ -486,6 +541,9 @@ static int add_drivers(struct mlx5_core_dev *dev)
 		bool is_supported = false;
 
 		if (priv->adev[i])
+			continue;
+
+		if (mlx5_adev_idx_skip_on_restored_vf(dev, i))
 			continue;
 
 		if (mlx5_adev_devices[i].is_enabled &&
