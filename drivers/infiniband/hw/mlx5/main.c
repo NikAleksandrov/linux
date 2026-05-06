@@ -1805,6 +1805,29 @@ static int allocate_uars(struct mlx5_ib_dev *dev, struct mlx5_ib_ucontext *conte
 	int i;
 
 	bfregi = &context->bfregi;
+
+	if (context->vfmig_restore_pending) {
+		/*
+		 * VFMIG restore path: caller will follow up with
+		 * MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT to seed
+		 * bfregi->sys_pages[] from the source snapshot. Until then
+		 * every entry must be the INVALID sentinel so:
+		 *  - uar_mmap()'s existing INVALID-slot check rejects mmap;
+		 *  - deallocate_uars() (main.c, see loop below) skips
+		 *    mlx5_cmd_uar_dealloc() for slots that were never
+		 *    allocated, both static and dynamic.
+		 *
+		 * Note: bfregi->sys_pages was kcalloc'd (zeroed); slot id 0
+		 * is a valid FW UAR id, so we must overwrite explicitly.
+		 */
+		for (i = 0; i < bfregi->num_sys_pages; i++)
+			bfregi->sys_pages[i] = MLX5_IB_INVALID_UAR_INDEX;
+		mlx5_ib_dbg(dev,
+			    "vfmig_restore_pending: skipping %u UAR allocations, sys_pages[] sentinel-filled, awaiting RESTORE_UCONTEXT\n",
+			    bfregi->num_static_sys_pages);
+		return 0;
+	}
+
 	for (i = 0; i < bfregi->num_static_sys_pages; i++) {
 		err = mlx5_cmd_uar_alloc(dev->mdev, &bfregi->sys_pages[i],
 					 context->devx_uid);
@@ -1835,9 +1858,16 @@ static void deallocate_uars(struct mlx5_ib_dev *dev,
 	int i;
 
 	bfregi = &context->bfregi;
+	/*
+	 * Skip INVALID sentinels for both static and dynamic slots. With the
+	 * VFMIG restore path, static slots can now legitimately be INVALID
+	 * if the ucontext was alloc'd with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
+	 * and torn down before the matching RESTORE_UCONTEXT seeded the
+	 * table. Pre-VFMIG, only dynamic slots could carry INVALID; the
+	 * unified check is a strict superset.
+	 */
 	for (i = 0; i < bfregi->num_sys_pages; i++)
-		if (i < bfregi->num_static_sys_pages ||
-		    bfregi->sys_pages[i] != MLX5_IB_INVALID_UAR_INDEX)
+		if (bfregi->sys_pages[i] != MLX5_IB_INVALID_UAR_INDEX)
 			mlx5_cmd_uar_dealloc(dev->mdev, bfregi->sys_pages[i],
 					     context->devx_uid);
 }
@@ -2072,7 +2102,8 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 	if (err)
 		return err;
 
-	if (req.flags & ~MLX5_IB_ALLOC_UCTX_DEVX)
+	if (req.flags & ~(MLX5_IB_ALLOC_UCTX_DEVX |
+			  MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE))
 		return -EOPNOTSUPP;
 
 	if (req.comp_mask || req.reserved0 || req.reserved1 || req.reserved2)
@@ -2082,6 +2113,15 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 				    MLX5_NON_FP_BFREGS_PER_UAR);
 	if (req.num_low_latency_bfregs > req.total_num_bfregs - 1)
 		return -EINVAL;
+
+	/*
+	 * Latch the VFMIG restore intent on the ucontext now so allocate_uars()
+	 * (called below via the lib_uar_dyn=false path) sees it and skips the
+	 * per-slot ALLOC_UAR commands. The bool is cleared by
+	 * MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT once sys_pages[] is seeded.
+	 */
+	if (req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE)
+		context->vfmig_restore_pending = true;
 
 	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX) {
 		err = mlx5_ib_devx_create(dev, true, uctx->enabled_caps);
@@ -2100,6 +2140,18 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 	lib_uar_4k = req.lib_caps & MLX5_LIB_CAP_4K_UAR;
 	lib_uar_dyn = req.lib_caps & MLX5_LIB_CAP_DYN_UAR;
 	bfregi = &context->bfregi;
+
+	/*
+	 * v0 VFMIG restore covers only the static bfregi->sys_pages[] path.
+	 * lib_uar_dyn=true bypasses sys_pages[] entirely (UARs are dynamic
+	 * MLX5_IB_OBJECT_UAR uobjects with their own mmap_entry table); a
+	 * separate restore path will be needed there. Reject the combo for
+	 * now rather than silently succeeding with a bogus restore.
+	 */
+	if (context->vfmig_restore_pending && lib_uar_dyn) {
+		err = -EOPNOTSUPP;
+		goto out_ucap;
+	}
 
 	if (lib_uar_dyn) {
 		bfregi->lib_uar_dyn = lib_uar_dyn;
