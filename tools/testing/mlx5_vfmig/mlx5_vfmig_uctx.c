@@ -8,19 +8,29 @@
  * Step 1 scope (alloc-with-flag):
  *
  *   alloc_uctx_with_flag <ibdev>
- *     Open /dev/infiniband/<ibdev>'s uverbs<N>, send
- *     IB_USER_VERBS_CMD_GET_CONTEXT with the new
- *     MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE bit set in
- *     mlx5_ib_alloc_ucontext_req_v2.flags. On success, dump a few
- *     resp fields, then close the fd. The ucontext close path
+ *     Positive: GET_CONTEXT with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE.
+ *     On success, dump a few resp fields and close. The close path
  *     exercises deallocate_uars()'s INVALID-skip, validating the
  *     abandoned-restore cleanup.
  *
- *     Enable the kernel-side dbg log first if you want to confirm:
- *       echo 'file drivers/infiniband/hw/mlx5/main.c +p' | \
- *           sudo tee /proc/dynamic_debug/control
- *     Then watch dmesg for
- *       "vfmig_restore_pending: skipping ... UAR allocations"
+ *   alloc_uctx_neg_dyn_uar <ibdev>
+ *     Negative: GET_CONTEXT with VFMIG_RESTORE *and*
+ *     MLX5_LIB_CAP_DYN_UAR. v0 rejects this combo because lib_uar_dyn
+ *     bypasses the static sys_pages[] table that the restore path
+ *     depends on. Expect EOPNOTSUPP.
+ *
+ *   alloc_uctx_neg_bad_flag <ibdev>
+ *     Negative: GET_CONTEXT with an unsupported flag bit (1 << 31).
+ *     Catches the ~(DEVX | VFMIG_RESTORE) reject mask. Expect
+ *     EOPNOTSUPP. Sanity check that the mask widening to allow
+ *     VFMIG_RESTORE didn't accidentally accept anything else.
+ *
+ *   Enable the kernel-side dbg log if you want to confirm the
+ *   skip-allocate-uars path was taken on the positive case:
+ *     echo 'file drivers/infiniband/hw/mlx5/main.c +p' | \
+ *         sudo tee /proc/dynamic_debug/control
+ *   Then watch dmesg for
+ *     "vfmig_restore_pending: skipping ... UAR allocations"
  *
  * Future steps will add query_uctx_uar_table, restore_uctx, etc.
  *
@@ -207,48 +217,59 @@ struct resp_blob {
 	struct mlx5_ib_alloc_ucontext_resp drv;
 };
 
-static int do_alloc_uctx_with_flag(const char *ibdev)
+/*
+ * Build and send a GET_CONTEXT command. Returns:
+ *   >= 0  on kernel success (cmd fully written)
+ *   < 0   on kernel rejection (negated errno)
+ *
+ * Caller owns the open fd.
+ */
+static int send_get_context(int fd, uint32_t flags, uint64_t lib_caps,
+			    struct resp_blob *resp_out)
 {
 	struct cmd_blob cmd = {};
-	struct resp_blob resp = {};
 	ssize_t n;
-	int fd;
+
+	cmd.hdr.command   = IB_USER_VERBS_CMD_GET_CONTEXT;
+	cmd.hdr.in_words  = sizeof(cmd) / 4;
+	cmd.hdr.out_words = sizeof(*resp_out) / 4;
+
+	cmd.get_ctx.response = (uintptr_t)resp_out;
+
+	cmd.req.total_num_bfregs = 8;
+	cmd.req.num_low_latency_bfregs = 0;
+	cmd.req.flags = flags;
+	cmd.req.max_cqe_version = 1;
+	cmd.req.lib_caps = lib_caps;
+
+	n = write(fd, &cmd, sizeof(cmd));
+	if (n < 0)
+		return -errno;
+	if ((size_t)n != sizeof(cmd))
+		return -EIO;
+	return 0;
+}
+
+static int do_alloc_uctx_with_flag(const char *ibdev)
+{
+	struct resp_blob resp = {};
+	int fd, rc;
 
 	fd = open_uverbs_for_ibdev(ibdev);
 	if (fd < 0)
 		return 1;
 
-	cmd.hdr.command   = IB_USER_VERBS_CMD_GET_CONTEXT;
-	cmd.hdr.in_words  = sizeof(cmd) / 4;
-	cmd.hdr.out_words = sizeof(resp) / 4;
-
-	cmd.get_ctx.response = (uintptr_t)&resp;
-
-	cmd.req.total_num_bfregs = 8;
-	cmd.req.num_low_latency_bfregs = 0;
-	cmd.req.flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE;
-	cmd.req.max_cqe_version = 1;
-	cmd.req.lib_caps = MLX5_LIB_CAP_4K_UAR;
-
-	n = write(fd, &cmd, sizeof(cmd));
-	if (n < 0) {
+	rc = send_get_context(fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			      MLX5_LIB_CAP_4K_UAR, &resp);
+	if (rc < 0) {
 		fprintf(stderr,
-			"GET_CONTEXT(VFMIG_RESTORE) write failed: %s\n",
-			strerror(errno));
-		close(fd);
-		return 1;
-	}
-	if ((size_t)n != sizeof(cmd)) {
-		fprintf(stderr,
-			"GET_CONTEXT(VFMIG_RESTORE) short write: %zd of %zu\n",
-			n, sizeof(cmd));
+			"GET_CONTEXT(VFMIG_RESTORE) failed: %s\n",
+			strerror(-rc));
 		close(fd);
 		return 1;
 	}
 
-	printf("alloc_uctx_with_flag %s:\n", ibdev);
-	printf("  flags             = 0x%x (VFMIG_RESTORE)\n",
-	       cmd.req.flags);
+	printf("alloc_uctx_with_flag %s: PASS\n", ibdev);
 	printf("  qp_tab_size       = %u\n", resp.drv.qp_tab_size);
 	printf("  bf_reg_size       = %u\n", resp.drv.bf_reg_size);
 	printf("  tot_bfregs        = %u\n", resp.drv.tot_bfregs);
@@ -258,12 +279,86 @@ static int do_alloc_uctx_with_flag(const char *ibdev)
 	printf("  cqe_version       = %u\n", resp.drv.cqe_version);
 	printf("  num_ports         = %u\n", resp.drv.num_ports);
 	printf("\n");
-	printf("ucontext successfully alloc'd; sys_pages[] is now sentinel-filled\n");
-	printf("(MLX5_IB_INVALID_UAR_INDEX); RESTORE_UCONTEXT not yet implemented.\n");
-	printf("Closing fd will exercise deallocate_uars() abandoned-restore cleanup.\n");
+	printf("sys_pages[] is now sentinel-filled (MLX5_IB_INVALID_UAR_INDEX);\n");
+	printf("RESTORE_UCONTEXT not yet implemented. Closing fd exercises\n");
+	printf("deallocate_uars() abandoned-restore cleanup.\n");
 
 	close(fd);
 	return 0;
+}
+
+/*
+ * Negative: VFMIG_RESTORE + lib_uar_dyn must be rejected with EOPNOTSUPP.
+ * The static sys_pages[] table that the restore path depends on doesn't
+ * exist when lib_uar_dyn=true; UARs go through MLX5_IB_OBJECT_UAR uobjects
+ * with their own restore story (out of v0 scope).
+ */
+static int do_alloc_uctx_neg_dyn_uar(const char *ibdev)
+{
+	struct resp_blob resp = {};
+	int fd, rc;
+
+	fd = open_uverbs_for_ibdev(ibdev);
+	if (fd < 0)
+		return 1;
+
+	rc = send_get_context(fd,
+			      MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			      MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
+			      &resp);
+	close(fd);
+
+	if (rc == -EOPNOTSUPP) {
+		printf("alloc_uctx_neg_dyn_uar %s: PASS (rejected with EOPNOTSUPP)\n",
+		       ibdev);
+		return 0;
+	}
+	if (rc == 0) {
+		fprintf(stderr,
+			"alloc_uctx_neg_dyn_uar %s: FAIL (kernel ACCEPTED VFMIG_RESTORE | DYN_UAR; should reject)\n",
+			ibdev);
+		return 1;
+	}
+	fprintf(stderr,
+		"alloc_uctx_neg_dyn_uar %s: FAIL (got %s, expected EOPNOTSUPP)\n",
+		ibdev, strerror(-rc));
+	return 1;
+}
+
+/*
+ * Negative: an unsupported flag bit (1 << 31) must be rejected with
+ * EOPNOTSUPP. Sanity check on the
+ * "req.flags & ~(DEVX | VFMIG_RESTORE)" reject mask -- specifically
+ * that widening it to admit VFMIG_RESTORE didn't accidentally let
+ * other bits through.
+ */
+static int do_alloc_uctx_neg_bad_flag(const char *ibdev)
+{
+	struct resp_blob resp = {};
+	int fd, rc;
+
+	fd = open_uverbs_for_ibdev(ibdev);
+	if (fd < 0)
+		return 1;
+
+	rc = send_get_context(fd, 1u << 31, MLX5_LIB_CAP_4K_UAR, &resp);
+	close(fd);
+
+	if (rc == -EOPNOTSUPP) {
+		printf("alloc_uctx_neg_bad_flag %s: PASS (rejected with EOPNOTSUPP)\n",
+		       ibdev);
+		return 0;
+	}
+	if (rc == 0) {
+		fprintf(stderr,
+			"alloc_uctx_neg_bad_flag %s: FAIL (kernel ACCEPTED 0x80000000 in flags; reject mask broken)\n",
+			ibdev);
+		return 1;
+	}
+	fprintf(stderr,
+		"alloc_uctx_neg_bad_flag %s: FAIL (got %s, expected EOPNOTSUPP)\n",
+		ibdev, strerror(-rc));
+	return 1;
 }
 
 static int verb_eq(const char *a, const char *b)
@@ -282,7 +377,9 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s <verb> [args]\n"
-		"  alloc_uctx_with_flag <ibdev>\n"
+		"  alloc_uctx_with_flag <ibdev>     (positive: alloc with VFMIG_RESTORE)\n"
+		"  alloc_uctx_neg_dyn_uar <ibdev>   (negative: VFMIG_RESTORE | DYN_UAR -> EOPNOTSUPP)\n"
+		"  alloc_uctx_neg_bad_flag <ibdev>  (negative: bogus flag bit -> EOPNOTSUPP)\n"
 		"\n"
 		"<ibdev> is the IB device name as listed in /sys/class/infiniband\n"
 		"(e.g. mlx5_2). Verbs accept '-' or '_' interchangeably.\n",
@@ -296,13 +393,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (verb_eq(argv[1], "alloc_uctx_with_flag")) {
-		if (argc != 3) {
-			usage(argv[0]);
-			return 1;
-		}
+	if (argc == 3 && verb_eq(argv[1], "alloc_uctx_with_flag"))
 		return do_alloc_uctx_with_flag(argv[2]);
-	}
+	if (argc == 3 && verb_eq(argv[1], "alloc_uctx_neg_dyn_uar"))
+		return do_alloc_uctx_neg_dyn_uar(argv[2]);
+	if (argc == 3 && verb_eq(argv[1], "alloc_uctx_neg_bad_flag"))
+		return do_alloc_uctx_neg_bad_flag(argv[2]);
 
 	usage(argv[0]);
 	return 1;
