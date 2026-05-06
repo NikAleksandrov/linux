@@ -230,6 +230,12 @@ enum mlx5_ib_objects {
 	MLX5_IB_OBJECT_PP,
 	MLX5_IB_OBJECT_UAR,
 	MLX5_IB_OBJECT_STEERING_ANCHOR,
+	/*
+	 * Verb-only namespace (no per-instance state, no IDR) for the
+	 * VFMIG (CRIU SR-IOV migration) per-ucontext save/restore verbs.
+	 * See tools/testing/mlx5_vfmig/DESIGN_uar_restore.md.
+	 */
+	MLX5_IB_OBJECT_VFMIG,
 };
 
 enum mlx5_ib_flow_matcher_create_attrs {
@@ -359,6 +365,104 @@ enum mlx5_ib_query_port_attrs {
 
 enum mlx5_ib_get_data_direct_sysfs_path_attrs {
 	MLX5_IB_ATTR_GET_DATA_DIRECT_SYSFS_PATH = (1U << UVERBS_ID_NS_SHIFT),
+};
+
+/*
+ * VFMIG ucontext vendor verbs. Methods on the verb-only object
+ * MLX5_IB_OBJECT_VFMIG; the calling fd's ucontext is implicit (resolved
+ * via ib_uverbs_get_ucontext()).
+ *
+ * Wire-protocol contract: identifiers in UAR_TABLE / BFREG_COUNT are
+ * opaque FW UAR ids and per-bfreg-slot counts respectively, as returned
+ * by mlx5 firmware. They are valid only against a destination VHCA whose
+ * state was imported by SAVE_VHCA_STATE / LOAD_VHCA_STATE from the
+ * source VHCA they were captured on.
+ *
+ * See tools/testing/mlx5_vfmig/DESIGN_uar_restore.md.
+ */
+enum mlx5_ib_vfmig_methods {
+	MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT,
+};
+
+/*
+ * Two-pass call convention:
+ *
+ *  Pass 1 (sizing): pass META only. Kernel fills META; UAR_TABLE and
+ *    BFREG_COUNT are absent (UA_OPTIONAL). Userspace reads
+ *    meta.num_sys_pages and meta.total_num_bfregs from the result and
+ *    allocates u32[num_sys_pages] and u32[total_num_bfregs] buffers.
+ *
+ *  Pass 2 (snapshot): pass META + UAR_TABLE + BFREG_COUNT, with the
+ *    arrays sized exactly as learned from pass 1. Kernel snapshots
+ *    bfregi->sys_pages[] and bfregi->count[] under bfregi->lock.
+ *
+ * The handler rejects with -EINVAL if the array buffer sizes don't
+ * match the current ucontext shape, so racing a call against e.g. a
+ * concurrent dynamic-UAR mmap is detectable rather than silently
+ * truncating.
+ */
+enum mlx5_ib_vfmig_query_ucontext_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_UAR_TABLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_BFREG_COUNT,
+	MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META,
+};
+
+/*
+ * RESTORE_UCONTEXT consumes a snapshot previously emitted by
+ * QUERY_UCONTEXT on a source ucontext (whose underlying VHCA was then
+ * SAVE_VHCA_STATE'd and LOAD_VHCA_STATE'd onto this destination VHCA),
+ * and seeds the destination ucontext's bfregi->sys_pages[] verbatim --
+ * skipping the per-slot ALLOC_UAR FW commands that mlx5_ib_alloc_ucontext
+ * would normally issue. This relies on the destination VHCA already
+ * holding those FW UAR ids reserved as part of LOAD_VHCA_STATE.
+ *
+ * Preconditions (all enforced by the handler; -EINVAL on any failure):
+ *   1. The ucontext was created with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
+ *      (so sys_pages[] is sentinel-INVALID and ready to be seeded).
+ *   2. lib_uar_dyn=false (v0 doesn't cover dynamic-UAR ucontexts).
+ *   3. META cross-check: every field of the supplied
+ *      mlx5_ib_vfmig_ucontext_meta must match what the destination's
+ *      mlx5_ib_alloc_ucontext computed for THIS ucontext (strict bitwise
+ *      equality on num_static_sys_pages, num_sys_pages, num_dyn_bfregs,
+ *      num_low_latency_bfregs, total_num_bfregs, lib_caps, lib_uar_4k,
+ *      lib_uar_dyn, cqe_version). v0 targets a homogeneous fleet; this
+ *      guarantee can be relaxed later if needed.
+ *   4. UAR_TABLE length == num_sys_pages * sizeof(__u32) (mandatory).
+ *   5. UAR_TABLE[0..num_static_sys_pages) must all be valid (none equal
+ *      to MLX5_IB_INVALID_UAR_INDEX = BIT(31)). Static slots are
+ *      structural; an INVALID there indicates a malformed snapshot.
+ *   6. BFREG_COUNT, if supplied, length == total_num_bfregs *
+ *      sizeof(__u32). v0 ALSO requires every entry to be zero --
+ *      non-zero implies the source had live QPs / claimed dyn UARs,
+ *      whose corresponding kernel/FW objects we don't yet rebuild.
+ *      Locking the wire shape now lets a future MR/QP-restore step
+ *      relax this without an ABI bump.
+ *
+ * On success the handler memcpy()s sys_pages[] (and zeros count[],
+ * idempotently) under bfregi->lock, then clears
+ * c->vfmig_restore_pending. A subsequent RESTORE on the same ucontext
+ * therefore fails precondition #1 with -EINVAL: there's exactly one
+ * RESTORE per ucontext.
+ */
+enum mlx5_ib_vfmig_restore_ucontext_attrs {
+	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT,
+	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META,
+};
+
+struct mlx5_ib_vfmig_ucontext_meta {
+	__u32	num_static_sys_pages;
+	__u32	num_sys_pages;
+	__u32	num_dyn_bfregs;
+	__u32	num_low_latency_bfregs;
+	__u32	total_num_bfregs;
+	__u32	reserved0;
+	__aligned_u64 lib_caps;
+	__u8	lib_uar_4k;
+	__u8	lib_uar_dyn;
+	__u8	cqe_version;
+	__u8	reserved1[5];
 };
 
 #endif
