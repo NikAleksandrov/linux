@@ -7,7 +7,7 @@ CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 # `make vfio-helper` because it is only needed by the legacy
 # test_m2.sh path and pulls in <linux/iommufd.h> + <linux/vfio.h>
 # which require sanitized userspace headers.
-BINARIES := mlx5_vfmig mlx5_vfmig_synth
+BINARIES := mlx5_vfmig mlx5_vfmig_synth mlx5_vfmig_uctx
 VFIO_BINARIES := mlx5_vfmig_save
 
 # Where to find sanitized userspace versions of <linux/iommufd.h> and
@@ -26,6 +26,9 @@ mlx5_vfmig: mlx5_vfmig.c ../../../include/uapi/linux/mlx5_vfmig.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 mlx5_vfmig_synth: mlx5_vfmig_synth.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+mlx5_vfmig_uctx: mlx5_vfmig_uctx.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 mlx5_vfmig_save: mlx5_vfmig_save.c

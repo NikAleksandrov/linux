@@ -1,3 +1,4 @@
 # Built by tools/testing/mlx5_vfmig/Makefile
 mlx5_vfmig
 mlx5_vfmig_synth
+mlx5_vfmig_uctx
