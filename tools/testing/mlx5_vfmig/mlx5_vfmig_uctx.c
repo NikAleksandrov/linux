@@ -75,6 +75,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -970,6 +971,303 @@ out:
 }
 
 /*
+ * On-disk format for the cross-host UCTX snapshot used by step 4 of
+ * the UAR-restore plan (test_m2r_iova.sh's UCTX=1 mode).
+ *
+ *   [vfmig_uctx_blob_hdr]            16 bytes
+ *   [mlx5_ib_vfmig_ucontext_meta]    32 bytes
+ *   [u32 uar_table[meta.num_sys_pages]]
+ *   [u32 bfreg_count[meta.total_num_bfregs]]
+ *
+ * No driver_id, no kernel-version or libmlx5-version stamp: v0 already
+ * relies on a homogeneous fleet (same kernel, same libmlx5, same
+ * MLX5_LIB_CAP_*), and the in-handler strict META cross-check at
+ * RESTORE time is the actual gatekeeper. The magic + version on this
+ * file are just the minimum needed to catch "wrong file" mistakes
+ * (truncation, scp'd the netdev blob by accident, etc.). When the
+ * homogeneous-fleet caveat is relaxed in a later milestone, this
+ * format gains kernel/libmlx5 stamps and a bumped version.
+ */
+struct vfmig_uctx_blob_hdr {
+	char     magic[8];   /* "MLX5VFUC" */
+	uint32_t version;    /* 1 */
+	uint32_t reserved;
+};
+
+#define VFMIG_UCTX_BLOB_MAGIC   "MLX5VFUC"
+#define VFMIG_UCTX_BLOB_VERSION 1u
+
+static int write_all(int fd, const void *buf, size_t len)
+{
+	const char *p = buf;
+	size_t remaining = len;
+
+	while (remaining) {
+		ssize_t n = write(fd, p, remaining);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		p += n;
+		remaining -= n;
+	}
+	return 0;
+}
+
+static int read_all(int fd, void *buf, size_t len)
+{
+	char *p = buf;
+	size_t remaining = len;
+
+	while (remaining) {
+		ssize_t n = read(fd, p, remaining);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (n == 0)
+			return -EPROTO;	/* short file */
+		p += n;
+		remaining -= n;
+	}
+	return 0;
+}
+
+/*
+ * save_uctx_snapshot <ibdev> <file>:
+ *   Open a normal ucontext on <ibdev>, two-pass QUERY it, and write
+ *   the resulting (meta, uar_table, bfreg_count) tuple to <file>.
+ *   This is the "Phase A" emitter for cross-host UAR restore: pair
+ *   with restore_uctx_snapshot on the destination host.
+ */
+static int do_save_uctx_snapshot(const char *ibdev, const char *path)
+{
+	struct vfmig_uctx_blob_hdr hdr = {};
+	struct mlx5_ib_vfmig_ucontext_meta meta = {};
+	struct resp_blob alloc_resp = {};
+	uint32_t *uar_table = NULL;
+	uint32_t *bfreg_count = NULL;
+	int fd = -1, out_fd = -1, rc, ret = 1;
+
+	fd = open_uverbs_for_ibdev(ibdev);
+	if (fd < 0)
+		return 1;
+
+	rc = send_get_context(fd, 0, MLX5_LIB_CAP_4K_UAR, &alloc_resp);
+	if (rc < 0) {
+		fprintf(stderr, "GET_CONTEXT (normal): %s\n", strerror(-rc));
+		goto out;
+	}
+
+	rc = snapshot_ucontext(fd, &meta, &uar_table, &bfreg_count);
+	if (rc < 0) {
+		fprintf(stderr, "QUERY (snapshot): %s\n", strerror(-rc));
+		goto out;
+	}
+
+	out_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (out_fd < 0) {
+		fprintf(stderr, "open %s for write: %s\n", path,
+			strerror(errno));
+		goto out;
+	}
+
+	memcpy(hdr.magic, VFMIG_UCTX_BLOB_MAGIC, sizeof(hdr.magic));
+	hdr.version = VFMIG_UCTX_BLOB_VERSION;
+
+	if ((rc = write_all(out_fd, &hdr, sizeof(hdr)))   < 0 ||
+	    (rc = write_all(out_fd, &meta, sizeof(meta))) < 0 ||
+	    (rc = write_all(out_fd, uar_table,
+			    meta.num_sys_pages * sizeof(*uar_table)))   < 0 ||
+	    (rc = write_all(out_fd, bfreg_count,
+			    meta.total_num_bfregs * sizeof(*bfreg_count))) < 0) {
+		fprintf(stderr, "write %s: %s\n", path, strerror(-rc));
+		goto out;
+	}
+
+	printf("save_uctx_snapshot %s -> %s: PASS\n", ibdev, path);
+	printf("  num_sys_pages=%u num_static=%u total_bfregs=%u\n",
+	       meta.num_sys_pages, meta.num_static_sys_pages,
+	       meta.total_num_bfregs);
+	printf("  static FW UAR ids:");
+	for (uint32_t i = 0; i < meta.num_static_sys_pages; i++)
+		printf(" 0x%x", uar_table[i]);
+	printf("\n");
+	ret = 0;
+out:
+	free(uar_table);
+	free(bfreg_count);
+	if (out_fd >= 0)
+		close(out_fd);
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+/*
+ * Sanity-mmap one static NC UAR page on a freshly-restored ucontext.
+ *
+ * mmap_offset encoding (see mlx5_ib_mmap, get_extended_index):
+ *   vm_pgoff = (cmd << 8) | (idx & 0xff) | ((idx >> 8) << 16)
+ *   mmap byte offset = vm_pgoff * PAGE_SIZE
+ *
+ * For static slot 0 / NC (cmd=3): offset = (3 << 8) << 12 = 0x300000.
+ * NC pages are 4 KiB regardless of FW UAR size; PROT_WRITE-only
+ * because libmlx5 typically maps these write-only for doorbells.
+ *
+ * The mmap succeeding proves three things in one go:
+ *   - bfregi->sys_pages[0] holds a valid FW UAR id (else uar_mmap
+ *     would short-circuit on MLX5_IB_INVALID_UAR_INDEX);
+ *   - that id is recognized by the destination's mlx5_core (else
+ *     io_remap_pfn_range would fail with -EFAULT or -EIO);
+ *   - the destination's BAR mapping is sane.
+ *
+ * We don't do any read or write through the mapping. MMIO doorbell
+ * registers have no observable read semantics, and writing without
+ * subsequent QP work is undefined. The mapping itself is the test.
+ */
+static int sanity_mmap_one_uar(int fd)
+{
+	const long page = sysconf(_SC_PAGESIZE);
+	const off_t offset = (off_t)(3 /* MLX5_IB_MMAP_NC_PAGE */ << 8)
+			     * page;
+	void *p;
+
+	p = mmap(NULL, page, PROT_WRITE, MAP_SHARED, fd, offset);
+	if (p == MAP_FAILED) {
+		fprintf(stderr,
+			"  sanity mmap(NC, idx=0, offset=0x%lx) FAILED: %s\n",
+			(long)offset, strerror(errno));
+		return -errno;
+	}
+
+	if (munmap(p, page) < 0) {
+		fprintf(stderr, "  munmap: %s\n", strerror(errno));
+		return -errno;
+	}
+	printf("  sanity mmap(NC, idx=0): PASS (mapped + unmapped 1 page)\n");
+	return 0;
+}
+
+/*
+ * restore_uctx_snapshot <ibdev> <file>:
+ *   Open a ucontext on <ibdev> with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+ *   read the snapshot from <file>, RESTORE, then QUERY to confirm
+ *   bitwise match, then mmap a static NC UAR page as a sanity probe.
+ *   This is the "Phase D" consumer for cross-host UAR restore.
+ */
+static int do_restore_uctx_snapshot(const char *ibdev, const char *path)
+{
+	struct vfmig_uctx_blob_hdr hdr;
+	struct mlx5_ib_vfmig_ucontext_meta meta;
+	struct mlx5_ib_vfmig_ucontext_meta meta_post = {};
+	struct resp_blob alloc_resp = {};
+	uint32_t *uar_table = NULL;
+	uint32_t *bfreg_count = NULL;
+	uint32_t *uar_post = NULL;
+	uint32_t *cnt_post = NULL;
+	int fd = -1, in_fd = -1, rc, ret = 1;
+
+	in_fd = open(path, O_RDONLY);
+	if (in_fd < 0) {
+		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+		return 1;
+	}
+	rc = read_all(in_fd, &hdr, sizeof(hdr));
+	if (rc < 0) {
+		fprintf(stderr, "read %s hdr: %s\n", path, strerror(-rc));
+		goto out;
+	}
+	if (memcmp(hdr.magic, VFMIG_UCTX_BLOB_MAGIC,
+		   sizeof(hdr.magic)) != 0) {
+		fprintf(stderr,
+			"%s: bad magic (not a vfmig uctx snapshot)\n", path);
+		goto out;
+	}
+	if (hdr.version != VFMIG_UCTX_BLOB_VERSION) {
+		fprintf(stderr,
+			"%s: version %u, this tool understands %u\n",
+			path, hdr.version, VFMIG_UCTX_BLOB_VERSION);
+		goto out;
+	}
+	rc = read_all(in_fd, &meta, sizeof(meta));
+	if (rc < 0) {
+		fprintf(stderr, "read %s meta: %s\n", path, strerror(-rc));
+		goto out;
+	}
+	uar_table = calloc(meta.num_sys_pages, sizeof(*uar_table));
+	bfreg_count = calloc(meta.total_num_bfregs, sizeof(*bfreg_count));
+	if (!uar_table || !bfreg_count) {
+		fprintf(stderr, "calloc failed\n");
+		goto out;
+	}
+	if ((rc = read_all(in_fd, uar_table,
+			   meta.num_sys_pages * sizeof(*uar_table))) < 0 ||
+	    (rc = read_all(in_fd, bfreg_count,
+			   meta.total_num_bfregs *
+				sizeof(*bfreg_count))) < 0) {
+		fprintf(stderr, "read %s body: %s\n", path, strerror(-rc));
+		goto out;
+	}
+
+	fd = open_uverbs_for_ibdev(ibdev);
+	if (fd < 0)
+		goto out;
+	rc = send_get_context(fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			      MLX5_LIB_CAP_4K_UAR, &alloc_resp);
+	if (rc < 0) {
+		fprintf(stderr, "GET_CONTEXT (VFMIG_RESTORE): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+
+	rc = issue_vfmig_restore(fd, uar_table, meta.num_sys_pages,
+				 bfreg_count, meta.total_num_bfregs, &meta);
+	if (rc < 0) {
+		fprintf(stderr, "RESTORE_UCONTEXT: %s\n", strerror(-rc));
+		goto out;
+	}
+
+	rc = snapshot_ucontext(fd, &meta_post, &uar_post, &cnt_post);
+	if (rc < 0) {
+		fprintf(stderr, "QUERY (post-RESTORE): %s\n", strerror(-rc));
+		goto out;
+	}
+	if (memcmp(&meta, &meta_post, sizeof(meta)) != 0 ||
+	    memcmp(uar_table, uar_post,
+		   meta.num_sys_pages * sizeof(*uar_table)) != 0 ||
+	    memcmp(bfreg_count, cnt_post,
+		   meta.total_num_bfregs * sizeof(*bfreg_count)) != 0) {
+		fprintf(stderr, "post-RESTORE QUERY does not match snapshot\n");
+		goto out;
+	}
+
+	printf("restore_uctx_snapshot %s <- %s: RESTORE+QUERY match: PASS\n",
+	       ibdev, path);
+
+	rc = sanity_mmap_one_uar(fd);
+	if (rc < 0)
+		goto out;
+
+	printf("restore_uctx_snapshot %s: PASS\n", ibdev);
+	ret = 0;
+out:
+	free(uar_table);
+	free(bfreg_count);
+	free(uar_post);
+	free(cnt_post);
+	if (fd >= 0)
+		close(fd);
+	if (in_fd >= 0)
+		close(in_fd);
+	return ret;
+}
+
+/*
  * Negative: an unsupported flag bit (1 << 31) must be rejected with
  * EOPNOTSUPP. Sanity check on the
  * "req.flags & ~(DEVX | VFMIG_RESTORE)" reject mask -- specifically
@@ -1029,6 +1327,8 @@ static void usage(const char *argv0)
 		"  roundtrip_uctx_neg_no_flag <ibdev>      (negative: RESTORE on non-VFMIG ucontext -> EINVAL)\n"
 		"  roundtrip_uctx_neg_meta_mismatch <ibdev>(negative: META total_num_bfregs tampered -> EINVAL)\n"
 		"  roundtrip_uctx_neg_static_invalid <ibdev>(negative: static slot 0 = INVALID -> EINVAL)\n"
+		"  save_uctx_snapshot <ibdev> <file>       (Phase A emitter: QUERY -> file)\n"
+		"  restore_uctx_snapshot <ibdev> <file>    (Phase D consumer: file -> RESTORE -> QUERY+mmap)\n"
 		"\n"
 		"<ibdev> is the IB device name as listed in /sys/class/infiniband\n"
 		"(e.g. mlx5_2). Verbs accept '-' or '_' interchangeably.\n",
@@ -1058,6 +1358,10 @@ int main(int argc, char **argv)
 		return do_roundtrip_uctx_neg_meta_mismatch(argv[2]);
 	if (argc == 3 && verb_eq(argv[1], "roundtrip_uctx_neg_static_invalid"))
 		return do_roundtrip_uctx_neg_static_invalid(argv[2]);
+	if (argc == 4 && verb_eq(argv[1], "save_uctx_snapshot"))
+		return do_save_uctx_snapshot(argv[2], argv[3]);
+	if (argc == 4 && verb_eq(argv[1], "restore_uctx_snapshot"))
+		return do_restore_uctx_snapshot(argv[2], argv[3]);
 
 	usage(argv[0]);
 	return 1;

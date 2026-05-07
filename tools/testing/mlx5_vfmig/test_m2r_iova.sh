@@ -75,12 +75,36 @@ PING_COUNT=${PING_COUNT:-5}
 # are implemented).
 PINGPONG=${PINGPONG:-0}
 
+# Optional UAR/ucontext save+restore smoke test (step 4 of the
+# UAR-restore plan). UCTX=1 enables:
+#   Phase A.5  emit a vfmig uctx snapshot to $UCTX_BLOB by opening
+#              a normal mlx5_ib ucontext on the source VF, two-pass
+#              QUERY_UCONTEXT'ing it, and writing
+#              meta+uar_table+bfreg_count to disk. Must-pass (it's
+#              just a query, no FW state change risk).
+#   Phase D.5  consume that snapshot on the destination by opening
+#              a ucontext with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+#              calling RESTORE_UCONTEXT, re-QUERYing to confirm
+#              bitwise identity, and mmap()ing one static NC UAR
+#              page as a sanity probe. Must-pass: the cross-host
+#              UAR persistence experiment (PASS-B + PASS-A) proved
+#              the seeded FW UAR ids are valid post-LOAD_VHCA_STATE.
+# Stand-alone (no CRIU dependency); validates the wire claim
+# end-to-end at user space.
+UCTX=${UCTX:-0}
+UCTX_TOOL=${UCTX_TOOL:-./mlx5_vfmig_uctx}
+UCTX_BLOB=${UCTX_BLOB:-${BLOB}.uctx}
+
 case "$ROLE" in
     source|destination|both) ;;
     *) echo "ROLE must be one of: source, destination, both"; exit 2 ;;
 esac
 
 [ -x "$TOOL" ] || { echo "build $TOOL first"; exit 1; }
+
+if [ "$UCTX" = "1" ]; then
+    [ -x "$UCTX_TOOL" ] || { echo "build $UCTX_TOOL first (UCTX=1)"; exit 1; }
+fi
 
 CDEV="/dev/mlx5_vfmig/$PF"
 [ -e "$CDEV" ] || { echo "missing $CDEV (mlx5_core not loaded?)"; exit 1; }
@@ -411,6 +435,22 @@ fi
 echo "--- cmd ring IOVA registry sanity (expect at least one HOST_PAGE entry) ---"
 sudo dmesg | grep -E 'vfmig_iova: vf 0 domain attached|vfmig: cmd ring at iova' | tail -10 || true
 
+# --- Phase A.5: emit UCTX snapshot to disk (UCTX=1) -------------------
+
+if [ "$UCTX" = "1" ]; then
+    src_ibdev_uctx=$(find_ib_dev_for_pci "$VF") || src_ibdev_uctx=""
+    if [ -z "$src_ibdev_uctx" ]; then
+        echo "FAIL: UCTX=1 but no ib_device for source VF $VF"
+        exit 1
+    fi
+    echo "=== Phase A.5: UCTX snapshot ($src_ibdev_uctx -> $UCTX_BLOB) ==="
+    sudo "$UCTX_TOOL" save_uctx_snapshot "$src_ibdev_uctx" "$UCTX_BLOB"
+    sudo chmod 0644 "$UCTX_BLOB"
+    UCTX_SHA=$(sha256sum "$UCTX_BLOB" | awk '{print $1}')
+    UCTX_BYTES=$(stat -c %s "$UCTX_BLOB")
+    echo "uctx snapshot sha256: $UCTX_SHA ($UCTX_BYTES bytes)"
+fi
+
 # --- Phase B: SAVE -----------------------------------------------------
 
 echo "=== Phase B: SAVE (now emits HOST_PAGE records before FW_DATA) ==="
@@ -450,6 +490,9 @@ src_kernel=$(uname -r)
 src_host=$(hostname)
 src_pf=$PF
 src_vf=$VF
+uctx_enabled=$UCTX
+uctx_sha256=${UCTX_SHA:-}
+uctx_bytes=${UCTX_BYTES:-0}
 EOF
 sudo chmod 0644 "$META"
 echo "wrote manifest $META"
@@ -458,10 +501,17 @@ cat "$META"
 if [ "$ROLE" = "source" ]; then
     echo
     echo "==== Source role done ===="
-    echo "Copy these to the destination host, e.g.:"
-    echo "  scp $BLOB $META user@DEST_HOST:/tmp/"
-    echo "Then on the destination:"
-    echo "  sudo PF=$PF ROLE=destination $0"
+    if [ "$UCTX" = "1" ]; then
+        echo "Copy these to the destination host, e.g.:"
+        echo "  scp $BLOB $META $UCTX_BLOB user@DEST_HOST:/tmp/"
+        echo "Then on the destination:"
+        echo "  sudo PF=$PF ROLE=destination UCTX=1 $0"
+    else
+        echo "Copy these to the destination host, e.g.:"
+        echo "  scp $BLOB $META user@DEST_HOST:/tmp/"
+        echo "Then on the destination:"
+        echo "  sudo PF=$PF ROLE=destination $0"
+    fi
     exit 0
 fi
 
@@ -499,6 +549,26 @@ if [ "$ROLE" = "destination" ]; then
         if [ -n "$EXPECT_BYTES" ] && [ "$EXPECT_BYTES" != "$SAVE_BYTES" ]; then
             echo "FAIL: blob size mismatch -- manifest expects $EXPECT_BYTES, actual $SAVE_BYTES"
             exit 1
+        fi
+        # Cross-host integrity for the UCTX sidecar (UCTX=1 only).
+        # Same shape of check as the main blob: refuse to run Phase
+        # D.5 if the sidecar doesn't match the manifest.
+        if [ "$UCTX" = "1" ]; then
+            MAN_UCTX_ENABLED=$(grep '^uctx_enabled=' "$META" | sed 's/^uctx_enabled=//')
+            if [ "$MAN_UCTX_ENABLED" != "1" ]; then
+                echo "FAIL: UCTX=1 but source manifest reports uctx_enabled=$MAN_UCTX_ENABLED"
+                exit 1
+            fi
+            [ -e "$UCTX_BLOB" ] || { echo "FAIL: UCTX=1 but missing sidecar $UCTX_BLOB"; exit 1; }
+            EXPECT_UCTX_SHA=$(grep '^uctx_sha256=' "$META" | sed 's/^uctx_sha256=//')
+            ACTUAL_UCTX_SHA=$(sha256sum "$UCTX_BLOB" | awk '{print $1}')
+            if [ -n "$EXPECT_UCTX_SHA" ] && [ "$EXPECT_UCTX_SHA" != "$ACTUAL_UCTX_SHA" ]; then
+                echo "FAIL: uctx blob sha256 mismatch -- manifest expects $EXPECT_UCTX_SHA"
+                echo "      actual sidecar is              $ACTUAL_UCTX_SHA"
+                echo "      did you scp $UCTX_BLOB across?"
+                exit 1
+            fi
+            echo "uctx blob sha256 matches manifest: $ACTUAL_UCTX_SHA"
         fi
     else
         echo "WARN: no source manifest at $META; POST won't be compared to PRE"
@@ -588,6 +658,31 @@ if [ "$PINGPONG" = "1" ] && [ -e "$(vf_path $VF2)/driver" ]; then
     else
         echo "WARN: no ib_device for $VF2; skipping Phase D.1 pingpong"
     fi
+fi
+
+# --- Phase D.5: consume UCTX snapshot on destination (UCTX=1) ---------
+#
+# Run AFTER the destination bind has succeeded so the ib_device exists.
+# Treated as must-pass: the cross-host UAR persistence experiment
+# (PASS-A + PASS-B in this session) demonstrated that the FW UAR ids
+# captured on the source remain valid after LOAD_VHCA_STATE, and the
+# in-handler strict META + static-slot validity checks at RESTORE time
+# would catch any silent drift before mmap. A failure here therefore
+# means an honest regression of one of: (a) the alloc-flag short-
+# circuit (step 1), (b) the QUERY snapshot fidelity (step 2), (c) the
+# RESTORE preconditions or apply (step 3), or (d) FW's preservation of
+# per-VHCA UAR allocator state across LOAD_VHCA_STATE.
+if [ "$UCTX" = "1" ] && [ -e "$(vf_path $VF2)/driver" ]; then
+    dst_ibdev_uctx=$(find_ib_dev_for_pci "$VF2") || dst_ibdev_uctx=""
+    if [ -z "$dst_ibdev_uctx" ]; then
+        echo "FAIL: UCTX=1 but no ib_device for restored VF $VF2"
+        exit 1
+    fi
+    echo "=== Phase D.5: UCTX restore ($UCTX_BLOB -> $dst_ibdev_uctx) ==="
+    sudo "$UCTX_TOOL" restore_uctx_snapshot "$dst_ibdev_uctx" "$UCTX_BLOB"
+elif [ "$UCTX" = "1" ]; then
+    echo "FAIL: UCTX=1 but VF $VF2 not bound -- can't run Phase D.5"
+    exit 1
 fi
 
 # Hard-fail on the legacy baseline failure: 60s ENABLE_HCA timeout.
