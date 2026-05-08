@@ -1591,6 +1591,18 @@ extern const struct uapi_definition mlx5_ib_std_types_defs[];
 extern const struct uapi_definition mlx5_ib_create_cq_defs[];
 extern const struct uapi_definition mlx5_ib_vfmig_defs[];
 
+/*
+ * VFMIG dyn-UAR restore helper. Defined in main.c next to alloc_uar_entry();
+ * exposed here so the vfmig vendor verbs (drivers/.../vfmig_uctx.c) can
+ * reuse the exact mmap_entry / mmap_flag setup the live-alloc path uses,
+ * differing only in (a) skipping mlx5_cmd_uar_alloc and (b) pinning the
+ * mmap pgoff so libmlx5's captured offsets stay valid post-restore.
+ */
+struct mlx5_user_mmap_entry *
+restore_uar_entry(struct mlx5_ib_ucontext *c,
+		  enum mlx5_ib_uapi_uar_alloc_type alloc_type,
+		  u32 uar_index, u32 mmap_pgoff);
+
 static inline int is_qp1(enum ib_qp_type qp_type)
 {
 	return qp_type == MLX5_IB_QPT_HW_GSI || qp_type == IB_QPT_GSI;

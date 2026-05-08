@@ -383,6 +383,37 @@ enum mlx5_ib_get_data_direct_sysfs_path_attrs {
 enum mlx5_ib_vfmig_methods {
 	MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT,
+	/*
+	 * Dynamic UAR (lib_uar_dyn=true / MLX5_LIB_CAP_DYN_UAR) save/restore.
+	 *
+	 * libmlx5 in dynamic-UAR mode does not use the static
+	 * bfregi->sys_pages[] table at all; UARs are allocated lazily as
+	 * MLX5_IB_OBJECT_UAR uobjects via MLX5_IB_METHOD_UAR_OBJ_ALLOC and
+	 * exposed to userspace via rdma_user_mmap_entry start_pgoff plus
+	 * the uobject handle returned in MLX5_IB_ATTR_UAR_OBJ_ALLOC_HANDLE.
+	 *
+	 * QUERY_DYN_UARS snapshots, for the calling fd's ucontext, every
+	 * outstanding MLX5_IB_OBJECT_UAR uobject as a record carrying
+	 *   (handle, page_id, mmap_offset, alloc_type)
+	 * so a destination ucontext (opened with
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE on a destination VHCA whose
+	 * state was imported via SAVE_VHCA_STATE / LOAD_VHCA_STATE from
+	 * the source) can replay them via RESTORE_DYN_UARS, which
+	 * reconstructs the uobjects at the same handles and re-inserts
+	 * the rdma_user_mmap_entry's at the same start_pgoff. After
+	 * RESTORE_DYN_UARS, the userspace-visible (handle, mmap_offset)
+	 * pairs that libmlx5 captured in its dump are valid against the
+	 * destination ucontext byte-for-byte, so the existing libmlx5
+	 * mmap()s can re-execute against the new fd unchanged.
+	 *
+	 * Two-pass call convention identical to QUERY_UCONTEXT: a first
+	 * call without the RECORDS array reads back COUNT; a second call
+	 * with RECORDS sized RECORDS[COUNT] fills them under the
+	 * ucontext's locks.  RESTORE_DYN_UARS is single-shot per ucontext
+	 * (mirrors RESTORE_UCONTEXT): it consumes c->vfmig_restore_pending.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS,
+	MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS,
 };
 
 /*
@@ -463,6 +494,64 @@ struct mlx5_ib_vfmig_ucontext_meta {
 	__u8	lib_uar_dyn;
 	__u8	cqe_version;
 	__u8	reserved1[5];
+};
+
+/*
+ * QUERY_DYN_UARS / RESTORE_DYN_UARS attribute IDs.
+ *
+ *   RECORDS:  array of struct mlx5_ib_vfmig_dyn_uar_record. Length must
+ *             equal COUNT * sizeof(struct mlx5_ib_vfmig_dyn_uar_record).
+ *             OPTIONAL on QUERY_DYN_UARS (omit for the sizing pass);
+ *             MANDATORY on RESTORE_DYN_UARS.
+ *
+ *   COUNT:    __u32. On QUERY_DYN_UARS, kernel always writes the number
+ *             of dynamic UARs currently held by this ucontext (so the
+ *             sizing pass tells userspace exactly how big RECORDS must
+ *             be, and the snapshot pass confirms RECORDS was sized
+ *             correctly). RECORDS, if supplied, must be COUNT-sized.
+ */
+enum mlx5_ib_vfmig_query_dyn_uars_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT,
+};
+
+enum mlx5_ib_vfmig_restore_dyn_uars_attrs {
+	MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS = (1U << UVERBS_ID_NS_SHIFT),
+};
+
+/*
+ * Per-dynamic-UAR record exchanged across migration.
+ *
+ *   handle:        ufile->idr handle of the MLX5_IB_OBJECT_UAR uobject
+ *                  on the source ucontext (== userspace's opaque UAR
+ *                  handle). RESTORE pins the destination's uobject at
+ *                  this same handle via rdma_alloc_begin_uobject_at_handle
+ *                  so libmlx5's captured (handle, mmap_offset) pairs
+ *                  remain valid post-restore.
+ *
+ *   uar_index:     FW UAR id (page_idx). Valid only against a destination
+ *                  VHCA whose state was imported via LOAD_VHCA_STATE from
+ *                  the source the snapshot was captured on.
+ *
+ *   mmap_offset:   start_pgoff << PAGE_SHIFT of the rdma_user_mmap_entry
+ *                  on the source ucontext (i.e. the offset libmlx5 used
+ *                  in its mmap() syscall). RESTORE re-inserts the entry
+ *                  on the destination at the same start_pgoff.
+ *
+ *   alloc_type:    MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF (write-combining,
+ *                  blue-flame doorbell page) or
+ *                  MLX5_IB_UAPI_UAR_ALLOC_TYPE_NC (uncached). Decides
+ *                  the entry's mmap_flag and the prot used when libmlx5
+ *                  remaps. v0 only restores these two types -- DEVX-mode
+ *                  ucontexts and the MLX5_IB_OBJECT_VAR table are not
+ *                  covered by these verbs.
+ */
+struct mlx5_ib_vfmig_dyn_uar_record {
+	__u32	handle;
+	__u32	uar_index;
+	__aligned_u64 mmap_offset;
+	__u8	alloc_type;
+	__u8	reserved0[7];
 };
 
 #endif

@@ -2142,17 +2142,15 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 	bfregi = &context->bfregi;
 
 	/*
-	 * v0 VFMIG restore covers only the static bfregi->sys_pages[] path.
-	 * lib_uar_dyn=true bypasses sys_pages[] entirely (UARs are dynamic
-	 * MLX5_IB_OBJECT_UAR uobjects with their own mmap_entry table); a
-	 * separate restore path will be needed there. Reject the combo for
-	 * now rather than silently succeeding with a bogus restore.
+	 * VFMIG restore on a lib_uar_dyn=true ucontext is handled by
+	 * MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS rather than the static
+	 * RESTORE_UCONTEXT path: dynamic-UAR libmlx5 doesn't use
+	 * bfregi->sys_pages[] at all, so allocate_uars()'s sentinel
+	 * sys_pages[] is uninteresting. allocate_uars() is bypassed
+	 * unconditionally below for lib_uar_dyn=true; the restore handler
+	 * later seeds the MLX5_IB_OBJECT_UAR uobjects + mmap_entry's and
+	 * clears c->vfmig_restore_pending exactly like RESTORE_UCONTEXT.
 	 */
-	if (context->vfmig_restore_pending && lib_uar_dyn) {
-		err = -EOPNOTSUPP;
-		goto out_ucap;
-	}
-
 	if (lib_uar_dyn) {
 		bfregi->lib_uar_dyn = lib_uar_dyn;
 		goto uar_done;
@@ -4161,6 +4159,58 @@ alloc_uar_entry(struct mlx5_ib_ucontext *c,
 err_insert:
 	mlx5_cmd_uar_dealloc(dev->mdev, uar_index, c->devx_uid);
 end:
+	kfree(entry);
+	return ERR_PTR(err);
+}
+
+/*
+ * VFMIG sibling of alloc_uar_entry() used by RESTORE_DYN_UARS.
+ *
+ * Differences from the normal allocator:
+ *   - No mlx5_cmd_uar_alloc() FW round-trip. The destination VHCA
+ *     already holds @uar_index reserved as part of LOAD_VHCA_STATE
+ *     (the source VHCA's UAR id, transferred verbatim via the FW
+ *     migration blob); issuing ALLOC_UAR here would either pick a
+ *     different id or, worse, EBUSY on a slot we already own.
+ *   - rdma_user_mmap_entry_insert_exact() pins the start_pgoff so it
+ *     matches the source's mmap_offset byte-for-byte, which is what
+ *     keeps libmlx5's captured offset valid against the destination
+ *     ucontext's mmap table.
+ *
+ * Cleanup is identical to the normal path: mmap_obj_cleanup() calls
+ * mlx5_cmd_uar_dealloc() on the page_idx, returning the FW UAR id to
+ * the VHCA's pool exactly as if it had been freshly allocated.
+ */
+struct mlx5_user_mmap_entry *
+restore_uar_entry(struct mlx5_ib_ucontext *c,
+		  enum mlx5_ib_uapi_uar_alloc_type alloc_type,
+		  u32 uar_index, u32 mmap_pgoff)
+{
+	struct mlx5_user_mmap_entry *entry;
+	struct mlx5_ib_dev *dev;
+	int err;
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return ERR_PTR(-ENOMEM);
+
+	dev = to_mdev(c->ibucontext.device);
+	entry->page_idx = uar_index;
+	entry->address = uar_index2paddress(dev, uar_index);
+	if (alloc_type == MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF)
+		entry->mmap_flag = MLX5_IB_MMAP_TYPE_UAR_WC;
+	else
+		entry->mmap_flag = MLX5_IB_MMAP_TYPE_UAR_NC;
+
+	err = rdma_user_mmap_entry_insert_exact(&c->ibucontext,
+						&entry->rdma_entry,
+						PAGE_SIZE, mmap_pgoff);
+	if (err)
+		goto err_insert;
+
+	return entry;
+
+err_insert:
 	kfree(entry);
 	return ERR_PTR(err);
 }
