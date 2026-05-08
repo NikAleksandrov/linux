@@ -13,11 +13,13 @@
  *     exercises deallocate_uars()'s INVALID-skip, validating the
  *     abandoned-restore cleanup.
  *
- *   alloc_uctx_neg_dyn_uar <ibdev>
- *     Negative: GET_CONTEXT with VFMIG_RESTORE *and*
- *     MLX5_LIB_CAP_DYN_UAR. v0 rejects this combo because lib_uar_dyn
- *     bypasses the static sys_pages[] table that the restore path
- *     depends on. Expect EOPNOTSUPP.
+ *   alloc_uctx_dyn_uar <ibdev>
+ *     Positive: GET_CONTEXT with VFMIG_RESTORE *and*
+ *     MLX5_LIB_CAP_DYN_UAR. The v0 rejection of this combo has been
+ *     replaced by MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS, which restores
+ *     dyn-UAR uobjects at their preserved handles; the alloc path now
+ *     just bypasses the static sys_pages[] init and waits for the
+ *     restore verb to seed the MLX5_IB_OBJECT_UAR uobjects.
  *
  *   alloc_uctx_neg_bad_flag <ibdev>
  *     Negative: GET_CONTEXT with an unsupported flag bit (1 << 31).
@@ -159,15 +161,36 @@ enum {
  *   MLX5_IB_OBJECT_VFMIG = DEVX + 10.
  * Update if entries are inserted before VFMIG in the kernel enum.
  */
+/*
+ * Position in enum mlx5_ib_objects (mlx5_user_ioctl_cmds.h):
+ *   MLX5_IB_OBJECT_DEVX = (1u << UVERBS_ID_NS_SHIFT);
+ *   ... DEVX(0) DEVX_OBJ(1) DEVX_UMEM(2) FLOW_MATCHER(3)
+ *       DEVX_ASYNC_CMD_FD(4) DEVX_ASYNC_EVENT_FD(5)
+ *       VAR(6) PP(7) UAR(8) STEERING_ANCHOR(9) ...
+ *   MLX5_IB_OBJECT_UAR = DEVX + 8.
+ * Update if entries are inserted before UAR in the kernel enum.
+ */
+#define MLX5_IB_OBJECT_UAR				((1u << UVERBS_ID_NS_SHIFT) + 8)
+#define MLX5_IB_METHOD_UAR_OBJ_ALLOC			(1u << UVERBS_ID_NS_SHIFT)
+#define MLX5_IB_ATTR_UAR_OBJ_ALLOC_HANDLE		(1u << UVERBS_ID_NS_SHIFT)
+#define MLX5_IB_ATTR_UAR_OBJ_ALLOC_TYPE			((1u << UVERBS_ID_NS_SHIFT) + 1)
+#define MLX5_IB_ATTR_UAR_OBJ_ALLOC_MMAP_OFFSET		((1u << UVERBS_ID_NS_SHIFT) + 2)
+#define MLX5_IB_ATTR_UAR_OBJ_ALLOC_MMAP_LENGTH		((1u << UVERBS_ID_NS_SHIFT) + 3)
+#define MLX5_IB_ATTR_UAR_OBJ_ALLOC_PAGE_ID		((1u << UVERBS_ID_NS_SHIFT) + 4)
 #define MLX5_IB_OBJECT_VFMIG				((1u << UVERBS_ID_NS_SHIFT) + 10)
 #define MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT		(1u << UVERBS_ID_NS_SHIFT)
 #define MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT		((1u << UVERBS_ID_NS_SHIFT) + 1)
+#define MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS		((1u << UVERBS_ID_NS_SHIFT) + 2)
+#define MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS		((1u << UVERBS_ID_NS_SHIFT) + 3)
 #define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_UAR_TABLE	(1u << UVERBS_ID_NS_SHIFT)
 #define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_BFREG_COUNT	((1u << UVERBS_ID_NS_SHIFT) + 1)
 #define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META		((1u << UVERBS_ID_NS_SHIFT) + 2)
 #define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE	(1u << UVERBS_ID_NS_SHIFT)
 #define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT	((1u << UVERBS_ID_NS_SHIFT) + 1)
 #define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META	((1u << UVERBS_ID_NS_SHIFT) + 2)
+#define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS	(1u << UVERBS_ID_NS_SHIFT)
+#define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT		((1u << UVERBS_ID_NS_SHIFT) + 1)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS	(1u << UVERBS_ID_NS_SHIFT)
 #define MLX5_IB_INVALID_UAR_INDEX			(1u << 31)
 
 struct mlx5_ib_vfmig_ucontext_meta {
@@ -182,6 +205,24 @@ struct mlx5_ib_vfmig_ucontext_meta {
 	uint8_t  lib_uar_dyn;
 	uint8_t  cqe_version;
 	uint8_t  reserved1[5];
+} __attribute__((aligned(8)));
+
+/*
+ * MLX5_IB_UAPI_UAR_ALLOC_TYPE_* from include/uapi/rdma/mlx5_user_ioctl_verbs.h.
+ * BF (write-combining, blue-flame doorbell) and NC (uncached) are the only
+ * two types alloc_uar_entry()/restore_uar_entry() emit.
+ */
+enum {
+	MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF = 0x0,
+	MLX5_IB_UAPI_UAR_ALLOC_TYPE_NC = 0x1,
+};
+
+struct mlx5_ib_vfmig_dyn_uar_record {
+	uint32_t handle;
+	uint32_t uar_index;
+	uint64_t mmap_offset;
+	uint8_t  alloc_type;
+	uint8_t  reserved0[7];
 } __attribute__((aligned(8)));
 
 /* From include/uapi/rdma/mlx5-abi.h */
@@ -382,12 +423,13 @@ static int do_alloc_uctx_with_flag(const char *ibdev)
 }
 
 /*
- * Negative: VFMIG_RESTORE + lib_uar_dyn must be rejected with EOPNOTSUPP.
- * The static sys_pages[] table that the restore path depends on doesn't
- * exist when lib_uar_dyn=true; UARs go through MLX5_IB_OBJECT_UAR uobjects
- * with their own restore story (out of v0 scope).
+ * Positive: VFMIG_RESTORE + lib_uar_dyn must be ACCEPTED. Pairs with the
+ * MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS path (an earlier revision of
+ * this tool used to assert EOPNOTSUPP here, when v0 only covered the
+ * static sys_pages[] case; the rejection has since been replaced by a
+ * proper dyn-UAR restore story).
  */
-static int do_alloc_uctx_neg_dyn_uar(const char *ibdev)
+static int do_alloc_uctx_dyn_uar(const char *ibdev)
 {
 	struct resp_blob resp = {};
 	int fd, rc;
@@ -402,19 +444,13 @@ static int do_alloc_uctx_neg_dyn_uar(const char *ibdev)
 			      &resp);
 	close(fd);
 
-	if (rc == -EOPNOTSUPP) {
-		printf("alloc_uctx_neg_dyn_uar %s: PASS (rejected with EOPNOTSUPP)\n",
+	if (rc == 0) {
+		printf("alloc_uctx_dyn_uar %s: PASS (VFMIG_RESTORE | DYN_UAR accepted)\n",
 		       ibdev);
 		return 0;
 	}
-	if (rc == 0) {
-		fprintf(stderr,
-			"alloc_uctx_neg_dyn_uar %s: FAIL (kernel ACCEPTED VFMIG_RESTORE | DYN_UAR; should reject)\n",
-			ibdev);
-		return 1;
-	}
 	fprintf(stderr,
-		"alloc_uctx_neg_dyn_uar %s: FAIL (got %s, expected EOPNOTSUPP)\n",
+		"alloc_uctx_dyn_uar %s: FAIL (got %s, expected success)\n",
 		ibdev, strerror(-rc));
 	return 1;
 }
@@ -1268,6 +1304,546 @@ out:
 }
 
 /*
+ * Build & issue a VFMIG QUERY_DYN_UARS ioctl. RECORDS may be NULL+0 to
+ * request a sizing pass (kernel writes COUNT only). On success returns
+ * 0 and writes *count_out. On failure returns -errno (negated).
+ */
+static int issue_vfmig_query_dyn_uars(int fd,
+		struct mlx5_ib_vfmig_dyn_uar_record *records, size_t records_n,
+		uint32_t *count_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	if (records) {
+		cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS;
+		cmd.attrs[n].len = (uint16_t)(records_n * sizeof(*records));
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)records;
+		n++;
+	}
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT;
+	cmd.attrs[n].len = sizeof(*count_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)count_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Build & issue a VFMIG RESTORE_DYN_UARS ioctl. RECORDS is mandatory
+ * with non-zero length on the wire (kernel rejects len % sizeof(record)
+ * != 0 or len == 0). Returns 0 on kernel success, -errno (negated) on
+ * failure.
+ */
+static int issue_vfmig_restore_dyn_uars(int fd,
+		const struct mlx5_ib_vfmig_dyn_uar_record *records,
+		size_t records_n)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} cmd = {};
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs[0]);
+
+	cmd.attrs[0].attr_id = MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS;
+	cmd.attrs[0].len = (uint16_t)(records_n * sizeof(*records));
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = (uintptr_t)records;
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Result tuple returned by an UAR_OBJ_ALLOC ioctl.
+ *
+ *   handle:       ufile->idr id assigned to the new MLX5_IB_OBJECT_UAR
+ *                 uobject. The kernel writes this into the HANDLE attr's
+ *                 data field for IDR/ACCESS_NEW attributes (see
+ *                 uverbs_process_attr() / put_user(id, &user_attrs[i].data)).
+ *   page_id:      FW UAR id (== mlx5_user_mmap_entry::page_idx).
+ *   mmap_offset:  start_pgoff << PAGE_SHIFT, i.e. the byte offset libmlx5
+ *                 uses with mmap(MAP_SHARED, fd, ...) to reach this UAR.
+ *   mmap_length:  region length (1 page on every supported platform).
+ */
+struct uar_alloc_result {
+	uint32_t handle;
+	uint32_t page_id;
+	uint64_t mmap_offset;
+	uint32_t mmap_length;
+};
+
+/*
+ * Issue MLX5_IB_METHOD_UAR_OBJ_ALLOC via the raw uverbs ioctl, bypassing
+ * libibverbs / libmlx5 (libmlx5 wraps this in mlx5dv_devx_alloc_uar(),
+ * which we don't want a hard dependency on for a kernel test).
+ *
+ * Wire format for each attr (see uverbs_process_attr):
+ *   - HANDLE (IDR/ACCESS_NEW):
+ *       len=0, attr_data.reserved=0. Kernel allocates the uobject and
+ *       writes the assigned id back into attrs[].data via put_user().
+ *   - TYPE (CONST_IN, i.e. inline u64-sized PTR_IN):
+ *       len=8. Value is packed *inline* in attrs[].data (the kernel
+ *       reads it directly because uverbs_attr_ptr_is_inline() returns
+ *       true for len <= 8); no userspace pointer dereference happens.
+ *   - PAGE_ID / MMAP_LENGTH / MMAP_OFFSET (PTR_OUT):
+ *       len=sizeof(field), data=(uintptr_t)&field. Kernel copies via
+ *       copy_to_user.
+ *
+ * Returns 0 on kernel success, -errno (negated) on failure.
+ */
+static int issue_uar_obj_alloc(int fd, uint8_t alloc_type,
+			       struct uar_alloc_result *out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[5];
+	} cmd = {};
+
+	memset(out, 0, sizeof(*out));
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_UAR;
+	cmd.hdr.method_id = MLX5_IB_METHOD_UAR_OBJ_ALLOC;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+	cmd.hdr.num_attrs = 5;
+	cmd.hdr.length = sizeof(cmd.hdr) + 5 * sizeof(cmd.attrs[0]);
+
+	cmd.attrs[0].attr_id = MLX5_IB_ATTR_UAR_OBJ_ALLOC_HANDLE;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = 0;
+
+	cmd.attrs[1].attr_id = MLX5_IB_ATTR_UAR_OBJ_ALLOC_TYPE;
+	cmd.attrs[1].len = sizeof(uint64_t);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = alloc_type;
+
+	cmd.attrs[2].attr_id = MLX5_IB_ATTR_UAR_OBJ_ALLOC_PAGE_ID;
+	cmd.attrs[2].len = sizeof(out->page_id);
+	cmd.attrs[2].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[2].data = (uintptr_t)&out->page_id;
+
+	cmd.attrs[3].attr_id = MLX5_IB_ATTR_UAR_OBJ_ALLOC_MMAP_LENGTH;
+	cmd.attrs[3].len = sizeof(out->mmap_length);
+	cmd.attrs[3].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[3].data = (uintptr_t)&out->mmap_length;
+
+	cmd.attrs[4].attr_id = MLX5_IB_ATTR_UAR_OBJ_ALLOC_MMAP_OFFSET;
+	cmd.attrs[4].len = sizeof(out->mmap_offset);
+	cmd.attrs[4].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[4].data = (uintptr_t)&out->mmap_offset;
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+
+	/*
+	 * IDR/ACCESS_NEW: kernel wrote the assigned handle back into
+	 * attrs[0].data via put_user(). The data field is u64; the
+	 * handle is an unsigned 32-bit id (xa_limit_32b in idr_add_uobj).
+	 */
+	out->handle = (uint32_t)cmd.attrs[0].data;
+	return 0;
+}
+
+/*
+ * Find a record in @records (length @n) with handle == @handle. Returns
+ * a pointer into @records, or NULL if not found.
+ */
+static const struct mlx5_ib_vfmig_dyn_uar_record *
+find_record_by_handle(const struct mlx5_ib_vfmig_dyn_uar_record *records,
+		      uint32_t n, uint32_t handle)
+{
+	for (uint32_t i = 0; i < n; i++)
+		if (records[i].handle == handle)
+			return &records[i];
+	return NULL;
+}
+
+/*
+ * roundtrip_dyn_uars <ibdev>:
+ *
+ * Same-VHCA smoke test for the dyn-UAR save/restore path. Validates the
+ * userspace-visible end-to-end shape:
+ *
+ *   1. fd_a opens a normal dynamic-UAR ucontext.
+ *   2. fd_a issues N UAR_OBJ_ALLOC ioctls; remembers (handle, page_id,
+ *      mmap_offset, alloc_type) for each.
+ *   3. fd_a runs QUERY_DYN_UARS (two-pass) and asserts every record
+ *      matches step (2) by handle.
+ *   4. fd_b opens a ucontext with VFMIG_RESTORE | DYN_UAR.
+ *   5. fd_b runs QUERY_DYN_UARS and asserts COUNT == 0 (the alloc-skip
+ *      path took effect; no live UARs yet).
+ *   6. fd_b runs RESTORE_DYN_UARS with fd_a's snapshot.
+ *   7. fd_b runs QUERY_DYN_UARS again and asserts records match fd_a
+ *      bitwise -- this confirms rdma_alloc_begin_uobject_at_handle()
+ *      pinned the handles and restore_uar_entry() reinserted the mmap
+ *      pgoffs at the saved offsets.
+ *   8. fd_b mmap()s one of the saved offsets and confirms it succeeds
+ *      (kernel ran rdma_user_mmap_entry_get_pgoff() against fd_b's
+ *      mmap table, found the restored entry, and io_remap_pfn_range()d
+ *      the BAR for the saved page_id). No read/write through the
+ *      mapping -- doorbell semantics are out of scope here.
+ *   9. Cleanup: close fd_b first, then fd_a. Kernel will dmesg one
+ *      benign DEALLOC_UAR failure on fd_a's close because both
+ *      ucontexts hold the same FW UAR id on the same VHCA -- this is
+ *      the design difference vs cross-host (LOAD_VHCA_STATE), which
+ *      transfers the FW id ownership and avoids the double-free.
+ *
+ * SCOPE CAVEAT: this is a same-VHCA smoke that exercises the kernel
+ * verbs end-to-end, not a substitute for the cross-host pingpong gate.
+ * It does NOT exercise:
+ *   - LOAD_VHCA_STATE FW id ownership transfer.
+ *   - QP doorbell semantics (FW would reject doorbells on a UAR that
+ *     fd_a still holds and fd_b restored; we never doorbell, only mmap).
+ */
+#define ROUNDTRIP_DYN_UARS_NR 2
+
+static int do_roundtrip_dyn_uars(const char *ibdev)
+{
+	struct uar_alloc_result alloc[ROUNDTRIP_DYN_UARS_NR] = {};
+	struct mlx5_ib_vfmig_dyn_uar_record *recs_a = NULL;
+	struct mlx5_ib_vfmig_dyn_uar_record *recs_b = NULL;
+	struct resp_blob alloc_resp_a = {};
+	struct resp_blob alloc_resp_b = {};
+	uint32_t count_a = 0, count_b = 0;
+	int fd_a = -1, fd_b = -1, rc, ret = 1;
+	const long page = sysconf(_SC_PAGESIZE);
+	uint32_t i;
+	uint8_t alloc_type;
+	void *p;
+
+	fd_a = open_uverbs_for_ibdev(ibdev);
+	if (fd_a < 0)
+		return 1;
+	fd_b = open_uverbs_for_ibdev(ibdev);
+	if (fd_b < 0)
+		goto out;
+
+	/* Step 1: open fd_a as a normal dyn-UAR ucontext. */
+	rc = send_get_context(fd_a, 0,
+			      MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
+			      &alloc_resp_a);
+	if (rc < 0) {
+		fprintf(stderr,
+			"step 1 FAIL: GET_CONTEXT(A, dyn-UAR): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+
+	/*
+	 * Step 2: alloc N=2 dyn UARs on fd_a. Try BF (write-combining)
+	 * first; if the device doesn't support WC pages, fall back to NC
+	 * for the remaining slots. Either way we exercise the same code
+	 * path -- alloc_type just decides mmap_flag (UAR_WC vs UAR_NC).
+	 */
+	for (i = 0; i < ROUNDTRIP_DYN_UARS_NR; i++) {
+		alloc_type = (i == 0) ? MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF
+				      : MLX5_IB_UAPI_UAR_ALLOC_TYPE_NC;
+		rc = issue_uar_obj_alloc(fd_a, alloc_type, &alloc[i]);
+		if (rc == -EOPNOTSUPP &&
+		    alloc_type == MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF) {
+			/* WC not supported; fall back to NC. */
+			alloc_type = MLX5_IB_UAPI_UAR_ALLOC_TYPE_NC;
+			rc = issue_uar_obj_alloc(fd_a, alloc_type, &alloc[i]);
+		}
+		if (rc < 0) {
+			fprintf(stderr,
+				"step 2 FAIL: UAR_OBJ_ALLOC[%u, type=%u]: %s\n",
+				i, alloc_type, strerror(-rc));
+			goto out;
+		}
+		printf("step 2: UAR_OBJ_ALLOC[%u]: handle=%u page_id=%u "
+		       "mmap_offset=0x%llx mmap_length=%u alloc_type=%u\n",
+		       i, alloc[i].handle, alloc[i].page_id,
+		       (unsigned long long)alloc[i].mmap_offset,
+		       alloc[i].mmap_length, alloc_type);
+	}
+
+	/*
+	 * Step 3: snapshot fd_a via QUERY_DYN_UARS (two-pass). Cross-
+	 * check by handle against the live UAR_OBJ_ALLOC tuples.
+	 */
+	rc = issue_vfmig_query_dyn_uars(fd_a, NULL, 0, &count_a);
+	if (rc < 0) {
+		fprintf(stderr,
+			"step 3 FAIL: QUERY_DYN_UARS(A, sizing): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+	if (count_a != ROUNDTRIP_DYN_UARS_NR) {
+		fprintf(stderr,
+			"step 3 FAIL: QUERY_DYN_UARS(A) count=%u, expected %u\n",
+			count_a, ROUNDTRIP_DYN_UARS_NR);
+		goto out;
+	}
+	recs_a = calloc(count_a, sizeof(*recs_a));
+	if (!recs_a) {
+		fprintf(stderr, "calloc: %s\n", strerror(errno));
+		goto out;
+	}
+	rc = issue_vfmig_query_dyn_uars(fd_a, recs_a, count_a, &count_a);
+	if (rc < 0) {
+		fprintf(stderr,
+			"step 3 FAIL: QUERY_DYN_UARS(A, snapshot): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+	for (i = 0; i < ROUNDTRIP_DYN_UARS_NR; i++) {
+		const struct mlx5_ib_vfmig_dyn_uar_record *r =
+			find_record_by_handle(recs_a, count_a,
+					      alloc[i].handle);
+		if (!r) {
+			fprintf(stderr,
+				"step 3 FAIL: handle=%u not present in QUERY(A) snapshot\n",
+				alloc[i].handle);
+			goto out;
+		}
+		if (r->uar_index != alloc[i].page_id ||
+		    r->mmap_offset != alloc[i].mmap_offset) {
+			fprintf(stderr,
+				"step 3 FAIL: QUERY(A) record for handle=%u "
+				"differs from UAR_OBJ_ALLOC: "
+				"snapshot uar=%u offset=0x%llx vs alloc uar=%u offset=0x%llx\n",
+				alloc[i].handle,
+				r->uar_index,
+				(unsigned long long)r->mmap_offset,
+				alloc[i].page_id,
+				(unsigned long long)alloc[i].mmap_offset);
+			goto out;
+		}
+	}
+	printf("step 3: QUERY_DYN_UARS(A) bitwise matches live UAR_OBJ_ALLOC tuples: PASS\n");
+
+	/* Step 4: open fd_b with VFMIG_RESTORE | DYN_UAR. */
+	rc = send_get_context(fd_b,
+			      MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			      MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
+			      &alloc_resp_b);
+	if (rc < 0) {
+		fprintf(stderr,
+			"step 4 FAIL: GET_CONTEXT(B, VFMIG_RESTORE | DYN_UAR): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+
+	/*
+	 * Step 5: confirm fd_b is empty pre-RESTORE. The
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE | DYN_UAR alloc path
+	 * unconditionally bypasses allocate_uars(); no MLX5_IB_OBJECT_UAR
+	 * uobjects exist yet, so QUERY_DYN_UARS must report COUNT == 0.
+	 */
+	rc = issue_vfmig_query_dyn_uars(fd_b, NULL, 0, &count_b);
+	if (rc < 0) {
+		fprintf(stderr,
+			"step 5 FAIL: QUERY_DYN_UARS(B, pre-RESTORE): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+	if (count_b != 0) {
+		fprintf(stderr,
+			"step 5 FAIL: QUERY_DYN_UARS(B, pre-RESTORE) count=%u, expected 0\n",
+			count_b);
+		goto out;
+	}
+	printf("step 5: QUERY_DYN_UARS(B) pre-RESTORE: count=0 (alloc-skip OK)\n");
+
+	/* Step 6: RESTORE_DYN_UARS on fd_b with fd_a's snapshot. */
+	rc = issue_vfmig_restore_dyn_uars(fd_b, recs_a, count_a);
+	if (rc < 0) {
+		fprintf(stderr,
+			"step 6 FAIL: RESTORE_DYN_UARS(B): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+	printf("step 6: RESTORE_DYN_UARS(B) %u records: PASS\n", count_a);
+
+	/* Step 7: re-query fd_b and assert bitwise match against fd_a. */
+	rc = issue_vfmig_query_dyn_uars(fd_b, NULL, 0, &count_b);
+	if (rc < 0 || count_b != count_a) {
+		fprintf(stderr,
+			"step 7 FAIL: QUERY_DYN_UARS(B, post-RESTORE) count=%u expected=%u rc=%d\n",
+			count_b, count_a, rc);
+		goto out;
+	}
+	recs_b = calloc(count_b, sizeof(*recs_b));
+	if (!recs_b) {
+		fprintf(stderr, "calloc: %s\n", strerror(errno));
+		goto out;
+	}
+	rc = issue_vfmig_query_dyn_uars(fd_b, recs_b, count_b, &count_b);
+	if (rc < 0) {
+		fprintf(stderr,
+			"step 7 FAIL: QUERY_DYN_UARS(B, post-RESTORE snapshot): %s\n",
+			strerror(-rc));
+		goto out;
+	}
+	/*
+	 * Compare by handle (list-iteration order is not guaranteed: the
+	 * uobject list is FIFO, but RESTORE prepends each new uobj and
+	 * QUERY walks list_for_each_entry which is forward-from-head).
+	 */
+	for (i = 0; i < count_a; i++) {
+		const struct mlx5_ib_vfmig_dyn_uar_record *a = &recs_a[i];
+		const struct mlx5_ib_vfmig_dyn_uar_record *b =
+			find_record_by_handle(recs_b, count_b, a->handle);
+		if (!b) {
+			fprintf(stderr,
+				"step 7 FAIL: handle=%u missing in QUERY(B post-RESTORE)\n",
+				a->handle);
+			goto out;
+		}
+		if (b->uar_index != a->uar_index ||
+		    b->mmap_offset != a->mmap_offset ||
+		    b->alloc_type != a->alloc_type) {
+			fprintf(stderr,
+				"step 7 FAIL: handle=%u record drift: "
+				"A{uar=%u offset=0x%llx alloc=%u} vs "
+				"B{uar=%u offset=0x%llx alloc=%u}\n",
+				a->handle, a->uar_index,
+				(unsigned long long)a->mmap_offset, a->alloc_type,
+				b->uar_index,
+				(unsigned long long)b->mmap_offset, b->alloc_type);
+			goto out;
+		}
+	}
+	printf("step 7: QUERY_DYN_UARS(B post-RESTORE) bitwise matches A: PASS\n");
+
+	/*
+	 * Step 8: mmap one of fd_b's restored UAR offsets. We pick
+	 * record [0] since both BF (WC) and NC are mmap'd PROT_WRITE
+	 * 1 page; the exact prot doesn't matter for the success-of-mmap
+	 * test (mlx5_ib_mmap picks pgprot via mmap_flag and io_remap_pfn
+	 * succeeds on either). munmap() right after; we never touch the
+	 * mapping (see DOORBELL caveat in this function's docstring).
+	 */
+	p = mmap(NULL, page, PROT_WRITE, MAP_SHARED, fd_b,
+		 (off_t)recs_b[0].mmap_offset);
+	if (p == MAP_FAILED) {
+		fprintf(stderr,
+			"step 8 FAIL: mmap(fd_b, offset=0x%llx) on restored UAR handle=%u: %s\n",
+			(unsigned long long)recs_b[0].mmap_offset,
+			recs_b[0].handle, strerror(errno));
+		goto out;
+	}
+	if (munmap(p, page) < 0)
+		fprintf(stderr, "step 8 warning: munmap: %s\n",
+			strerror(errno));
+	printf("step 8: mmap(fd_b, offset=0x%llx, len=%ld) on restored UAR handle=%u: PASS\n",
+	       (unsigned long long)recs_b[0].mmap_offset, page,
+	       recs_b[0].handle);
+
+	printf("\nroundtrip_dyn_uars %s: PASS\n", ibdev);
+	printf("  (NOTE: closing fd_a will dmesg one benign DEALLOC_UAR error per\n");
+	printf("   restored UAR -- expected on a same-VHCA smoke; cross-host\n");
+	printf("   LOAD_VHCA_STATE transfers the FW id ownership and avoids it.)\n");
+	ret = 0;
+
+out:
+	free(recs_a);
+	free(recs_b);
+	if (fd_b >= 0)
+		close(fd_b);	/* close B first to deallocate the ids exactly once */
+	if (fd_a >= 0)
+		close(fd_a);
+	return ret;
+}
+
+/*
+ * query_dyn_uars <ibdev>:
+ *   Open a *dynamic-UAR* ucontext (lib_caps |= MLX5_LIB_CAP_DYN_UAR) and
+ *   issue MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS twice -- pass 1 (sizing)
+ *   for COUNT only, pass 2 (snapshot) for the records. On a freshly
+ *   opened ucontext that hasn't yet issued any UAR_OBJ_ALLOC verbs,
+ *   COUNT is expected to be 0; this subcommand is the reachability
+ *   probe for the new verb. roundtrip_dyn_uars actually populates
+ *   dyn UARs and exercises the full save/restore round-trip.
+ */
+static int do_query_dyn_uars(const char *ibdev)
+{
+	struct resp_blob alloc_resp = {};
+	struct mlx5_ib_vfmig_dyn_uar_record *records = NULL;
+	uint32_t count = 0;
+	int fd, rc, ret = 1;
+
+	fd = open_uverbs_for_ibdev(ibdev);
+	if (fd < 0)
+		return 1;
+
+	rc = send_get_context(fd, 0,
+			      MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
+			      &alloc_resp);
+	if (rc < 0) {
+		fprintf(stderr,
+			"GET_CONTEXT (dyn-UAR) failed: %s\n", strerror(-rc));
+		goto out;
+	}
+
+	rc = issue_vfmig_query_dyn_uars(fd, NULL, 0, &count);
+	if (rc < 0) {
+		fprintf(stderr,
+			"QUERY_DYN_UARS (sizing) failed: %s\n",
+			strerror(-rc));
+		goto out;
+	}
+	printf("query_dyn_uars %s: pass 1 count=%u\n", ibdev, count);
+
+	if (count) {
+		records = calloc(count, sizeof(*records));
+		if (!records) {
+			fprintf(stderr, "calloc failed\n");
+			goto out;
+		}
+		rc = issue_vfmig_query_dyn_uars(fd, records, count, &count);
+		if (rc < 0) {
+			fprintf(stderr,
+				"QUERY_DYN_UARS (snapshot) failed: %s\n",
+				strerror(-rc));
+			goto out;
+		}
+		printf("pass 2: %u dyn UAR record(s):\n", count);
+		for (uint32_t i = 0; i < count; i++) {
+			printf("  [%4u] handle=%u uar_index=%u "
+			       "mmap_offset=0x%llx alloc_type=%u\n",
+			       i, records[i].handle, records[i].uar_index,
+			       (unsigned long long)records[i].mmap_offset,
+			       records[i].alloc_type);
+		}
+	} else {
+		printf("(no dyn UARs allocated on this ucontext yet -- "
+		       "expected on a fresh open without UAR_OBJ_ALLOC)\n");
+	}
+
+	printf("query_dyn_uars %s: PASS\n", ibdev);
+	ret = 0;
+out:
+	free(records);
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+/*
  * Negative: an unsupported flag bit (1 << 31) must be rejected with
  * EOPNOTSUPP. Sanity check on the
  * "req.flags & ~(DEVX | VFMIG_RESTORE)" reject mask -- specifically
@@ -1320,9 +1896,11 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"usage: %s <verb> [args]\n"
 		"  alloc_uctx_with_flag <ibdev>            (positive: alloc with VFMIG_RESTORE)\n"
-		"  alloc_uctx_neg_dyn_uar <ibdev>          (negative: VFMIG_RESTORE | DYN_UAR -> EOPNOTSUPP)\n"
+		"  alloc_uctx_dyn_uar <ibdev>              (positive: VFMIG_RESTORE | DYN_UAR accepted)\n"
 		"  alloc_uctx_neg_bad_flag <ibdev>         (negative: bogus flag bit -> EOPNOTSUPP)\n"
 		"  query_uctx_uar_table <ibdev>            (open normal ucontext, QUERY two-pass)\n"
+		"  query_dyn_uars <ibdev>                  (open dyn-UAR ucontext, QUERY_DYN_UARS two-pass)\n"
+		"  roundtrip_dyn_uars <ibdev>              (positive: alloc N dyn UARs on A -> snapshot -> restore on B -> mmap)\n"
 		"  roundtrip_uctx <ibdev>                  (positive: A normal -> QUERY -> B w/flag -> RESTORE -> QUERY match)\n"
 		"  roundtrip_uctx_neg_no_flag <ibdev>      (negative: RESTORE on non-VFMIG ucontext -> EINVAL)\n"
 		"  roundtrip_uctx_neg_meta_mismatch <ibdev>(negative: META total_num_bfregs tampered -> EINVAL)\n"
@@ -1344,12 +1922,16 @@ int main(int argc, char **argv)
 
 	if (argc == 3 && verb_eq(argv[1], "alloc_uctx_with_flag"))
 		return do_alloc_uctx_with_flag(argv[2]);
-	if (argc == 3 && verb_eq(argv[1], "alloc_uctx_neg_dyn_uar"))
-		return do_alloc_uctx_neg_dyn_uar(argv[2]);
+	if (argc == 3 && verb_eq(argv[1], "alloc_uctx_dyn_uar"))
+		return do_alloc_uctx_dyn_uar(argv[2]);
 	if (argc == 3 && verb_eq(argv[1], "alloc_uctx_neg_bad_flag"))
 		return do_alloc_uctx_neg_bad_flag(argv[2]);
 	if (argc == 3 && verb_eq(argv[1], "query_uctx_uar_table"))
 		return do_query_uctx_uar_table(argv[2]);
+	if (argc == 3 && verb_eq(argv[1], "query_dyn_uars"))
+		return do_query_dyn_uars(argv[2]);
+	if (argc == 3 && verb_eq(argv[1], "roundtrip_dyn_uars"))
+		return do_roundtrip_dyn_uars(argv[2]);
 	if (argc == 3 && verb_eq(argv[1], "roundtrip_uctx"))
 		return do_roundtrip_uctx(argv[2]);
 	if (argc == 3 && verb_eq(argv[1], "roundtrip_uctx_neg_no_flag"))
