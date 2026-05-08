@@ -2552,13 +2552,41 @@ static int mlx5_ib_mmap_offset(struct mlx5_ib_dev *dev,
 	return ret;
 }
 
-static u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
+u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
 {
 	u64 cmd = (entry->rdma_entry.start_pgoff >> 16) & 0xFFFF;
 	u64 index = entry->rdma_entry.start_pgoff & 0xFFFF;
 
 	return (((index >> 8) << 16) | (cmd << MLX5_IB_MMAP_CMD_SHIFT) |
 		(index & 0xFF)) << PAGE_SHIFT;
+}
+
+/*
+ * Inverse of mlx5_entry_to_mmap_offset(): recover the rdma_user_mmap_entry
+ * start_pgoff from the libmlx5-wire-format mmap_offset returned by
+ * UAR_OBJ_ALLOC / VAR_OBJ_ALLOC. Used by the VFMIG dyn-UAR restore path
+ * (drivers/.../vfmig_uctx.c) to feed rdma_user_mmap_entry_insert_exact
+ * with a pgoff that matches the source ucontext's so libmlx5's captured
+ * mmap_offset is valid against the destination ucontext.
+ *
+ * Returns U32_MAX on out-of-range input. Caller must check.
+ */
+u32 mlx5_mmap_offset_to_pgoff(u64 mmap_offset)
+{
+	u64 inner = mmap_offset >> PAGE_SHIFT;
+	u32 cmd, index_hi, index_lo, index;
+
+	if (inner > U32_MAX)
+		return U32_MAX;
+
+	cmd      = (inner >> MLX5_IB_MMAP_CMD_SHIFT) & MLX5_IB_MMAP_CMD_MASK;
+	index_hi = (inner >> 16) & 0xFFFF;
+	index_lo =  inner        & 0xFF;
+	index    = (index_hi << 8) | index_lo;
+
+	if (cmd > 0xFFFF)
+		return U32_MAX;
+	return (cmd << 16) | index;
 }
 
 static int mlx5_ib_mmap(struct ib_ucontext *ibcontext, struct vm_area_struct *vma)

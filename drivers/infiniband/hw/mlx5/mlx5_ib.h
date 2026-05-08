@@ -1603,6 +1603,16 @@ restore_uar_entry(struct mlx5_ib_ucontext *c,
 		  enum mlx5_ib_uapi_uar_alloc_type alloc_type,
 		  u32 uar_index, u32 mmap_pgoff);
 
+/*
+ * mlx5-specific mmap_offset codec. mlx5_entry_to_mmap_offset() packs an
+ * rdma_user_mmap_entry's start_pgoff into the byte-offset format that
+ * libmlx5 hands to mmap(); mlx5_mmap_offset_to_pgoff() is its inverse,
+ * used by VFMIG dyn-UAR restore. Defined in main.c next to the rest of
+ * the mmap helpers; declared here so vfmig_uctx.c can reuse them.
+ */
+u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry);
+u32 mlx5_mmap_offset_to_pgoff(u64 mmap_offset);
+
 static inline int is_qp1(enum ib_qp_type qp_type)
 {
 	return qp_type == MLX5_IB_QPT_HW_GSI || qp_type == IB_QPT_GSI;

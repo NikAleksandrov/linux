@@ -423,8 +423,17 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS)(
 
 		records[count].handle = uobj->id;
 		records[count].uar_index = entry->page_idx;
+		/*
+		 * Use the libmlx5-wire-format mmap_offset (the same byte
+		 * offset UAR_OBJ_ALLOC reports back to userspace), not the
+		 * raw start_pgoff << PAGE_SHIFT. This makes captured
+		 * mmap_offset values round-trip byte-for-byte against the
+		 * alloc path AND directly usable with mmap() on the
+		 * destination after restore. mlx5_entry_to_mmap_offset()
+		 * applies the cmd/index repacking that libmlx5 expects.
+		 */
 		records[count].mmap_offset =
-			(u64)entry->rdma_entry.start_pgoff << PAGE_SHIFT;
+			mlx5_entry_to_mmap_offset(entry);
 		switch (entry->mmap_flag) {
 		case MLX5_IB_MMAP_TYPE_UAR_WC:
 			records[count].alloc_type =
@@ -531,9 +540,18 @@ static int vfmig_restore_one_dyn_uar(struct uverbs_attr_bundle *attrs,
 			    (unsigned long long)rec->mmap_offset, rec->handle);
 		return -EINVAL;
 	}
-	if ((rec->mmap_offset >> PAGE_SHIFT) > U32_MAX)
+	/*
+	 * QUERY_DYN_UARS emits the libmlx5-wire-format mmap_offset (what
+	 * userspace mmap()s); rdma_user_mmap_entry_insert_exact() needs
+	 * the rdma_user_mmap_entry start_pgoff. Run the inverse codec.
+	 */
+	mmap_pgoff = mlx5_mmap_offset_to_pgoff(rec->mmap_offset);
+	if (mmap_pgoff == U32_MAX) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: out-of-range mmap_offset=0x%llx for handle=%u\n",
+			    (unsigned long long)rec->mmap_offset, rec->handle);
 		return -EINVAL;
-	mmap_pgoff = (u32)(rec->mmap_offset >> PAGE_SHIFT);
+	}
 
 	uobj = rdma_alloc_begin_uobject_at_handle(attrs,
 						  MLX5_IB_OBJECT_UAR,
