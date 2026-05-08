@@ -41,14 +41,20 @@ config MLX5_VFMIG
 config MLX5_VFMIG_IOVA_PER_VF_GIB
 	int "MLX5 vfmig: per-VF deterministic IOVA window size, in GiB"
 	depends on MLX5_VFMIG
-	range 1 65536
+	range 4 65536
 	default 128
 	help
 	  Size, in GiB, of the deterministic IOVA window allocated to each
-	  tracked VF. The window starts at a high, fixed base and is
-	  partitioned into 8 equal sub-windows for slot-tagged allocations
-	  (cmd ring, FW pages, EQ buffers, frag bufs, doorbell pages, etc.)
-	  with a small transient arena reserved at the top.
+	  tracked VF. The window's first 7 * 510 MiB partition kernel
+	  call sites into seven fixed-size slots (cmd ring, FW pages, DMA
+	  coherent, EQ buffers, frag bufs, doorbell pages); the remainder
+	  (minus 16 MiB at the top reserved for the transient arena)
+	  becomes the user-MR slot, so increasing this value grows the
+	  user-side ib_umem_get / dma_map_sgtable budget without
+	  perturbing any kernel-slot IOVA. The minimum of 4 GiB is the
+	  smallest value that still leaves a non-empty user-MR slot
+	  after kernel slots and transient arena are accounted for; below
+	  that, vfmig_iova.h's static_assert fires at build time.
 
 	  This caps the total IOVA budget for kernel-side mlx5_core DMA
 	  allocations on a tracked VF. Once the user-space ib_umem_get path

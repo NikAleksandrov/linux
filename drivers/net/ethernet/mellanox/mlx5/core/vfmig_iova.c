@@ -11,6 +11,7 @@
  * gives us.
  */
 
+#include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/gfp.h>
 #include <linux/iommu.h>
@@ -22,6 +23,7 @@
 #include <linux/string.h>
 
 #include "mlx5_core.h"
+#include "vfmig_dma_ops.h"
 #include "vfmig_iova.h"
 
 /*
@@ -52,6 +54,41 @@ struct vfmig_iova_page {
 	void		*vaddr;
 	enum vfmig_iova_slot slot;
 	u64		 instance_key;
+
+	/*
+	 * @external: the backing page is owned by the caller, not by
+	 * the registry. Set on entries created by the
+	 * vfmig_iova_user_page_map_phys() path (umem-pinned MR / CQ /
+	 * QP / SRQ buffers + doorbell records flowing through
+	 * vfmig_dma_ops). For these entries the registry tracks the
+	 * (iova, len, phys) bookkeeping and owns the iommu_map slot,
+	 * but skips alloc_pages at install and __free_pages at
+	 * destroy.
+	 *
+	 * @page is NULL and @vaddr is meaningless on external entries.
+	 * @len + @iova are the live IOMMU mapping. @phys (recorded in
+	 * the IOMMU page tables only -- not stored separately on the
+	 * entry) is the umem-pinned physical address; we recover it
+	 * via iommu_iova_to_phys() if SAVE-time iteration ever needs
+	 * to read the umem contents back (stage 2 wire format will
+	 * reach for it that way rather than carrying phys in the
+	 * registry struct).
+	 *
+	 * @awaiting_bind: stage-2 LOAD-side flag. Set on entries
+	 * pre-installed by HOST_USER_PAGE replay before any
+	 * destination-side map_sg has run. The first map_sg call that
+	 * reaches the matching cursor position consumes the entry,
+	 * iommu_maps the freshly-pinned umem page at that IOVA, clears
+	 * @awaiting_bind, increments @awaiting_bind_hits, and proceeds
+	 * normally.
+	 *
+	 * Stage 1 wires both flags and the counter, but never sets
+	 * @awaiting_bind: there is no LOAD-side USER_PAGE replay yet.
+	 * Counter reads as zero, .map_sg always falls into the "fresh
+	 * IOVA + iommu_map + install external" branch.
+	 */
+	bool		 external;
+	bool		 awaiting_bind;
 };
 
 /*
@@ -191,6 +228,16 @@ struct vfmig_iova_domain {
 	bool		     drift_reported;
 	u32		     expected_count[VFMIG_IOVA_NR_SLOTS];
 	u32		     alloc_count[VFMIG_IOVA_NR_SLOTS];
+
+	/*
+	 * Stage-2-facing diagnostic: count of times .map_sg has bound a
+	 * freshly-pinned umem page to a pre-replayed (awaiting_bind=true)
+	 * registry entry. Stage 1 never increments this; .map_sg always
+	 * takes the "fresh IOVA + new external entry" branch because the
+	 * LOAD path doesn't yet pre-install USER_PAGE entries. Read with
+	 * vfmig_iova_awaiting_bind_hits().
+	 */
+	atomic_long_t	     awaiting_bind_hits;
 };
 
 static inline u64
@@ -200,19 +247,41 @@ vfmig_iova_slot_base(const struct vfmig_iova_domain *dom,
 	return dom->base + (u64)slot * VFMIG_IOVA_SLOT_BYTES;
 }
 
+/*
+ * The deterministic IOVA range has an asymmetric layout: kernel slots
+ * 0..6 are each VFMIG_IOVA_SLOT_BYTES (510 MiB) wide, and slot 7
+ * (VFMIG_SLOT_USER_PAGE) absorbs everything between
+ * slot_base(USER_PAGE) and the transient arena's base. That makes
+ * "slot end" trivial for kernel slots and a separate lookup for
+ * USER_PAGE: dom->transient.base is the inclusive upper bound.
+ *
+ * Note: vfmig_iova_domain_create() computes dom->transient.base
+ * directly (PER_VF - TRANSIENT_BYTES from base), not via this helper,
+ * so the function is safe to call any time after domain_create has
+ * returned.
+ */
 static inline u64
 vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
 		    enum vfmig_iova_slot slot)
 {
+	if (slot == VFMIG_SLOT_USER_PAGE)
+		return dom->transient.base;
 	return dom->base + (u64)(slot + 1) * VFMIG_IOVA_SLOT_BYTES;
 }
 
 /*
  * Inverse of vfmig_iova_slot_base(): which slot does @iova fall into,
  * or VFMIG_SLOT_INVALID if it's outside any deterministic slot
- * window. The deterministic range is exactly
- * [base, base + NR_SLOTS * SLOT_BYTES); anything above belongs to the
- * transient arena (or is out of range entirely).
+ * window.
+ *
+ * Asymmetric layout (see vfmig_iova_slot_end above):
+ *   - Anything below slot_base(USER_PAGE) maps by uniform division:
+ *     (iova - base) / SLOT_BYTES gives the slot index in 0..6.
+ *   - Anything in [slot_base(USER_PAGE), transient.base) is
+ *     USER_PAGE regardless of how many SLOT_BYTES units past
+ *     slot_base(USER_PAGE) it falls.
+ *   - Anything >= transient.base belongs to the transient arena (or
+ *     is out of range entirely) -- not a deterministic slot.
  */
 static enum vfmig_iova_slot
 vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
@@ -221,10 +290,12 @@ vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
 
 	if (iova < dom->base)
 		return VFMIG_SLOT_INVALID;
+	if (iova >= dom->transient.base)
+		return VFMIG_SLOT_INVALID;
 	off = iova - dom->base;
 	idx = off / VFMIG_IOVA_SLOT_BYTES;
-	if (idx >= VFMIG_IOVA_NR_SLOTS)
-		return VFMIG_SLOT_INVALID;
+	if (idx >= VFMIG_SLOT_USER_PAGE)
+		return VFMIG_SLOT_USER_PAGE;
 	return (enum vfmig_iova_slot)idx;
 }
 
@@ -344,16 +415,96 @@ err_free_p:
 }
 
 /*
+ * dom->lock held. Install one external (caller-owned-page) registry
+ * entry at @iova, mapping @phys for @len bytes. Used by the
+ * vfmig_dma_ops shim to plumb umem-pinned pages through the per-VF
+ * iommu_domain.
+ *
+ * Differs from vfmig_iova_install_page_locked in three ways:
+ *   - No alloc_pages / page_address: the caller supplies @phys
+ *     directly (typically derived from sg_phys(sg_entry)).
+ *   - The new entry is flagged @external = true so
+ *     destroy_page_locked skips __free_pages on tear-down.
+ *   - p->page = NULL, p->vaddr = NULL: the registry doesn't own a
+ *     kernel-virtual handle to the underlying page; SAVE-time read-
+ *     back goes through iommu_iova_to_phys + kmap_local_page on the
+ *     resolved struct page (stage 2 wire format will cover that).
+ *
+ * Same window/alignment validation as install_page_locked, same
+ * -EEXIST on duplicate IOVA, same -ERANGE on slot/IOVA mismatch.
+ */
+static int
+vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
+					enum vfmig_iova_slot slot,
+					u64 instance_key, u64 iova,
+					phys_addr_t phys, size_t len,
+					gfp_t gfp,
+					struct vfmig_iova_page **out_p)
+{
+	struct vfmig_iova_page *p;
+	int err;
+
+	if (!IS_ALIGNED(iova, VFMIG_IOVA_GRANULE) ||
+	    !IS_ALIGNED(len, VFMIG_IOVA_GRANULE) ||
+	    !IS_ALIGNED(phys, VFMIG_IOVA_GRANULE) ||
+	    len == 0)
+		return -EINVAL;
+	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR)
+		return -EINVAL;
+	if (iova < vfmig_iova_slot_base(dom, slot) ||
+	    iova + len > vfmig_iova_slot_end(dom, slot))
+		return -ERANGE;
+	if (vfmig_iova_find_locked(dom, iova))
+		return -EEXIST;
+
+	p = kzalloc(sizeof(*p), gfp);
+	if (!p)
+		return -ENOMEM;
+
+	p->page		= NULL;
+	p->vaddr	= NULL;
+	p->iova		= iova;
+	p->len		= len;
+	p->slot		= slot;
+	p->instance_key	= instance_key;
+	p->external	= true;
+	p->awaiting_bind = false;
+
+	err = iommu_map(dom->iommu_dom, iova, phys, len,
+			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp);
+	if (err) {
+		kfree(p);
+		return err;
+	}
+
+	vfmig_iova_insert_locked(dom, p);
+	*out_p = p;
+	return 0;
+}
+
+/*
  * dom->lock held. Tear down a single registry entry: iommu_unmap,
  * release backing pages, free the bookkeeping struct. List unlink is
  * caller's responsibility (so we can be called from list iteration).
+ *
+ * External entries (p->external == true) skip __free_pages because
+ * the backing page is owned by the umem / dma-buf caller, not by
+ * the registry. The IOMMU mapping is still ours to tear down.
+ *
+ * Awaiting-bind entries (p->awaiting_bind == true) also skip the
+ * iommu_unmap: stage-2 LOAD pre-installs them before any actual
+ * physical page exists for the IOVA, so iommu_unmap would walk
+ * empty page tables. (Stage 1 never sets awaiting_bind; the check
+ * is here so the path is consistent when stage 2 lands.)
  */
 static void
 vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
 			       struct vfmig_iova_page *p)
 {
-	(void)iommu_unmap(dom->iommu_dom, p->iova, p->len);
-	__free_pages(p->page, get_order(p->len));
+	if (!p->awaiting_bind)
+		(void)iommu_unmap(dom->iommu_dom, p->iova, p->len);
+	if (!p->external && p->page)
+		__free_pages(p->page, get_order(p->len));
 	kfree(p);
 }
 
@@ -401,15 +552,21 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	}
 
 	/*
-	 * Transient arena owns [det_end, det_end + TRANSIENT_BYTES),
-	 * where det_end is the upper bound of the deterministic range.
-	 * det_end equals base + NR_SLOTS * SLOT_BYTES by construction
-	 * (see SLOT_BYTES definition); using the slot helper keeps the
-	 * arithmetic in one place.
+	 * Transient arena owns the topmost VFMIG_IOVA_TRANSIENT_BYTES
+	 * of each VF's IOVA window, [PER_VF - TRANSIENT_BYTES, PER_VF).
+	 * Computed directly from the per-VF window because the
+	 * vfmig_iova_slot_end() helper for VFMIG_SLOT_USER_PAGE reads
+	 * dom->transient.base back, so we can't use it here without a
+	 * chicken-and-egg.
+	 *
+	 * Layout invariant (see VFMIG_IOVA_NR_SLOTS / SLOT_BYTES doc in
+	 * vfmig_iova.h): transient.base sits at exactly
+	 *   base + KERNEL_NR_SLOTS * SLOT_BYTES + USER_PAGE_size,
+	 * with USER_PAGE absorbing the remainder of the deterministic
+	 * range.
 	 */
-	dom->transient.base      = vfmig_iova_slot_end(dom,
-					(enum vfmig_iova_slot)
-					(VFMIG_IOVA_NR_SLOTS - 1));
+	dom->transient.base      = base + VFMIG_IOVA_PER_VF -
+				   VFMIG_IOVA_TRANSIENT_BYTES;
 	dom->transient.end       = base + VFMIG_IOVA_PER_VF;
 	dom->transient.cursor    = dom->transient.base;
 	dom->transient.max_pages = VFMIG_IOVA_TRANSIENT_MAX_PAGES;
@@ -465,6 +622,29 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	dom->vf_pdev = pci_dev_get(vf_pdev);
 
+	/*
+	 * Install the per-VF dma_map_ops shim that intercepts
+	 * dma_map_sgtable / dma_map_phys for user-side ib_umem_get
+	 * registrations. Done after iommu_attach_device so the
+	 * (custom dma_ops, custom iommu_domain) pair is atomic from
+	 * the DMA layer's point of view: while we're attached, every
+	 * DMA-API entry point routes through vfmig_iova; while we're
+	 * not, the default dma-iommu path owns the device.
+	 *
+	 * If this fails -- e.g. CONFIG_ARCH_HAS_DMA_OPS=n on this
+	 * arch -- the kernel-slot allocator alone doesn't degrade
+	 * gracefully (user-side umem mappings would silently bypass
+	 * us), so we tear the whole domain down rather than ship a
+	 * partially-functional one.
+	 */
+	err = vfmig_dma_ops_attach(vf_pdev, dom);
+	if (err) {
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: vfmig_dma_ops_attach failed: %d\n",
+			 err);
+		goto err_pci_put;
+	}
+
 	dev_info(&vf_pdev->dev,
 		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (deterministic, %u slots x 0x%llx) + [0x%llx, 0x%llx) (transient) within IOMMU aperture [0x%llx, 0x%llx]\n",
 		 vf_id, dom->base, dom->transient.base,
@@ -476,6 +656,9 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	*out = dom;
 	return 0;
 
+err_pci_put:
+	pci_dev_put(dom->vf_pdev);
+	dom->vf_pdev = NULL;
 err_detach:
 	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
 
@@ -541,6 +724,14 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 	mutex_unlock(&dom->lock);
 
 	if (vf_pdev) {
+		/*
+		 * Reverse of domain_create: undo dma_ops first so any
+		 * subsequent DMA path (none expected -- the VF is
+		 * unbound by caller contract -- but be safe) routes
+		 * through the default dma-iommu shim before we tear
+		 * down the iommu_domain it depends on.
+		 */
+		vfmig_dma_ops_detach(vf_pdev);
 		iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
 		dev_info(&vf_pdev->dev,
 			 "vfmig_iova: vf %u domain detached and freed\n",
@@ -569,6 +760,14 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	if (!dom || !iova_out || !vaddr_out || size == 0)
 		return -EINVAL;
 	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR)
+		return -EINVAL;
+	/*
+	 * USER_PAGE has its own dispatch path (vfmig_iova_user_page_map_phys)
+	 * that installs caller-owned external pages. Kernel callers must
+	 * not reach this slot through alloc_slot, which would alloc_pages
+	 * and clobber the cursor that the dma_ops shim is bumping.
+	 */
+	if (slot == VFMIG_SLOT_USER_PAGE)
 		return -EINVAL;
 
 	aligned = ALIGN(size, VFMIG_IOVA_GRANULE);
@@ -729,7 +928,8 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 
 	if (!dom)
 		return;
-	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR) {
+	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR ||
+	    slot == VFMIG_SLOT_USER_PAGE) {
 		dev_warn(&dom->vf_pdev->dev,
 			 "vfmig_iova: free_slot: bad slot %u for IOVA 0x%llx\n",
 			 slot, (u64)iova);
@@ -777,6 +977,21 @@ int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			 "vfmig_iova: vf %u replay: slot %u out of range\n",
 			 dom->vf_id, slot);
 		return -EINVAL;
+	}
+	if (slot == VFMIG_SLOT_USER_PAGE) {
+		/*
+		 * Stage 1 does not transport HOST_USER_PAGE records on
+		 * the wire. Stage 2 will replay them through a separate
+		 * vfmig_iova_replay_external_locked path that creates
+		 * @awaiting_bind entries (no contents copy, no
+		 * alloc_pages); routing them through this kernel-slot
+		 * replay would alloc_pages() at the wrong layer and
+		 * leak phys-vs-iova determinism.
+		 */
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u replay: USER_PAGE replay not supported in stage 1\n",
+			 dom->vf_id);
+		return -EOPNOTSUPP;
 	}
 
 	/*
@@ -869,6 +1084,19 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 
 	mutex_lock(&dom->lock);
 	list_for_each_entry(p, &dom->pages, node) {
+		/*
+		 * External entries (USER_PAGE, vfmig_dma_ops-backed)
+		 * are skipped in stage 1: their backing pages are
+		 * umem-pinned and have no kernel-virtual handle
+		 * (p->vaddr is NULL), so the SAVE-side callback that
+		 * memcpys from @vaddr would dereference NULL. The wire
+		 * format does not yet emit HOST_USER_PAGE records;
+		 * stage 2 will introduce that wire record and a
+		 * separate iterator (or add an @external argument
+		 * here) to surface external entries to the SAVE path.
+		 */
+		if (p->external)
+			continue;
 		ret = cb(p->slot, p->instance_key,
 			 p->iova, p->vaddr, p->len, ctx);
 		if (ret)
@@ -876,6 +1104,143 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 	}
 	mutex_unlock(&dom->lock);
 	return ret;
+}
+
+unsigned long vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom)
+{
+	if (!dom)
+		return 0;
+	return atomic_long_read(&dom->awaiting_bind_hits);
+}
+
+int vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
+				  phys_addr_t phys, size_t len, gfp_t gfp,
+				  dma_addr_t *iova_out)
+{
+	struct vfmig_iova_page *p;
+	size_t aligned;
+	u64 iova, slot_end;
+	int err;
+
+	if (!dom || !iova_out || len == 0)
+		return -EINVAL;
+	if (!IS_ALIGNED(phys, VFMIG_IOVA_GRANULE))
+		return -EINVAL;
+
+	aligned = ALIGN(len, VFMIG_IOVA_GRANULE);
+
+	mutex_lock(&dom->lock);
+
+	iova = dom->cursor[VFMIG_SLOT_USER_PAGE];
+	slot_end = vfmig_iova_slot_end(dom, VFMIG_SLOT_USER_PAGE);
+	if (iova + aligned > slot_end) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_PAGE slot exhausted at cursor 0x%llx (slot_end 0x%llx, asked %zu)\n",
+				     dom->vf_id, iova, slot_end, aligned);
+		err = -ENOSPC;
+		goto out_unlock;
+	}
+
+	/*
+	 * Stage 1: never a HIT here. Stage 2 will check for an
+	 * @awaiting_bind entry at @iova and bind the freshly-pinned
+	 * @phys to it (incrementing dom->awaiting_bind_hits) instead
+	 * of installing a new entry. Until that lands, every map_sg
+	 * segment goes through install_external below.
+	 */
+	p = vfmig_iova_find_locked(dom, iova);
+	if (p) {
+		/*
+		 * A HIT in stage 1 means somebody else (kernel-slot
+		 * caller, transient_get, prior leaked map_sg) sat on
+		 * an IOVA we believe to be the next free USER_PAGE
+		 * cursor position. That's a kernel bug and we'd rather
+		 * fail this mapping cleanly than silently overwrite
+		 * the existing entry.
+		 */
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u USER_PAGE: cursor 0x%llx already has a registry entry (slot %u key 0x%llx len %zu); refusing to overwrite\n",
+				    dom->vf_id, iova, p->slot,
+				    (unsigned long long)p->instance_key,
+				    p->len);
+		err = -EEXIST;
+		goto out_unlock;
+	}
+
+	/*
+	 * Auto-numbered key for stage 1 / stage 2. Stage 3 will
+	 * overwrite the recorded key with mkey-derived identity in a
+	 * separate retag step (vfmig_iova_tag_user_mr) so that
+	 * cross-host LOAD can match by mkey rather than by cursor
+	 * position.
+	 */
+	err = vfmig_iova_install_external_phys_locked(dom,
+			VFMIG_SLOT_USER_PAGE,
+			++dom->next_auto_key[VFMIG_SLOT_USER_PAGE],
+			iova, phys, aligned, gfp, &p);
+	if (err)
+		goto out_unlock;
+
+	dom->cursor[VFMIG_SLOT_USER_PAGE] = iova + aligned;
+	dom->alloc_count[VFMIG_SLOT_USER_PAGE]++;
+	*iova_out = iova;
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+int vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
+				    dma_addr_t iova, size_t len)
+{
+	struct vfmig_iova_page *p;
+	size_t aligned;
+	int err;
+
+	if (!dom)
+		return -EINVAL;
+
+	aligned = ALIGN(len, VFMIG_IOVA_GRANULE);
+
+	mutex_lock(&dom->lock);
+
+	p = vfmig_iova_find_locked(dom, (u64)iova);
+	if (!p) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_PAGE unmap: no registry entry at IOVA 0x%llx (asked %zu)\n",
+				     dom->vf_id, (u64)iova, aligned);
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	if (p->slot != VFMIG_SLOT_USER_PAGE) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_PAGE unmap: IOVA 0x%llx belongs to slot %u (expected USER_PAGE)\n",
+				     dom->vf_id, (u64)iova, p->slot);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	if (!p->external) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_PAGE unmap: IOVA 0x%llx is not an external entry\n",
+				     dom->vf_id, (u64)iova);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	if (p->len != aligned) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_PAGE unmap size mismatch at IOVA 0x%llx: have %zu, asked %zu\n",
+				     dom->vf_id, (u64)iova, p->len, aligned);
+		/* still proceed: the entry is what it is */
+	}
+	list_del(&p->node);
+	dom->n_pages--;
+	vfmig_iova_destroy_page_locked(dom, p);
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
 }
 
 /* -------- transient arena ----------------------------------------------- */

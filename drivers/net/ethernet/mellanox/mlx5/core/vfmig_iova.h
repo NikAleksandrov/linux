@@ -170,6 +170,23 @@ struct vfmig_iova_domain;
  *                              and external) funnel here -- the
  *                              page is the same kind of resource
  *                              regardless of who asked.
+ *   VFMIG_SLOT_USER_PAGE    -- user-space-pinned MR / CQ / QP / SRQ
+ *                              buffers + doorbell records.
+ *                              ib_umem_get -> dma_map_sgtable lands
+ *                              here via vfmig_dma_ops's .map_sg. The
+ *                              backing pages are owned by the umem
+ *                              (already pinned via gup), so the
+ *                              registry entries created in this slot
+ *                              carry the @external flag and skip
+ *                              alloc_pages / __free_pages on
+ *                              install / destroy. Unlike kernel
+ *                              slots this slot is "expand-to-fill":
+ *                              it occupies the entire IOVA range
+ *                              between slot DB_PAGE's end and the
+ *                              transient arena's base, so increasing
+ *                              CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB
+ *                              grows the user-MR budget without
+ *                              perturbing any kernel slot's IOVAs.
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
@@ -179,6 +196,7 @@ enum vfmig_iova_slot {
 	VFMIG_SLOT_EQ_BUF	= 4,
 	VFMIG_SLOT_FRAG_BUF	= 5,
 	VFMIG_SLOT_DB_PAGE	= 6,
+	VFMIG_SLOT_USER_PAGE	= 7,
 	VFMIG_SLOT_NR,	/* count, must stay <= VFMIG_IOVA_NR_SLOTS */
 };
 
@@ -275,35 +293,59 @@ enum vfmig_iova_slot {
 /*
  * Per-VF slot fan-out for the deterministic allocator.
  *
- * The per-VF deterministic range (VFMIG_IOVA_PER_VF -
- * VFMIG_IOVA_TRANSIENT_BYTES bytes, == 4080 MiB) is split into
- * VFMIG_IOVA_NR_SLOTS equal sub-windows of VFMIG_IOVA_SLOT_BYTES
- * (== 510 MiB) each. Slot N occupies
- *   [base + N * SLOT_BYTES, base + (N+1) * SLOT_BYTES).
- * Slot 0 is reserved for VFMIG_SLOT_INVALID -- its IOVA range is
- * never allocated from. Real allocations come from slots 1..NR-1.
+ * Asymmetric layout (introduced when VFMIG_SLOT_USER_PAGE was added):
  *
- * Sized for headroom rather than measured worst case: 510 MiB / slot
- * is wildly more than any current call site needs (FW_PAGE peaks at
- * ~32 MiB on a fully-used VF). The headroom is cheap because slot
- * sub-windows consume IOVA space, not physical memory; a slot with
- * one allocation costs one mapped page just like before.
+ *   - Slots 0..6 (VFMIG_IOVA_KERNEL_NR_SLOTS == NR_SLOTS - 1) are
+ *     fixed-size kernel slots, each VFMIG_IOVA_SLOT_BYTES (510 MiB)
+ *     wide. Slot N occupies
+ *       [base + N * SLOT_BYTES, base + (N+1) * SLOT_BYTES).
+ *     Slot 0 is reserved for VFMIG_SLOT_INVALID and is never
+ *     allocated from; real kernel allocations live in slots 1..6.
  *
- * The 8-slot fan-out is a deliberate over-provision: it lets us add
- * up to 4 more named slots in future revisions without renumbering
- * existing slots. Renumbering would change the IOVA bases of
- * already-deployed slots -- breaking SAVE/LOAD compatibility. New
- * slots get appended at the next free index; existing slots' bases
- * stay put.
+ *   - Slot 7 (VFMIG_SLOT_USER_PAGE) is "expand-to-fill". It
+ *     occupies everything between
+ *       [base + 7 * SLOT_BYTES, transient.base),
+ *     which is exactly
+ *       VFMIG_IOVA_PER_VF
+ *         - VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES
+ *         - VFMIG_IOVA_TRANSIENT_BYTES
+ *     bytes wide. At PER_VF=4 GiB this collapses to exactly
+ *     SLOT_BYTES (510 MiB), matching what slot 7 used to be when
+ *     all eight slots were fixed-size; at higher PER_VF values
+ *     USER_PAGE absorbs the entire excess. Concretely:
+ *
+ *       PER_VF (GiB)   USER_PAGE budget
+ *       4              ~510 MiB
+ *       16             ~12.5 GiB
+ *       128 (default)  ~124.5 GiB
+ *
+ * Why kernel slots are pinned at 510 MiB rather than scaling with
+ * PER_VF: the kernel call-site footprint (cmd ring, FW pages, EQs,
+ * WQs, doorbells) is bounded by hardware capabilities, not by how
+ * much IOVA the admin has handed us, so its budget shouldn't grow
+ * elastically. Pinning the kernel slot size also makes a SAVE blob
+ * captured on a PER_VF=N kernel still replayable on a PER_VF=M >= N
+ * kernel for the kernel-slot wire records: kernel-slot IOVAs are
+ * PER_VF-independent, only USER_PAGE records have a PER_VF-dependent
+ * upper bound (and only when the destination's PER_VF is smaller
+ * than the source's).
+ *
+ * The 8-slot fan-out is fixed: USER_PAGE pinned at index 7 means
+ * any future kernel-slot additions must reuse one of slots 1..6 or
+ * find a different way to grow (e.g. wide vs. narrow slot encoding)
+ * because renumbering existing slots would change every deployed
+ * kernel-slot IOVA -- a wire-incompatible change.
  */
 #define VFMIG_IOVA_NR_SLOTS		8U
-#define VFMIG_IOVA_SLOT_BYTES \
-	((VFMIG_IOVA_PER_VF - VFMIG_IOVA_TRANSIENT_BYTES) / VFMIG_IOVA_NR_SLOTS)
+#define VFMIG_IOVA_KERNEL_NR_SLOTS	(VFMIG_IOVA_NR_SLOTS - 1U)
+#define VFMIG_IOVA_SLOT_BYTES		(510ULL << 20)	/* 510 MiB, fixed */
 
-static_assert(VFMIG_IOVA_PER_VF > VFMIG_IOVA_TRANSIENT_BYTES,
-	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: per-VF window must exceed the transient arena (16 MiB)");
+static_assert(VFMIG_IOVA_PER_VF >
+	      (u64)VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES +
+	      VFMIG_IOVA_TRANSIENT_BYTES,
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must be >= 4 to fit 7 fixed 510-MiB kernel slots + 16 MiB transient + at least one user-MR IOVA");
 static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
-	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: each of the 8 deterministic slots must be >= 8 MiB to host worst-case kernel allocations");
+	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
 
 /*
  * (Slot identity is enum vfmig_iova_slot, defined outside the
@@ -451,6 +493,73 @@ int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			    enum vfmig_iova_slot slot, u64 instance_key,
 			    dma_addr_t iova, const void *contents,
 			    size_t len);
+
+/*
+ * dma_ops dispatch helpers for VFMIG_SLOT_USER_PAGE entries.
+ *
+ * vfmig_dma_ops.c (the per-VF dma_map_ops shim that intercepts
+ * dma_map_sgtable on tracked VFs) calls these to install / tear down
+ * one IOMMU mapping per scatter-gather segment. The IOVA window for
+ * these mappings is the USER_PAGE slot's expand-to-fill sub-window.
+ *
+ * The "external" qualifier in the registry distinguishes these
+ * entries from kernel-slot entries: the backing pages are owned by
+ * the caller (umem.c keeps them pinned via gup), so the registry
+ * does NOT alloc_pages() at install time and does NOT __free_pages()
+ * at destroy time. iommu_map / iommu_unmap are still called; the
+ * registry keeps the (iova, len, phys) bookkeeping for unmap and
+ * for SAVE-time iteration via vfmig_iova_for_each().
+ *
+ * vfmig_iova_user_page_map_phys:
+ *   - Bumps the USER_PAGE slot cursor by ALIGN(@len, GRANULE).
+ *     Returns -ENOSPC if the slot's expand-to-fill window would
+ *     overflow.
+ *   - iommu_maps @phys at the freshly-allocated IOVA for @len
+ *     bytes, READ | WRITE | CACHE.
+ *   - Inserts a registry entry with @external = true.
+ *   - On success, *@iova_out is the allocated IOVA.
+ *
+ *   @phys must be PAGE_SIZE-aligned, @len a non-zero multiple of
+ *   PAGE_SIZE. @gfp must not include __GFP_HIGHMEM/COMP/DMA/DMA32
+ *   (same constraint as vfmig_iova_alloc_slot; the underlying
+ *   iommu_map enforces it).
+ *
+ * vfmig_iova_user_page_unmap_phys:
+ *   - Looks up the registry entry at exactly @iova, asserting the
+ *     recorded length matches @len.
+ *   - iommu_unmaps and removes the entry.
+ *   - Stage 1 does NOT recycle the IOVA range: the per-slot bump
+ *     cursor stays put. Stage 2 introduces a per-slot free bitmap
+ *     for USER_PAGE so .map_sg can pull from freed ranges before
+ *     bumping the cursor; the wire format already encodes the free
+ *     bitmap as part of HOST_USER_PAGE delta records on the source
+ *     so the destination's USER_PAGE cursor matches.
+ *   - Safe with @iova not in the registry: warns and returns
+ *     -ENOENT (caller bug; we don't WARN_ON_ONCE because the warn
+ *     itself contains the offending iova/len for triage).
+ */
+int  vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
+				   phys_addr_t phys, size_t len, gfp_t gfp,
+				   dma_addr_t *iova_out);
+int  vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
+				     dma_addr_t iova, size_t len);
+
+/*
+ * Read the awaiting-bind hit counter for @dom.
+ *
+ * Stage 1 always returns 0 -- there is no LOAD-side replay path
+ * for USER_PAGE entries yet, so no entry ever has @awaiting_bind
+ * set, so .map_sg never takes the "bind a freshly-pinned page to
+ * a pre-replayed registry entry" branch. The counter is wired in
+ * stage 1 so the test plumbing (debugfs export, pingpong-side
+ * read) is in place; stage 2's order-discipline replay will
+ * populate awaiting-bind entries on LOAD and increment this
+ * counter on each hit.
+ *
+ * Read with READ_ONCE; writers use atomic_long_inc. Safe at any
+ * time, no locking needed.
+ */
+unsigned long vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom);
 
 /*
  * Acquire one DMA-coherent region from the per-VF domain's pre-mapped
@@ -621,6 +730,20 @@ static inline int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 {
 	return -EOPNOTSUPP;
 }
+static inline int vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
+						phys_addr_t phys, size_t len,
+						gfp_t gfp,
+						dma_addr_t *iova_out)
+{
+	return -EOPNOTSUPP;
+}
+static inline int vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
+						  dma_addr_t iova, size_t len)
+{
+	return -EOPNOTSUPP;
+}
+static inline unsigned long
+vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom) { return 0; }
 static inline void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom) { }
 static inline void
 vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom) { }
