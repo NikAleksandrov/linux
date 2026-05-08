@@ -181,12 +181,25 @@ struct vfmig_iova_domain;
  *                              alloc_pages / __free_pages on
  *                              install / destroy. Unlike kernel
  *                              slots this slot is "expand-to-fill":
- *                              it occupies the entire IOVA range
- *                              between slot DB_PAGE's end and the
- *                              transient arena's base, so increasing
+ *                              it occupies the IOVA range between
+ *                              the kcoherent sub-arena's end (see
+ *                              VFMIG_IOVA_KCOHERENT_BYTES below)
+ *                              and the transient arena's base, so
+ *                              increasing
  *                              CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB
  *                              grows the user-MR budget without
  *                              perturbing any kernel slot's IOVAs.
+ *
+ * Sub-arenas (not exposed via enum vfmig_iova_slot):
+ *   - kcoherent arena (see VFMIG_IOVA_KCOHERENT_BYTES below): a
+ *     non-migrated, IOVA-not-stable region carved from the bottom
+ *     of slot 7's window. Backs the dma_map_ops .alloc/.free path
+ *     for kernel coherent allocations made by drivers like mlx5e
+ *     on tracked VFs. Allocations here are NEVER recorded in the
+ *     SAVE manifest (vfmig_iova_for_each does not see them).
+ *   - transient arena (VFMIG_IOVA_TRANSIENT_BYTES, topmost slice
+ *     of the per-VF window): cmd-mailbox-style short-lived,
+ *     freelist-recycled, single-page allocations.
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
@@ -291,6 +304,43 @@ enum vfmig_iova_slot {
 #define VFMIG_IOVA_TRANSIENT_BYTES	(16ULL << 20)	/* 16 MiB */
 
 /*
+ * KCOHERENT sub-arena: carved from the BOTTOM of slot 7's
+ * (VFMIG_SLOT_USER_PAGE) window. Backs vfmig_dma_ops's .alloc/.free
+ * callbacks for kernel-side coherent allocations on tracked VFs --
+ * the canonical caller is mlx5e bringing up its RX/TX rings, drop_rq,
+ * and CQ/EQ buffers when the VF is tracked but the netdev still
+ * needs to come up far enough for IP configuration and RoCE GID
+ * population. ("Functional-enough" netdev: probe + ndo_open succeed,
+ * notifier chains fire, packets are DMA'd in/out by the device, but
+ * the actual RX/TX traffic is irrelevant for our use case because
+ * RDMA goes through mlx5_ib's separate path.)
+ *
+ * Properties (vs. the deterministic kernel slots):
+ *   - Allocations are NOT recorded in the SAVE manifest
+ *     (vfmig_iova_for_each does not iterate this arena).
+ *   - IOVAs are NOT stable across migration; the destination
+ *     re-probes mlx5e fresh and gets whatever IOVAs it gets.
+ *   - No drift detection, no replay: SAVE/LOAD are entirely
+ *     bypassed.
+ *   - Shape: bump cursor with no IOVA reuse on free; allocations
+ *     are driver-lifetime so churn is negligible.
+ *
+ * Layout: the arena occupies
+ *   [slot_base(USER_PAGE), slot_base(USER_PAGE) + KCOHERENT_BYTES);
+ * USER_PAGE's effective base is shifted up by KCOHERENT_BYTES so
+ * the user-MR sub-window starts at the arena's end.
+ *
+ * Wire compatibility: introducing this carve shifts USER_PAGE's
+ * base up by KCOHERENT_BYTES, which is a wire-incompatible change
+ * for USER_PAGE entries in any pre-existing SAVE blob -- those
+ * entries will fail replay with -ERANGE on a kernel that has the
+ * carve. We accept this break: USER_PAGE replay is itself stage-2
+ * (not yet wired), so no in-the-wild SAVE blob carries USER_PAGE
+ * entries today.
+ */
+#define VFMIG_IOVA_KCOHERENT_BYTES	(256ULL << 20)	/* 256 MiB */
+
+/*
  * Per-VF slot fan-out for the deterministic allocator.
  *
  * Asymmetric layout (introduced when VFMIG_SLOT_USER_PAGE was added):
@@ -302,22 +352,23 @@ enum vfmig_iova_slot {
  *     Slot 0 is reserved for VFMIG_SLOT_INVALID and is never
  *     allocated from; real kernel allocations live in slots 1..6.
  *
- *   - Slot 7 (VFMIG_SLOT_USER_PAGE) is "expand-to-fill". It
- *     occupies everything between
- *       [base + 7 * SLOT_BYTES, transient.base),
+ *   - Slot 7 (VFMIG_SLOT_USER_PAGE) is "expand-to-fill", with
+ *     the bottom VFMIG_IOVA_KCOHERENT_BYTES of its window
+ *     reserved for the non-migrated kcoherent sub-arena. The
+ *     user-MR sub-window therefore occupies
+ *       [base + 7 * SLOT_BYTES + KCOHERENT_BYTES, transient.base),
  *     which is exactly
  *       VFMIG_IOVA_PER_VF
  *         - VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES
+ *         - VFMIG_IOVA_KCOHERENT_BYTES
  *         - VFMIG_IOVA_TRANSIENT_BYTES
- *     bytes wide. At PER_VF=4 GiB this collapses to exactly
- *     SLOT_BYTES (510 MiB), matching what slot 7 used to be when
- *     all eight slots were fixed-size; at higher PER_VF values
- *     USER_PAGE absorbs the entire excess. Concretely:
+ *     bytes wide. At higher PER_VF values USER_PAGE absorbs the
+ *     entire excess. Concretely (KCOHERENT = 256 MiB):
  *
  *       PER_VF (GiB)   USER_PAGE budget
- *       4              ~510 MiB
- *       16             ~12.5 GiB
- *       128 (default)  ~124.5 GiB
+ *       4              ~254 MiB
+ *       16             ~12.25 GiB
+ *       128 (default)  ~124.25 GiB
  *
  * Why kernel slots are pinned at 510 MiB rather than scaling with
  * PER_VF: the kernel call-site footprint (cmd ring, FW pages, EQs,
@@ -342,10 +393,13 @@ enum vfmig_iova_slot {
 
 static_assert(VFMIG_IOVA_PER_VF >
 	      (u64)VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES +
+	      VFMIG_IOVA_KCOHERENT_BYTES +
 	      VFMIG_IOVA_TRANSIENT_BYTES,
-	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must be >= 4 to fit 7 fixed 510-MiB kernel slots + 16 MiB transient + at least one user-MR IOVA");
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit 7 fixed 510-MiB kernel slots + 256 MiB kcoherent + 16 MiB transient + at least one user-MR IOVA");
 static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
+static_assert(VFMIG_IOVA_KCOHERENT_BYTES <= VFMIG_IOVA_SLOT_BYTES,
+	      "VFMIG_IOVA_KCOHERENT_BYTES must not exceed slot 7's nominal window");
 
 /*
  * (Slot identity is enum vfmig_iova_slot, defined outside the
@@ -545,6 +599,64 @@ int  vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
 				     dma_addr_t iova, size_t len);
 
 /*
+ * Allocate a CPU+IOVA-coherent region from the per-VF domain's
+ * non-migrated kcoherent sub-arena. Backs vfmig_dma_ops's .alloc
+ * callback for kernel coherent allocations on tracked VFs (mlx5e
+ * RX/TX rings, drop_rq, CQ/EQ buffers, page-pool coherent sources).
+ *
+ * Properties:
+ *   - Allocations are NOT recorded in the SAVE manifest; SAVE-time
+ *     iteration via vfmig_iova_for_each() does not see them.
+ *   - IOVAs are NOT stable across migration. The destination
+ *     re-probes its drivers fresh and gets whatever IOVAs are
+ *     handed out.
+ *   - Bump cursor with no IOVA reuse on free; suitable for the
+ *     long-lived, low-churn allocations these drivers make.
+ *
+ * @size is rounded up to PAGE_SIZE. The backing memory is a
+ * physically-contiguous run of pages obtained via alloc_pages_exact;
+ * sizes larger than what the page allocator can satisfy as a
+ * contiguous block fail with -ENOMEM.
+ *
+ * @gfp may include __GFP_COMP / __GFP_HIGHMEM / __GFP_DMA{,32};
+ * the implementation strips flags incompatible with iommu_map and
+ * with our requirement that page_address() be valid on the backing
+ * memory (the dma-coherent contract requires a kernel-virtual
+ * mapping). __GFP_ZERO is implied: the returned region is zeroed,
+ * matching dma_alloc_coherent semantics.
+ *
+ * On success, *@iova_out is the allocated IOVA (also the dma_addr_t
+ * the caller hands back from .alloc), and *@vaddr_out is the
+ * kernel-virtual address. Both are page-aligned.
+ *
+ * Errors:
+ *   -EINVAL  bad arguments (NULL @dom, zero @size, bad @iova_out)
+ *   -ENOSPC  kcoherent arena exhausted (cursor would advance past
+ *            VFMIG_IOVA_KCOHERENT_BYTES)
+ *   -ENOMEM  alloc_pages_exact failure or kmalloc of bookkeeping
+ *   <0       iommu_map failure
+ */
+int  vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
+				size_t size, gfp_t gfp,
+				dma_addr_t *iova_out, void **vaddr_out);
+
+/*
+ * Release a region previously obtained from
+ * vfmig_iova_kcoherent_alloc(). @vaddr and @size MUST match the
+ * values returned by / passed to _alloc(). @iova MUST equal what
+ * _alloc() wrote to *iova_out.
+ *
+ * Behaviour: iommu_unmaps the region, frees the backing pages,
+ * removes the bookkeeping entry. Does NOT reclaim IOVA range to
+ * the cursor (kcoherent fragmentation is bounded by driver
+ * footprint and isn't recycled at this stage).
+ *
+ * Safe with @dom == NULL (no-op).
+ */
+void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
+			       dma_addr_t iova, size_t size, void *vaddr);
+
+/*
  * Read the awaiting-bind hit counter for @dom.
  *
  * Stage 1 always returns 0 -- there is no LOAD-side replay path
@@ -742,6 +854,16 @@ static inline int vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
 {
 	return -EOPNOTSUPP;
 }
+static inline int vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
+					     size_t size, gfp_t gfp,
+					     dma_addr_t *iova_out,
+					     void **vaddr_out)
+{
+	return -EOPNOTSUPP;
+}
+static inline void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
+					     dma_addr_t iova, size_t size,
+					     void *vaddr) { }
 static inline unsigned long
 vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom) { return 0; }
 static inline void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom) { }

@@ -142,6 +142,57 @@ struct vfmig_transient_arena {
 	unsigned int	 max_pages;	/* arena ceiling, in pages */
 };
 
+/*
+ * One outstanding kcoherent allocation. Lives on
+ * dom->kcoherent.pages until vfmig_iova_kcoherent_free unlinks and
+ * destroys it. We keep enough state to unmap + free in domain
+ * destroy if the caller leaks (drivers should call .free for every
+ * .alloc, but the destroy path is defensively complete).
+ *
+ * @vaddr is the kernel-virtual base; the backing memory is a
+ * physically-contiguous run of pages obtained via alloc_pages_exact,
+ * so virt_to_phys(vaddr) is the IOMMU-mapped phys base. @len is the
+ * (PAGE_SIZE-aligned) byte length passed at alloc time, also handed
+ * to free_pages_exact at teardown.
+ */
+struct vfmig_kcoherent_page {
+	struct list_head node;
+	u64		 iova;
+	size_t		 len;
+	void		*vaddr;
+};
+
+/*
+ * Per-domain kcoherent arena: bottom VFMIG_IOVA_KCOHERENT_BYTES of
+ * slot 7 (USER_PAGE)'s window. Backs vfmig_dma_ops's .alloc/.free.
+ *
+ *   [base, end) == [slot_base(USER_PAGE),
+ *                   slot_base(USER_PAGE) + KCOHERENT_BYTES)
+ *
+ * Allocations bump @cursor monotonically from @base toward @end.
+ * Frees do NOT reclaim IOVA range to @cursor: kcoherent's intended
+ * caller set (mlx5e ring/buffer setup at probe + ndo_open) makes
+ * driver-lifetime allocations with no churn, so simple bump
+ * allocation is sufficient at this stage. If a real workload
+ * reveals fragmentation pressure, switch to gen_pool / iova allocator
+ * and add a free bitmap.
+ *
+ * @pages is the list of currently-outstanding allocations, used
+ * exclusively for find-by-iova in _free and for the destroy-time
+ * drain. Not exposed via vfmig_iova_for_each() -- kcoherent entries
+ * are NEVER part of the SAVE manifest.
+ *
+ * Protected by dom->lock; the hot path is short and contention with
+ * USER_PAGE map_sg / kernel-slot alloc is rare in practice.
+ */
+struct vfmig_kcoherent_arena {
+	u64		 base;
+	u64		 end;
+	u64		 cursor;
+	struct list_head pages;
+	unsigned int	 n_pages;	/* len of @pages, for diagnostics */
+};
+
 struct vfmig_iova_domain {
 	struct iommu_domain *iommu_dom;
 	struct pci_dev	    *vf_pdev;	/* held via pci_dev_get() */
@@ -184,6 +235,7 @@ struct vfmig_iova_domain {
 	unsigned int	     n_pages;
 
 	struct vfmig_transient_arena transient;
+	struct vfmig_kcoherent_arena kcoherent;
 
 	/*
 	 * At-probe drift detection.
@@ -248,6 +300,24 @@ vfmig_iova_slot_base(const struct vfmig_iova_domain *dom,
 }
 
 /*
+ * USER_PAGE's effective starting IOVA after the kcoherent carve.
+ *
+ * The bottom VFMIG_IOVA_KCOHERENT_BYTES of slot 7's window are
+ * reserved for the non-migrated kcoherent sub-arena (see
+ * struct vfmig_kcoherent_arena above), so the user-MR IOVA range
+ * actually available via vfmig_iova_user_page_map_phys() begins
+ * at this offset. Code that needs the lower bound for USER_PAGE
+ * range checks or cursor initialization MUST use this helper
+ * rather than vfmig_iova_slot_base(dom, USER_PAGE) directly.
+ */
+static inline u64
+vfmig_iova_user_page_start(const struct vfmig_iova_domain *dom)
+{
+	return vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE) +
+	       VFMIG_IOVA_KCOHERENT_BYTES;
+}
+
+/*
  * The deterministic IOVA range has an asymmetric layout: kernel slots
  * 0..6 are each VFMIG_IOVA_SLOT_BYTES (510 MiB) wide, and slot 7
  * (VFMIG_SLOT_USER_PAGE) absorbs everything between
@@ -277,9 +347,17 @@ vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
  * Asymmetric layout (see vfmig_iova_slot_end above):
  *   - Anything below slot_base(USER_PAGE) maps by uniform division:
  *     (iova - base) / SLOT_BYTES gives the slot index in 0..6.
- *   - Anything in [slot_base(USER_PAGE), transient.base) is
- *     USER_PAGE regardless of how many SLOT_BYTES units past
- *     slot_base(USER_PAGE) it falls.
+ *   - Anything in [slot_base(USER_PAGE),
+ *                  slot_base(USER_PAGE) + KCOHERENT_BYTES) belongs
+ *     to the kcoherent sub-arena. kcoherent is NOT a deterministic
+ *     slot (allocations there are non-migrated and have no replay
+ *     records on the wire), so it returns VFMIG_SLOT_INVALID. A
+ *     replay record claiming USER_PAGE for an IOVA in this range
+ *     fails the slot cross-check in vfmig_iova_replay_page() and
+ *     is rejected with -ERANGE -- which is exactly the right
+ *     behaviour: kcoherent IOVAs must never be re-installed via
+ *     replay.
+ *   - Anything in [user_page_start, transient.base) is USER_PAGE.
  *   - Anything >= transient.base belongs to the transient arena (or
  *     is out of range entirely) -- not a deterministic slot.
  */
@@ -294,8 +372,11 @@ vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
 		return VFMIG_SLOT_INVALID;
 	off = iova - dom->base;
 	idx = off / VFMIG_IOVA_SLOT_BYTES;
-	if (idx >= VFMIG_SLOT_USER_PAGE)
+	if (idx >= VFMIG_SLOT_USER_PAGE) {
+		if (iova < vfmig_iova_user_page_start(dom))
+			return VFMIG_SLOT_INVALID;	/* kcoherent range */
 		return VFMIG_SLOT_USER_PAGE;
+	}
 	return (enum vfmig_iova_slot)idx;
 }
 
@@ -451,9 +532,14 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 		return -EINVAL;
 	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR)
 		return -EINVAL;
-	if (iova < vfmig_iova_slot_base(dom, slot) ||
-	    iova + len > vfmig_iova_slot_end(dom, slot))
-		return -ERANGE;
+	{
+		u64 lo = (slot == VFMIG_SLOT_USER_PAGE)
+			? vfmig_iova_user_page_start(dom)
+			: vfmig_iova_slot_base(dom, slot);
+		if (iova < lo ||
+		    iova + len > vfmig_iova_slot_end(dom, slot))
+			return -ERANGE;
+	}
 	if (vfmig_iova_find_locked(dom, iova))
 		return -EEXIST;
 
@@ -534,6 +620,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	mutex_init(&dom->lock);
 	INIT_LIST_HEAD(&dom->pages);
 	INIT_LIST_HEAD(&dom->transient.free);
+	INIT_LIST_HEAD(&dom->kcoherent.pages);
 	dom->vf_id  = vf_id;
 	dom->base   = base;
 	/*
@@ -542,6 +629,12 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	 * indexing trivial -- alloc_slot rejects SLOT_INVALID before it
 	 * ever touches cursor[0]. next_auto_key[] is zero-initialized
 	 * by kzalloc above; first auto-assignment yields key 1.
+	 *
+	 * USER_PAGE is special-cased: its cursor starts at the
+	 * effective user-MR base, i.e. past the kcoherent sub-arena
+	 * (which lives in the bottom KCOHERENT_BYTES of slot 7's
+	 * window). The kcoherent arena maintains its own independent
+	 * cursor in dom->kcoherent.cursor.
 	 */
 	{
 		unsigned int s;
@@ -549,7 +642,22 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 		for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++)
 			dom->cursor[s] = vfmig_iova_slot_base(dom,
 					(enum vfmig_iova_slot)s);
+		dom->cursor[VFMIG_SLOT_USER_PAGE] =
+			vfmig_iova_user_page_start(dom);
 	}
+
+	/*
+	 * Kcoherent sub-arena: bottom KCOHERENT_BYTES of slot 7's
+	 * window. Lives between the deterministic kernel slots and the
+	 * user-MR (USER_PAGE) sub-window. Allocations are not in the
+	 * SAVE manifest; the cursor restarts at base on the destination
+	 * naturally because each side's domain_create runs fresh.
+	 */
+	dom->kcoherent.base   = vfmig_iova_slot_base(dom,
+						     VFMIG_SLOT_USER_PAGE);
+	dom->kcoherent.end    = dom->kcoherent.base +
+				VFMIG_IOVA_KCOHERENT_BYTES;
+	dom->kcoherent.cursor = dom->kcoherent.base;
 
 	/*
 	 * Transient arena owns the topmost VFMIG_IOVA_TRANSIENT_BYTES
@@ -646,9 +754,10 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	}
 
 	dev_info(&vf_pdev->dev,
-		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (deterministic, %u slots x 0x%llx) + [0x%llx, 0x%llx) (transient) within IOMMU aperture [0x%llx, 0x%llx]\n",
-		 vf_id, dom->base, dom->transient.base,
+		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (deterministic, %u slots x 0x%llx) + [0x%llx, 0x%llx) (kcoherent) + [0x%llx, 0x%llx) (transient) within IOMMU aperture [0x%llx, 0x%llx]\n",
+		 vf_id, dom->base, dom->kcoherent.base,
 		 VFMIG_IOVA_NR_SLOTS, (u64)VFMIG_IOVA_SLOT_BYTES,
+		 dom->kcoherent.base, dom->kcoherent.end,
 		 dom->transient.base, dom->transient.end,
 		 dom->iommu_dom->geometry.aperture_start,
 		 dom->iommu_dom->geometry.aperture_end);
@@ -705,6 +814,34 @@ static void vfmig_transient_drain_locked(struct vfmig_iova_domain *dom)
 	a->n_free   = 0;
 }
 
+/*
+ * dom->lock held. Tear down every outstanding kcoherent allocation.
+ * Drivers should call vfmig_iova_kcoherent_free() for every _alloc()
+ * before unbind, but a leak here is treated as defensive cleanup
+ * rather than a fatal: we iommu_unmap, free_pages_exact, and free
+ * the bookkeeping for each entry still on the list. A non-empty
+ * list at destroy time prints a once-per-domain warning to surface
+ * the leak.
+ */
+static void vfmig_kcoherent_drain_locked(struct vfmig_iova_domain *dom)
+{
+	struct vfmig_kcoherent_arena *a = &dom->kcoherent;
+	struct vfmig_kcoherent_page *kp, *tmp;
+
+	if (a->n_pages > 0)
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent: %u outstanding allocations at domain destroy (driver leak); cleaning up\n",
+				     dom->vf_id, a->n_pages);
+
+	list_for_each_entry_safe(kp, tmp, &a->pages, node) {
+		(void)iommu_unmap(dom->iommu_dom, kp->iova, kp->len);
+		free_pages_exact(kp->vaddr, kp->len);
+		list_del(&kp->node);
+		kfree(kp);
+	}
+	a->n_pages = 0;
+}
+
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 {
 	struct vfmig_iova_page *p, *tmp;
@@ -716,6 +853,7 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 
 	mutex_lock(&dom->lock);
 	vfmig_transient_drain_locked(dom);
+	vfmig_kcoherent_drain_locked(dom);
 	list_for_each_entry_safe(p, tmp, &dom->pages, node) {
 		list_del(&p->node);
 		vfmig_iova_destroy_page_locked(dom, p);
@@ -1070,6 +1208,17 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 		 */
 		dom->alloc_count[s] = 0;
 	}
+	/*
+	 * USER_PAGE: skip the kcoherent carve at the bottom of slot 7's
+	 * window. Mirrors the one-shot adjustment in domain_create.
+	 */
+	dom->cursor[VFMIG_SLOT_USER_PAGE] = vfmig_iova_user_page_start(dom);
+	/*
+	 * The kcoherent arena is NOT reset on replay: it has no
+	 * SAVE-side records so there's nothing for replay to land in,
+	 * and any allocations live for the lifetime of the bound
+	 * driver, not across a probe arc.
+	 */
 	mutex_unlock(&dom->lock);
 }
 
@@ -1241,6 +1390,145 @@ int vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
 out_unlock:
 	mutex_unlock(&dom->lock);
 	return err;
+}
+
+/* -------- kcoherent arena ----------------------------------------------- */
+
+/*
+ * dom->lock held. Locate the kcoherent entry mapped at exactly
+ * @iova, or NULL if none.
+ */
+static struct vfmig_kcoherent_page *
+vfmig_kcoherent_find_locked(struct vfmig_iova_domain *dom, u64 iova)
+{
+	struct vfmig_kcoherent_page *kp;
+
+	list_for_each_entry(kp, &dom->kcoherent.pages, node) {
+		if (kp->iova == iova)
+			return kp;
+	}
+	return NULL;
+}
+
+int vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
+			       size_t size, gfp_t gfp,
+			       dma_addr_t *iova_out, void **vaddr_out)
+{
+	struct vfmig_kcoherent_arena *a;
+	struct vfmig_kcoherent_page *kp;
+	size_t aligned;
+	gfp_t gfp_pages;
+	u64 iova;
+	void *vaddr;
+	int err;
+
+	if (!dom || !iova_out || !vaddr_out || size == 0)
+		return -EINVAL;
+
+	a = &dom->kcoherent;
+	aligned = ALIGN(size, PAGE_SIZE);
+
+	/*
+	 * Sanitize the gfp passed by dma_alloc_coherent for
+	 * alloc_pages_exact + iommu_map + page_address requirements:
+	 *   - __GFP_HIGHMEM / __GFP_COMP / __GFP_DMA{,32}: rejected by
+	 *     iommu_map() (and __GFP_HIGHMEM would also break our
+	 *     reliance on page_address() being valid for the kernel-
+	 *     virtual mapping that dma_alloc_coherent contracts).
+	 *     Strip them silently rather than fail: dma_alloc_coherent
+	 *     callers reasonably expect those flags to be honoured if
+	 *     possible and ignored otherwise.
+	 *   - __GFP_ZERO: implied by dma_alloc_coherent; force it on
+	 *     so callers that forget still see zeroed memory.
+	 */
+	gfp_pages = (gfp & ~(__GFP_HIGHMEM | __GFP_COMP |
+			     __GFP_DMA | __GFP_DMA32)) | __GFP_ZERO;
+
+	kp = kzalloc(sizeof(*kp), gfp_pages);
+	if (!kp)
+		return -ENOMEM;
+
+	mutex_lock(&dom->lock);
+
+	if (a->cursor + aligned > a->end) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent exhausted at cursor 0x%llx (end 0x%llx, asked %zu)\n",
+				     dom->vf_id, a->cursor, a->end, aligned);
+		err = -ENOSPC;
+		goto err_free_kp;
+	}
+	iova = a->cursor;
+
+	vaddr = alloc_pages_exact(aligned, gfp_pages);
+	if (!vaddr) {
+		err = -ENOMEM;
+		goto err_free_kp;
+	}
+
+	err = iommu_map(dom->iommu_dom, iova, virt_to_phys(vaddr),
+			aligned,
+			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+			gfp_pages);
+	if (err)
+		goto err_free_pages;
+
+	kp->iova  = iova;
+	kp->len   = aligned;
+	kp->vaddr = vaddr;
+	list_add_tail(&kp->node, &a->pages);
+	a->n_pages++;
+	a->cursor += aligned;
+
+	mutex_unlock(&dom->lock);
+
+	*iova_out  = iova;
+	*vaddr_out = vaddr;
+	return 0;
+
+err_free_pages:
+	free_pages_exact(vaddr, aligned);
+err_free_kp:
+	mutex_unlock(&dom->lock);
+	kfree(kp);
+	return err;
+}
+
+void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
+			       dma_addr_t iova, size_t size, void *vaddr)
+{
+	struct vfmig_kcoherent_page *kp;
+	size_t aligned;
+
+	if (!dom)
+		return;
+
+	aligned = ALIGN(size, PAGE_SIZE);
+
+	mutex_lock(&dom->lock);
+	kp = vfmig_kcoherent_find_locked(dom, (u64)iova);
+	if (!kp) {
+		mutex_unlock(&dom->lock);
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent free: no entry at IOVA 0x%llx (asked %zu); ignoring\n",
+				     dom->vf_id, (u64)iova, aligned);
+		return;
+	}
+	if (kp->len != aligned)
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent free size mismatch at IOVA 0x%llx: have %zu, asked %zu; using recorded size\n",
+				     dom->vf_id, (u64)iova, kp->len, aligned);
+	if (vaddr && vaddr != kp->vaddr)
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent free vaddr mismatch at IOVA 0x%llx: have %p, asked %p\n",
+				     dom->vf_id, (u64)iova, kp->vaddr, vaddr);
+
+	(void)iommu_unmap(dom->iommu_dom, kp->iova, kp->len);
+	free_pages_exact(kp->vaddr, kp->len);
+	list_del(&kp->node);
+	dom->kcoherent.n_pages--;
+	mutex_unlock(&dom->lock);
+
+	kfree(kp);
 }
 
 /* -------- transient arena ----------------------------------------------- */

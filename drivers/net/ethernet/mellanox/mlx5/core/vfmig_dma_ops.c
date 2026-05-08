@@ -34,11 +34,30 @@
  * Stage scope
  * -----------
  * Stage 1 (this file): map_sg / unmap_sg / map_phys / unmap_phys /
- * sync_* / dma_supported / get_required_mask. .alloc and .free are
- * intentionally NULL: the only kernel call sites that would dispatch
- * .alloc are the unconverted dma_alloc_coherent call sites that v1
- * already detects as "alloc against unmanaged domain" -- they fail
- * loudly, which is exactly what we want.
+ * sync_* / dma_supported / get_required_mask, plus alloc / free.
+ *
+ * .alloc / .free route to the per-VF kcoherent sub-arena
+ * (vfmig_iova_kcoherent_alloc / _free), a non-migrated IOVA-not-
+ * stable region carved from the bottom of slot 7's window. The
+ * intended caller is mlx5e bringing up its RX/TX rings, drop_rq, and
+ * CQ/EQ buffers when the VF is tracked but the netdev still needs
+ * to come up far enough for IP configuration and RoCE GID
+ * population: ip link / ip addr / NETDEV notifier chains all work,
+ * even though the actual TX/RX traffic on this netdev is irrelevant
+ * (RDMA goes through mlx5_ib's separate path). kcoherent allocations
+ * are NEVER recorded in the SAVE manifest -- the destination
+ * re-probes mlx5e fresh and re-allocates on its own.
+ *
+ * .map_phys / .map_sg route streaming mappings to the USER_PAGE slot
+ * (registry-tracked, migrated). Today USER_PAGE is intended for
+ * ib_umem_get-pinned MR / CQ / QP / SRQ buffers, but mlx5e's
+ * dma_map_page (per-packet RX / TX page-pool buffers) lands here
+ * too. For Stage 1 -- which does not exercise SAVE-while-mlx5e-
+ * running -- the mappings are valid and HW DMA succeeds; the only
+ * caveat is that a SAVE blob captured while mlx5e is active would
+ * carry kernel page-pool entries as if they were user MRs, which
+ * is undefined and out of scope. Splitting kernel-streaming from
+ * user-MR routing is a follow-up tracked in DESIGN_user_mr_dma.md.
  *
  * Stage 2 (next PR) extends the (iova, len, phys) registry tracking
  * with awaiting_bind support so a destination's .map_sg can consume
@@ -330,16 +349,74 @@ static u64 vfmig_dma_ops_get_required_mask(struct device *dev)
 	return DMA_BIT_MASK(64);
 }
 
+/*
+ * dma_alloc_coherent lands here for tracked VFs. Routes to the
+ * non-migrated kcoherent sub-arena of the per-VF iommu_domain.
+ *
+ * The intended caller is mlx5e (and any other auxiliary driver
+ * that probes off the same VF) doing ring / drop_rq / CQ buffer
+ * setup. These allocations live for the bound lifetime of the
+ * driver and are not part of the SAVE manifest: the destination
+ * re-probes mlx5e fresh and gets its own IOVAs.
+ *
+ * @attrs: dma_alloc_attrs flags. Stage 1 ignores them entirely
+ * (no DMA_ATTR_NO_KERNEL_MAPPING, no DMA_ATTR_NON_CONSISTENT, etc.):
+ * vfmig_iova_kcoherent_alloc always returns a kernel-virtual,
+ * physically-contiguous, IOMMU_CACHE region, which is the strongest
+ * coherent contract and works for every kernel caller seen so far.
+ * If a future caller actually needs DMA_ATTR_NO_KERNEL_MAPPING (e.g.
+ * for a very large RX buffer pool that doesn't want vmemmap
+ * pressure), we'll plumb it through then.
+ */
+static void *vfmig_dma_ops_alloc(struct device *dev, size_t size,
+				 dma_addr_t *dma_handle, gfp_t gfp,
+				 unsigned long attrs)
+{
+	struct vfmig_iova_domain *dom = vfmig_dma_ops_dom_for(dev);
+	dma_addr_t iova;
+	void *vaddr;
+	int err;
+
+	if (unlikely(!dom)) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: alloc(%zu) with no domain attached (caller bug)\n",
+				     size);
+		return NULL;
+	}
+
+	err = vfmig_iova_kcoherent_alloc(dom, size, gfp, &iova, &vaddr);
+	if (err) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: alloc(%zu) failed: %d\n",
+				     size, err);
+		return NULL;
+	}
+	*dma_handle = iova;
+	return vaddr;
+}
+
+static void vfmig_dma_ops_free(struct device *dev, size_t size,
+			       void *vaddr, dma_addr_t dma_handle,
+			       unsigned long attrs)
+{
+	struct vfmig_iova_domain *dom = vfmig_dma_ops_dom_for(dev);
+
+	if (unlikely(!dom))
+		return;
+
+	vfmig_iova_kcoherent_free(dom, dma_handle, size, vaddr);
+}
+
 static const struct dma_map_ops vfmig_dma_ops = {
 	/*
-	 * .alloc / .free deliberately NULL. dma_alloc_coherent on a
-	 * tracked VF is a v1 fail-loud signal: the call site hasn't
-	 * been converted to vfmig_iova_alloc_slot, so its IOVA isn't
-	 * deterministic across SAVE/LOAD. The DMA layer fails with
-	 * -ENOSYS rather than handing back a bogus mapping.
+	 * .alloc / .free route dma_alloc_coherent calls to the
+	 * non-migrated kcoherent sub-arena (see header comment on
+	 * "Stage scope"). Required so that mlx5e and other kernel
+	 * coherent callers on tracked VFs get a working DMA path
+	 * rather than failing loudly mid-probe.
 	 */
-	.alloc			= NULL,
-	.free			= NULL,
+	.alloc			= vfmig_dma_ops_alloc,
+	.free			= vfmig_dma_ops_free,
 
 	.map_phys		= vfmig_dma_ops_map_phys,
 	.unmap_phys		= vfmig_dma_ops_unmap_phys,
