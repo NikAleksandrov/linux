@@ -48,16 +48,28 @@
  * are NEVER recorded in the SAVE manifest -- the destination
  * re-probes mlx5e fresh and re-allocates on its own.
  *
- * .map_phys / .map_sg route streaming mappings to the USER_PAGE slot
- * (registry-tracked, migrated). Today USER_PAGE is intended for
- * ib_umem_get-pinned MR / CQ / QP / SRQ buffers, but mlx5e's
- * dma_map_page (per-packet RX / TX page-pool buffers) lands here
- * too. For Stage 1 -- which does not exercise SAVE-while-mlx5e-
- * running -- the mappings are valid and HW DMA succeeds; the only
- * caveat is that a SAVE blob captured while mlx5e is active would
- * carry kernel page-pool entries as if they were user MRs, which
- * is undefined and out of scope. Splitting kernel-streaming from
- * user-MR routing is a follow-up tracked in DESIGN_user_mr_dma.md.
+ * .map_sg / .unmap_sg keep their migration-tracked routing into
+ * the USER_PAGE slot (registry list, install_external_phys for
+ * each sg segment). The canonical caller is ib_umem_get +
+ * dma_map_sgtable: the umem-pinned pages must round-trip through
+ * SAVE/LOAD with stable IOVAs, which is what USER_PAGE's
+ * registry + replay machinery provides.
+ *
+ * .map_phys / .unmap_phys route to the non-migrated kcoherent
+ * sub-arena instead. The canonical callers are mlx5e RX
+ * (page_pool dma_map_page) and TX (dma_map_single per skb
+ * fragment), both of which are streaming-rate and would exhibit
+ * O(n^2) behaviour through the USER_PAGE registry list (see the
+ * detailed comment on vfmig_dma_ops_map_phys below). kcoherent's
+ * O(1) bump-cursor path is mandatory for these callers.
+ *
+ * Heuristic: today's exact distinction is
+ *   - ib_umem_get -> dma_map_sgtable -> .map_sg     (USER_PAGE)
+ *   - mlx5e       -> dma_map_page/single -> .map_phys (kcoherent)
+ * If a future caller breaks this (e.g. an ib_umem path that
+ * goes through .map_phys, or an mlx5e path that emits sgtables),
+ * the routing will need a more explicit signal -- a custom
+ * DMA_ATTR_VFMIG_USER_MR bit, or a separate API entry point.
  *
  * Stage 2 (next PR) extends the (iova, len, phys) registry tracking
  * with awaiting_bind support so a destination's .map_sg can consume
@@ -248,9 +260,36 @@ static void vfmig_dma_ops_unmap_sg(struct device *dev, struct scatterlist *sg,
 }
 
 /*
- * dma_map_phys lands here for callers that supply a single physical
- * address rather than a scatterlist. Same machinery as map_sg's
- * inner loop, single-entry.
+ * dma_map_phys / dma_map_single / dma_map_page land here for callers
+ * that supply a single physical address rather than a scatterlist.
+ *
+ * Routing: kcoherent sub-arena (NOT the USER_PAGE registry).
+ *
+ * Why not USER_PAGE: the canonical caller is mlx5e's RX path
+ * (page_pool dma_map_page per buffer) and TX path (dma_map_single
+ * per skb fragment). At ndo_open time mlx5e posts thousands of RX
+ * WQEs across its channels in tight succession. The USER_PAGE path
+ * is registry-list-tracked (O(n) find + O(n) insert per call),
+ * which composes to O(n^2) total work and turned a 32-channel
+ * netdev open into a multi-minute soft-lockup-class wedge in
+ * vfmig_iova_user_page_map_phys (observed in dmesg as repeated
+ * mlx5e_post_rx_mpwqes -> vfmig_iova_user_page_map_phys frames in
+ * scheduler stack traces).
+ *
+ * The kcoherent path is O(1) per call: bump cursor, iommu_map,
+ * return. No bookkeeping struct, no list. The trade-off is that
+ * these mappings are NOT recorded in the SAVE manifest; the
+ * destination's mlx5e re-maps its buffers fresh, which is
+ * semantically correct because mlx5e's runtime state is not part of
+ * what we migrate (kernel side rebuilds from probe + ndo_open
+ * naturally).
+ *
+ * USER_PAGE retains its registry semantics for ib_umem-pinned MR
+ * pages, which arrive via .map_sg (sgtable). That distinction is
+ * the routing fork: .map_sg -> USER_PAGE (migrated), .map_phys ->
+ * kcoherent (not migrated). Today the heuristic is exact:
+ *   - ib_umem_get -> dma_map_sgtable -> .map_sg
+ *   - mlx5e dma_map_page / dma_map_single -> .map_phys
  *
  * DMA_ATTR_MMIO indicates a peer-to-peer mapping of MMIO BAR space
  * rather than system memory. Our iommu_map call would still create
@@ -258,8 +297,9 @@ static void vfmig_dma_ops_unmap_sg(struct device *dev, struct scatterlist *sg,
  * SAVE/LOAD (BAR base addresses differ between source and
  * destination) and we'd need to coordinate with the peer driver to
  * reconstruct the correct phys on LOAD. Stage 1 rejects MMIO with
- * -EOPNOTSUPP; future work will add a "peer dma-buf" wire record
- * type that carries the peer device identity rather than phys.
+ * DMA_MAPPING_ERROR; future work will add a "peer dma-buf" wire
+ * record type that carries the peer device identity rather than
+ * phys.
  */
 static dma_addr_t vfmig_dma_ops_map_phys(struct device *dev, phys_addr_t phys,
 					 size_t size,
@@ -281,7 +321,7 @@ static dma_addr_t vfmig_dma_ops_map_phys(struct device *dev, phys_addr_t phys,
 	}
 
 	off = phys & ~PAGE_MASK;
-	err = vfmig_iova_user_page_map_phys(dom, phys & PAGE_MASK,
+	err = vfmig_iova_kcoherent_map_phys(dom, phys & PAGE_MASK,
 					    PAGE_ALIGN(size + off),
 					    GFP_ATOMIC, &iova);
 	if (err) {
@@ -307,8 +347,8 @@ static void vfmig_dma_ops_unmap_phys(struct device *dev, dma_addr_t handle,
 		return;	/* never mapped, see map_phys */
 
 	off = handle & ~PAGE_MASK;
-	(void)vfmig_iova_user_page_unmap_phys(dom, handle - off,
-					      PAGE_ALIGN(size + off));
+	vfmig_iova_kcoherent_unmap_phys(dom, handle - off,
+					PAGE_ALIGN(size + off));
 }
 
 /*

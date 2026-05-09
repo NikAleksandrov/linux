@@ -305,15 +305,21 @@ enum vfmig_iova_slot {
 
 /*
  * KCOHERENT sub-arena: carved from the BOTTOM of slot 7's
- * (VFMIG_SLOT_USER_PAGE) window. Backs vfmig_dma_ops's .alloc/.free
- * callbacks for kernel-side coherent allocations on tracked VFs --
- * the canonical caller is mlx5e bringing up its RX/TX rings, drop_rq,
- * and CQ/EQ buffers when the VF is tracked but the netdev still
- * needs to come up far enough for IP configuration and RoCE GID
- * population. ("Functional-enough" netdev: probe + ndo_open succeed,
- * notifier chains fire, packets are DMA'd in/out by the device, but
- * the actual RX/TX traffic is irrelevant for our use case because
- * RDMA goes through mlx5_ib's separate path.)
+ * (VFMIG_SLOT_USER_PAGE) window. Backs vfmig_dma_ops's
+ * .alloc / .free / .map_phys / .unmap_phys callbacks for
+ * kernel-side DMA on tracked VFs (both coherent ring/buffer
+ * allocations and per-WQE / per-skb streaming maps).
+ *
+ * The canonical caller is mlx5e:
+ *   - .alloc / .free        -> CQ / EQ / drop_rq / ring buffers,
+ *                              once-per-channel at probe / ndo_open;
+ *   - .map_phys / .unmap_phys -> per-WQE RX page_pool buffers and
+ *                              per-skb-fragment TX maps,
+ *                              high-frequency on the data path.
+ *
+ * (.map_sg / .unmap_sg keep their migration-tracked routing into
+ *  the USER_PAGE slot; that path is for ib_umem-pinned MR / CQ / QP
+ *  / SRQ buffers.)
  *
  * Properties (vs. the deterministic kernel slots):
  *   - Allocations are NOT recorded in the SAVE manifest
@@ -322,8 +328,23 @@ enum vfmig_iova_slot {
  *     re-probes mlx5e fresh and gets whatever IOVAs it gets.
  *   - No drift detection, no replay: SAVE/LOAD are entirely
  *     bypassed.
- *   - Shape: bump cursor with no IOVA reuse on free; allocations
- *     are driver-lifetime so churn is negligible.
+ *   - Shape: bump cursor with no IOVA reuse on free. Per-call cost
+ *     is O(1) (no registry list walk), which is mandatory for the
+ *     streaming-rate .map_phys callers: mlx5e posts thousands of
+ *     RX WQEs at ndo_open time and the registry-list path's O(n)
+ *     find/insert would compose to O(n^2) total -- a measurable
+ *     soft-lockup-class wedge at 32-channel default config.
+ *
+ * Sizing: 1 GiB at default config. Per-VF mlx5e footprint at 32
+ * channels with default ring sizes maps roughly:
+ *   - page_pool RX:   32 ch x 1024 pages x 4 KiB = ~128 MiB
+ *   - TX skb frags:    typically << 256 MiB live at any time
+ *   - coherent rings:  ~10 MiB (CQ/EQ/drop_rq)
+ * Headroom is generous because kcoherent is bump-only with no
+ * IOVA reclaim in stage 1, so churn over the lifetime of the
+ * netdev (link-up/down cycles, ethtool ring resize, MTU change)
+ * accumulates. 1 GiB is enough for a few hundred such cycles
+ * before a SET_TRACKED toggle would be needed to reset.
  *
  * Layout: the arena occupies
  *   [slot_base(USER_PAGE), slot_base(USER_PAGE) + KCOHERENT_BYTES);
@@ -338,7 +359,7 @@ enum vfmig_iova_slot {
  * (not yet wired), so no in-the-wild SAVE blob carries USER_PAGE
  * entries today.
  */
-#define VFMIG_IOVA_KCOHERENT_BYTES	(256ULL << 20)	/* 256 MiB */
+#define VFMIG_IOVA_KCOHERENT_BYTES	(1ULL << 30)	/* 1 GiB */
 
 /*
  * Per-VF slot fan-out for the deterministic allocator.
@@ -395,11 +416,9 @@ static_assert(VFMIG_IOVA_PER_VF >
 	      (u64)VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES +
 	      VFMIG_IOVA_KCOHERENT_BYTES +
 	      VFMIG_IOVA_TRANSIENT_BYTES,
-	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit 7 fixed 510-MiB kernel slots + 256 MiB kcoherent + 16 MiB transient + at least one user-MR IOVA");
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit 7 fixed 510-MiB kernel slots + KCOHERENT + 16 MiB transient + at least one user-MR IOVA");
 static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
-static_assert(VFMIG_IOVA_KCOHERENT_BYTES <= VFMIG_IOVA_SLOT_BYTES,
-	      "VFMIG_IOVA_KCOHERENT_BYTES must not exceed slot 7's nominal window");
 
 /*
  * (Slot identity is enum vfmig_iova_slot, defined outside the
@@ -657,6 +676,49 @@ void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
 			       dma_addr_t iova, size_t size, void *vaddr);
 
 /*
+ * Map a caller-owned physical address into the kcoherent sub-arena.
+ * Backs vfmig_dma_ops's .map_phys callback for streaming-rate
+ * single-phys mappings (mlx5e RX page_pool, TX skb fragments,
+ * XDP buffers). Differs from vfmig_iova_user_page_map_phys() in
+ * being O(1) per call: no registry insertion, no list walk, no
+ * SAVE-time iteration. The cost is non-migrability, which is
+ * acceptable for kernel-streaming traffic that the destination
+ * re-establishes from scratch.
+ *
+ * Properties:
+ *   - Allocations bump dom->kcoherent.cursor (shared with
+ *     vfmig_iova_kcoherent_alloc()).
+ *   - No bookkeeping struct is allocated. _unmap_phys() trusts the
+ *     caller-supplied (@iova, @len) and just calls iommu_unmap.
+ *   - IOVAs are NOT stable across migration; the destination's
+ *     mlx5e re-maps its own buffers fresh.
+ *   - NOT recorded in the SAVE manifest.
+ *
+ * @phys must be PAGE_SIZE-aligned, @len a non-zero multiple of
+ * PAGE_SIZE. @gfp constraints match vfmig_iova_kcoherent_alloc()
+ * (incompatible flags are stripped silently).
+ *
+ * On success *@iova_out is the allocated IOVA. Errors:
+ *   -EINVAL  bad args
+ *   -ENOSPC  arena exhausted
+ *   <0       iommu_map failure
+ */
+int  vfmig_iova_kcoherent_map_phys(struct vfmig_iova_domain *dom,
+				   phys_addr_t phys, size_t len, gfp_t gfp,
+				   dma_addr_t *iova_out);
+
+/*
+ * Reverse of vfmig_iova_kcoherent_map_phys(). @iova and @len MUST
+ * match the values produced by / passed to _map_phys(). @len is
+ * page-aligned internally before the iommu_unmap call. Safe with
+ * @dom == NULL (no-op). Mismatched (@iova, @len) is a caller bug:
+ * iommu_unmap will warn and the IOMMU mapping may be left
+ * inconsistent.
+ */
+void vfmig_iova_kcoherent_unmap_phys(struct vfmig_iova_domain *dom,
+				     dma_addr_t iova, size_t len);
+
+/*
  * Read the awaiting-bind hit counter for @dom.
  *
  * Stage 1 always returns 0 -- there is no LOAD-side replay path
@@ -864,6 +926,16 @@ static inline int vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
 static inline void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
 					     dma_addr_t iova, size_t size,
 					     void *vaddr) { }
+static inline int vfmig_iova_kcoherent_map_phys(struct vfmig_iova_domain *dom,
+						phys_addr_t phys, size_t len,
+						gfp_t gfp,
+						dma_addr_t *iova_out)
+{
+	return -EOPNOTSUPP;
+}
+static inline void
+vfmig_iova_kcoherent_unmap_phys(struct vfmig_iova_domain *dom,
+				dma_addr_t iova, size_t len) { }
 static inline unsigned long
 vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom) { return 0; }
 static inline void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom) { }

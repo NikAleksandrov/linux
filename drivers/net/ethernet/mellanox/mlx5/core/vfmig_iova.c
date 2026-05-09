@@ -18,6 +18,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -164,31 +165,46 @@ struct vfmig_kcoherent_page {
 
 /*
  * Per-domain kcoherent arena: bottom VFMIG_IOVA_KCOHERENT_BYTES of
- * slot 7 (USER_PAGE)'s window. Backs vfmig_dma_ops's .alloc/.free.
+ * slot 7 (USER_PAGE)'s window. Backs vfmig_dma_ops's .alloc / .free
+ * and .map_phys / .unmap_phys callbacks (see vfmig_dma_ops.c
+ * header comment for the .map_sg vs .map_phys routing split).
  *
  *   [base, end) == [slot_base(USER_PAGE),
  *                   slot_base(USER_PAGE) + KCOHERENT_BYTES)
  *
  * Allocations bump @cursor monotonically from @base toward @end.
- * Frees do NOT reclaim IOVA range to @cursor: kcoherent's intended
- * caller set (mlx5e ring/buffer setup at probe + ndo_open) makes
- * driver-lifetime allocations with no churn, so simple bump
- * allocation is sufficient at this stage. If a real workload
- * reveals fragmentation pressure, switch to gen_pool / iova allocator
- * and add a free bitmap.
+ * Frees do NOT reclaim IOVA range to @cursor: kcoherent's caller
+ * set is dominated by mlx5e ring/buffer setup at probe + ndo_open
+ * (driver-lifetime, low churn) and per-WQE / per-skb streaming
+ * maps that cycle through page_pool's stable mapping (also low
+ * churn under steady-state). If a real workload reveals
+ * fragmentation pressure (e.g. many netdev up/down cycles), switch
+ * to gen_pool / iova allocator and add a free bitmap.
  *
- * @pages is the list of currently-outstanding allocations, used
- * exclusively for find-by-iova in _free and for the destroy-time
- * drain. Not exposed via vfmig_iova_for_each() -- kcoherent entries
- * are NEVER part of the SAVE manifest.
+ * @pages is the list of currently-outstanding *coherent*
+ * allocations (vfmig_iova_kcoherent_alloc); it is used exclusively
+ * for find-by-iova in _free and for the destroy-time drain. The
+ * streaming-map path (vfmig_iova_kcoherent_map_phys) does NOT
+ * insert into this list -- it relies on the caller passing back
+ * the (iova, len) pair at unmap time, so the per-call cost stays
+ * O(1). Neither path is exposed via vfmig_iova_for_each(); kcoherent
+ * entries are NEVER part of the SAVE manifest.
  *
- * Protected by dom->lock; the hot path is short and contention with
- * USER_PAGE map_sg / kernel-slot alloc is rare in practice.
+ * Locking: protected by @lock, a dedicated spinlock NOT shared with
+ * dom->lock. This is mandatory because mlx5e's RX path calls
+ * dma_map_page from NAPI poll context (softirq), which cannot take
+ * mutexes. @lock is held only for cursor reservation and (for the
+ * coherent-alloc path) list manipulation; iommu_map / iommu_unmap
+ * happen OUTSIDE the lock with GFP_ATOMIC, relying on the IOMMU
+ * subsystem's own internal locking. The critical section is
+ * therefore O(1) integer arithmetic plus an O(1) list_add_tail,
+ * keeping softirq stalls negligible.
  */
 struct vfmig_kcoherent_arena {
 	u64		 base;
 	u64		 end;
 	u64		 cursor;
+	spinlock_t	 lock;
 	struct list_head pages;
 	unsigned int	 n_pages;	/* len of @pages, for diagnostics */
 };
@@ -658,6 +674,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	dom->kcoherent.end    = dom->kcoherent.base +
 				VFMIG_IOVA_KCOHERENT_BYTES;
 	dom->kcoherent.cursor = dom->kcoherent.base;
+	spin_lock_init(&dom->kcoherent.lock);
 
 	/*
 	 * Transient arena owns the topmost VFMIG_IOVA_TRANSIENT_BYTES
@@ -815,15 +832,18 @@ static void vfmig_transient_drain_locked(struct vfmig_iova_domain *dom)
 }
 
 /*
- * dom->lock held. Tear down every outstanding kcoherent allocation.
- * Drivers should call vfmig_iova_kcoherent_free() for every _alloc()
- * before unbind, but a leak here is treated as defensive cleanup
- * rather than a fatal: we iommu_unmap, free_pages_exact, and free
- * the bookkeeping for each entry still on the list. A non-empty
- * list at destroy time prints a once-per-domain warning to surface
- * the leak.
+ * Tear down every outstanding kcoherent allocation. Called from
+ * vfmig_iova_domain_destroy() with the VF unbound (caller contract);
+ * no concurrent kcoherent traffic is possible, so we don't need to
+ * take @kcoherent.lock here. Tear down each entry on the list in
+ * order: iommu_unmap, free_pages_exact, kfree the bookkeeping. The
+ * iommu mapping cleanup for any _map_phys leaks (which carry no
+ * bookkeeping) is left to iommu_domain_free() in the caller.
+ *
+ * A non-empty list at destroy time prints a once-per-domain warning
+ * to surface the leak.
  */
-static void vfmig_kcoherent_drain_locked(struct vfmig_iova_domain *dom)
+static void vfmig_kcoherent_drain(struct vfmig_iova_domain *dom)
 {
 	struct vfmig_kcoherent_arena *a = &dom->kcoherent;
 	struct vfmig_kcoherent_page *kp, *tmp;
@@ -853,13 +873,20 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 
 	mutex_lock(&dom->lock);
 	vfmig_transient_drain_locked(dom);
-	vfmig_kcoherent_drain_locked(dom);
 	list_for_each_entry_safe(p, tmp, &dom->pages, node) {
 		list_del(&p->node);
 		vfmig_iova_destroy_page_locked(dom, p);
 	}
 	dom->n_pages = 0;
 	mutex_unlock(&dom->lock);
+
+	/*
+	 * kcoherent drain is outside dom->lock: the arena has its own
+	 * spinlock for runtime synchronization, and at destroy time
+	 * the VF is unbound (caller contract) so no concurrent
+	 * kcoherent traffic is possible -- drain runs lockless.
+	 */
+	vfmig_kcoherent_drain(dom);
 
 	if (vf_pdev) {
 		/*
@@ -1395,9 +1422,39 @@ out_unlock:
 /* -------- kcoherent arena ----------------------------------------------- */
 
 /*
- * dom->lock held. Locate the kcoherent entry mapped at exactly
- * @iova, or NULL if none.
+ * Locking model
+ * -------------
+ * @kcoherent.lock is a dedicated spinlock NOT shared with dom->lock.
+ * It guards two pieces of state:
+ *   - the bump cursor (@cursor), and
+ *   - the outstanding-coherent-allocations list (@pages, @n_pages).
+ *
+ * All sleeping operations (alloc_pages_exact, free_pages_exact,
+ * kzalloc with GFP_KERNEL, iommu_map / iommu_unmap with caller-
+ * specified gfp) happen OUTSIDE the lock. iommu_map's atomicity is
+ * handled by the IOMMU subsystem's internal locking; we don't need
+ * to serialize map calls against each other -- they're operating on
+ * disjoint IOVA ranges by construction (cursor reservations are
+ * unique).
+ *
+ * Why a spinlock and not the existing dom->lock mutex: mlx5e's RX
+ * path calls dma_map_page from NAPI poll context (softirq), which
+ * cannot sleep. Mutexes are out. spin_lock_irqsave handles both
+ * softirq and process-context callers correctly, at the cost of
+ * disabling local IRQs for the brief integer-arithmetic critical
+ * section.
+ *
+ * Cursor leaks
+ * ------------
+ * If iommu_map fails AFTER cursor reservation, the IOVA range is
+ * "leaked" -- the cursor doesn't reclaim. This is consistent with
+ * the broader kcoherent model (bump-only, no fragmentation
+ * reclaim) and the loss is bounded: iommu_map failures on a healthy
+ * IOMMU are rare (-ENOMEM in the IOMMU page-table allocator), and
+ * the arena has 1 GiB of room.
  */
+
+/* Held @kcoherent.lock. Locate the entry mapped at exactly @iova, or NULL. */
 static struct vfmig_kcoherent_page *
 vfmig_kcoherent_find_locked(struct vfmig_iova_domain *dom, u64 iova)
 {
@@ -1410,14 +1467,38 @@ vfmig_kcoherent_find_locked(struct vfmig_iova_domain *dom, u64 iova)
 	return NULL;
 }
 
+/*
+ * Reserve @aligned bytes at the cursor under @kcoherent.lock.
+ * Returns the reserved IOVA on success, U64_MAX on exhaustion (so
+ * callers can release any pre-allocated backing pages without
+ * needing the lock to test for failure).
+ */
+static u64 vfmig_kcoherent_reserve(struct vfmig_iova_domain *dom,
+				   size_t aligned)
+{
+	struct vfmig_kcoherent_arena *a = &dom->kcoherent;
+	unsigned long flags;
+	u64 iova;
+
+	spin_lock_irqsave(&a->lock, flags);
+	if (a->cursor + aligned > a->end) {
+		spin_unlock_irqrestore(&a->lock, flags);
+		return U64_MAX;
+	}
+	iova = a->cursor;
+	a->cursor += aligned;
+	spin_unlock_irqrestore(&a->lock, flags);
+	return iova;
+}
+
 int vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
 			       size_t size, gfp_t gfp,
 			       dma_addr_t *iova_out, void **vaddr_out)
 {
-	struct vfmig_kcoherent_arena *a;
 	struct vfmig_kcoherent_page *kp;
 	size_t aligned;
 	gfp_t gfp_pages;
+	unsigned long flags;
 	u64 iova;
 	void *vaddr;
 	int err;
@@ -1425,39 +1506,20 @@ int vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
 	if (!dom || !iova_out || !vaddr_out || size == 0)
 		return -EINVAL;
 
-	a = &dom->kcoherent;
 	aligned = ALIGN(size, PAGE_SIZE);
 
 	/*
 	 * Sanitize the gfp passed by dma_alloc_coherent for
-	 * alloc_pages_exact + iommu_map + page_address requirements:
-	 *   - __GFP_HIGHMEM / __GFP_COMP / __GFP_DMA{,32}: rejected by
-	 *     iommu_map() (and __GFP_HIGHMEM would also break our
-	 *     reliance on page_address() being valid for the kernel-
-	 *     virtual mapping that dma_alloc_coherent contracts).
-	 *     Strip them silently rather than fail: dma_alloc_coherent
-	 *     callers reasonably expect those flags to be honoured if
-	 *     possible and ignored otherwise.
-	 *   - __GFP_ZERO: implied by dma_alloc_coherent; force it on
-	 *     so callers that forget still see zeroed memory.
+	 * alloc_pages_exact + iommu_map + page_address requirements.
+	 * (See vfmig_iova.h's API doc for the full rationale.)
 	 */
 	gfp_pages = (gfp & ~(__GFP_HIGHMEM | __GFP_COMP |
 			     __GFP_DMA | __GFP_DMA32)) | __GFP_ZERO;
 
+	/* All allocations happen OUTSIDE the spinlock. */
 	kp = kzalloc(sizeof(*kp), gfp_pages);
 	if (!kp)
 		return -ENOMEM;
-
-	mutex_lock(&dom->lock);
-
-	if (a->cursor + aligned > a->end) {
-		dev_warn_ratelimited(&dom->vf_pdev->dev,
-				     "vfmig_iova: vf %u kcoherent exhausted at cursor 0x%llx (end 0x%llx, asked %zu)\n",
-				     dom->vf_id, a->cursor, a->end, aligned);
-		err = -ENOSPC;
-		goto err_free_kp;
-	}
-	iova = a->cursor;
 
 	vaddr = alloc_pages_exact(aligned, gfp_pages);
 	if (!vaddr) {
@@ -1465,21 +1527,37 @@ int vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
 		goto err_free_kp;
 	}
 
+	iova = vfmig_kcoherent_reserve(dom, aligned);
+	if (iova == U64_MAX) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent alloc exhausted (asked %zu, end 0x%llx)\n",
+				     dom->vf_id, aligned,
+				     dom->kcoherent.end);
+		err = -ENOSPC;
+		goto err_free_pages;
+	}
+
+	/*
+	 * iommu_map outside the cursor lock. Pass GFP_ATOMIC so the
+	 * IOMMU page-table allocator stays atomic-safe in case the
+	 * caller invoked us from a context that itself disallowed
+	 * sleeping (uncommon for .alloc, but cheap insurance).
+	 */
 	err = iommu_map(dom->iommu_dom, iova, virt_to_phys(vaddr),
 			aligned,
 			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
-			gfp_pages);
+			GFP_ATOMIC);
 	if (err)
 		goto err_free_pages;
 
 	kp->iova  = iova;
 	kp->len   = aligned;
 	kp->vaddr = vaddr;
-	list_add_tail(&kp->node, &a->pages);
-	a->n_pages++;
-	a->cursor += aligned;
 
-	mutex_unlock(&dom->lock);
+	spin_lock_irqsave(&dom->kcoherent.lock, flags);
+	list_add_tail(&kp->node, &dom->kcoherent.pages);
+	dom->kcoherent.n_pages++;
+	spin_unlock_irqrestore(&dom->kcoherent.lock, flags);
 
 	*iova_out  = iova;
 	*vaddr_out = vaddr;
@@ -1488,15 +1566,91 @@ int vfmig_iova_kcoherent_alloc(struct vfmig_iova_domain *dom,
 err_free_pages:
 	free_pages_exact(vaddr, aligned);
 err_free_kp:
-	mutex_unlock(&dom->lock);
 	kfree(kp);
 	return err;
+}
+
+int vfmig_iova_kcoherent_map_phys(struct vfmig_iova_domain *dom,
+				  phys_addr_t phys, size_t len, gfp_t gfp,
+				  dma_addr_t *iova_out)
+{
+	size_t aligned;
+	gfp_t gfp_iommu;
+	u64 iova;
+	int err;
+
+	if (!dom || !iova_out || len == 0)
+		return -EINVAL;
+	if (!IS_ALIGNED(phys, PAGE_SIZE))
+		return -EINVAL;
+
+	aligned = ALIGN(len, PAGE_SIZE);
+
+	/*
+	 * Strip flags iommu_map rejects. No __GFP_ZERO: caller-owned
+	 * @phys already points at populated pages. Many callers from
+	 * softirq pass GFP_ATOMIC; leave the atomicity bits intact so
+	 * iommu_map honours them.
+	 */
+	gfp_iommu = gfp & ~(__GFP_HIGHMEM | __GFP_COMP |
+			    __GFP_DMA | __GFP_DMA32);
+
+	iova = vfmig_kcoherent_reserve(dom, aligned);
+	if (iova == U64_MAX) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent map_phys exhausted (asked %zu, end 0x%llx)\n",
+				     dom->vf_id, aligned,
+				     dom->kcoherent.end);
+		return -ENOSPC;
+	}
+
+	err = iommu_map(dom->iommu_dom, iova, phys, aligned,
+			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+			gfp_iommu);
+	if (err)
+		return err;	/* iova reservation leaked; see file header */
+
+	*iova_out = iova;
+	return 0;
+}
+
+void vfmig_iova_kcoherent_unmap_phys(struct vfmig_iova_domain *dom,
+				     dma_addr_t iova, size_t len)
+{
+	size_t aligned;
+
+	if (!dom || len == 0)
+		return;
+
+	aligned = ALIGN(len, PAGE_SIZE);
+
+	/*
+	 * No bookkeeping to remove: kcoherent map_phys is registry-
+	 * less. Defensive sanity check that @iova falls in the
+	 * kcoherent window so a stale dma_handle from another path
+	 * (USER_PAGE, transient, kernel slot) can't accidentally
+	 * unmap something here.
+	 */
+	if (iova < dom->kcoherent.base ||
+	    (u64)iova + aligned > dom->kcoherent.end) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u kcoherent unmap_phys: IOVA 0x%llx + 0x%zx outside kcoherent window [0x%llx, 0x%llx); ignoring\n",
+				     dom->vf_id, (u64)iova, aligned,
+				     dom->kcoherent.base,
+				     dom->kcoherent.end);
+		return;
+	}
+
+	/* iommu_unmap has its own internal locking; no kcoherent.lock needed. */
+	(void)iommu_unmap(dom->iommu_dom, (u64)iova, aligned);
 }
 
 void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
 			       dma_addr_t iova, size_t size, void *vaddr)
 {
 	struct vfmig_kcoherent_page *kp;
+	struct vfmig_kcoherent_page found;
+	unsigned long flags;
 	size_t aligned;
 
 	if (!dom)
@@ -1504,10 +1658,10 @@ void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
 
 	aligned = ALIGN(size, PAGE_SIZE);
 
-	mutex_lock(&dom->lock);
+	spin_lock_irqsave(&dom->kcoherent.lock, flags);
 	kp = vfmig_kcoherent_find_locked(dom, (u64)iova);
 	if (!kp) {
-		mutex_unlock(&dom->lock);
+		spin_unlock_irqrestore(&dom->kcoherent.lock, flags);
 		dev_warn_ratelimited(&dom->vf_pdev->dev,
 				     "vfmig_iova: vf %u kcoherent free: no entry at IOVA 0x%llx (asked %zu); ignoring\n",
 				     dom->vf_id, (u64)iova, aligned);
@@ -1522,13 +1676,19 @@ void vfmig_iova_kcoherent_free(struct vfmig_iova_domain *dom,
 				     "vfmig_iova: vf %u kcoherent free vaddr mismatch at IOVA 0x%llx: have %p, asked %p\n",
 				     dom->vf_id, (u64)iova, kp->vaddr, vaddr);
 
-	(void)iommu_unmap(dom->iommu_dom, kp->iova, kp->len);
-	free_pages_exact(kp->vaddr, kp->len);
+	/*
+	 * Snapshot the entry and unlink it under the spinlock. The
+	 * actual iommu_unmap and free_pages_exact happen outside the
+	 * lock so they can sleep / take their own locks freely.
+	 */
+	found = *kp;
 	list_del(&kp->node);
 	dom->kcoherent.n_pages--;
-	mutex_unlock(&dom->lock);
+	spin_unlock_irqrestore(&dom->kcoherent.lock, flags);
 
 	kfree(kp);
+	(void)iommu_unmap(dom->iommu_dom, found.iova, found.len);
+	free_pages_exact(found.vaddr, found.len);
 }
 
 /* -------- transient arena ----------------------------------------------- */
