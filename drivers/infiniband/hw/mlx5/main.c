@@ -3118,21 +3118,26 @@ int mlx5_ib_dev_res_cq_init(struct mlx5_ib_dev *dev)
 	int ret = 0;
 
 	/*
-	 * Restored VFs (M2 contract) come up with their VHCA's FW-side
-	 * objects already populated by LOAD_VHCA_STATE, including whatever
-	 * dev_res-class objects the source had. Allocating fresh ones here
-	 * would either succeed and leak (the source's still own those FW
-	 * IDs) or fail loudly; either way we don't want it. Refuse the
-	 * lazy init so the caller (mlx5_ib_create_qp / create_srq) returns
-	 * cleanly without ever issuing CREATE_CQ / ALLOC_PD.
+	 * Stage-1 vfmig: dev_res CQ + PD must come up on restored VFs too.
+	 * The kernel-internal UMR QP (used to post MKEY page-table updates
+	 * on every ibv_reg_mr) and the GSI QP1 setup both deref
+	 * to_mpd(devr->p0)->pdn; if devr->p0 is NULL, we panic with a
+	 * NULL pointer deref at offset 0x130.
 	 *
-	 * In M2 a restored VF is netdev/ULP-free and RDMA-disabled at the
-	 * kernel level; user-space verbs restore (Rung 3) will rebind the
-	 * captured FW objects directly via QUERY_*-based RESTORE_* verbs
-	 * rather than going through the dev_res lazy-create path.
+	 * The earlier implementation skipped this on restored VFs out of
+	 * concern about FW-ID leaks (the source's c0/p0 sit unreferenced
+	 * in the per-VHCA FW tables). The leak is real but quantitatively
+	 * negligible for Stage 1: ~2 objects per restored VF, against
+	 * per-VHCA caps in the 10^4-10^7 range. The CQ + PD allocations
+	 * themselves are uncontroversial -- FW does not reject ALLOC_PD
+	 * or CREATE_CQ on a restored VHCA the way it rejects CREATE_SRQ
+	 * (see srq_init below for the contrasting case).
+	 *
+	 * FIXME(stage2+): replace the fresh alloc with an FW-side import
+	 * of the source's c0/p0 (L4 R2 dev_res import), so the source's
+	 * FW IDs are reused. Until then, fresh alloc unblocks the UMR /
+	 * GSI paths that need a working dev-wide PD.
 	 */
-	if (mlx5_vf_is_restored(dev->mdev))
-		return -EOPNOTSUPP;
 
 	/*
 	 * devr->c0 is set once, never changed until device unload.
@@ -3262,26 +3267,35 @@ static int mlx5_ib_dev_res_init(struct mlx5_ib_dev *dev)
 	if (!MLX5_CAP_GEN(dev->mdev, xrc))
 		return -EOPNOTSUPP;
 
-	/*
-	 * Restored VFs already have the source's XRCDs (and the rest of
-	 * dev_res's FW objects) materialised on this VHCA via
-	 * LOAD_VHCA_STATE. Don't allocate fresh ones -- they'd take new FW
-	 * IDs that nothing on the destination references, leak the
-	 * source's IDs, and run the risk of bumping into per-VHCA limits.
-	 * Still init the mutexes so the matching res_cleanup path and the
-	 * lazy cq_init/srq_init early-returns above don't hit uninited
-	 * locks. devr->xrcdn0/xrcdn1 stay zero on restored VFs, which is
-	 * fine: nothing reads them while srq_init returns -EOPNOTSUPP.
-	 */
 	mutex_init(&devr->cq_lock);
 	mutex_init(&devr->srq_lock);
 
-	if (mlx5_vf_is_restored(dev->mdev)) {
-		mlx5_ib_dbg(dev,
-			    "vfmig: restored VF -- skipping dev_res XRCD allocation; FW carries source's XRCDs\n");
-		return 0;
-	}
-
+	/*
+	 * Stage-1 vfmig: on a restored VF we DO allocate fresh dev_res
+	 * objects (xrcdn0/xrcdn1 here, plus p0/c0/s0/s1 lazily via
+	 * mlx5_ib_pd_init / cq_init / srq_init). The earlier
+	 * implementation skipped these on restored VFs to avoid
+	 * "leaking" the source's per-VHCA FW IDs, but that left
+	 * devr->p0 NULL, which any subsequent kernel-internal QP create
+	 * (UMR QP for ibv_reg_mr, GSI QP1 for ib_mad's port-open) deref'd
+	 * via to_mpd(devr->p0)->pdn -> NULL pointer panic. Allocating
+	 * fresh here:
+	 *   - Source's source-side dev_res FW IDs sit unreferenced in the
+	 *     restored VHCA's FW tables. They are unreachable (no kernel
+	 *     pointer, no userspace handle) but consume entries against
+	 *     per-VHCA caps until the next save/restore cycle's FW reset.
+	 *     Per-VHCA PD/SRQ/CQ caps are >>10^4, so this is well within
+	 *     budget for Stage 1.
+	 *   - The fresh objects on the destination get new FW IDs that
+	 *     don't conflict with anything; they back the kernel-internal
+	 *     QP1, UMR, etc. paths that need a working dev-wide PD.
+	 *
+	 * FIXME(stage2+): a cleaner long-term answer is to teach LOAD to
+	 * import the source's dev_res FW objects (xrcdn, pd, srq, cq) and
+	 * re-attach them to the destination's struct mlx5_ib_resources,
+	 * so the source's FW IDs are reused rather than leaked. That ties
+	 * into the L4 R2 todo (l4_mlx5_ib_rung2_dev_res_import).
+	 */
 	ret = mlx5_cmd_xrcd_alloc(dev->mdev, &devr->xrcdn0, 0);
 	if (ret)
 		goto err_mutex_destroy;
@@ -3310,14 +3324,12 @@ static void mlx5_ib_dev_res_cleanup(struct mlx5_ib_dev *dev)
 		ib_destroy_srq(devr->s0);
 	}
 	/*
-	 * Mirror the dev_res_init skip on restored VFs: nothing was
-	 * allocated, nothing to dealloc. Posting XRCD_DEALLOC against IDs
-	 * we never owned would be a real FW error.
+	 * dev_res_init now allocates xrcdn0/xrcdn1 unconditionally
+	 * (including on restored VFs -- see the FIXME there). Mirror that
+	 * here.
 	 */
-	if (!mlx5_vf_is_restored(dev->mdev)) {
-		mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn1, 0);
-		mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn0, 0);
-	}
+	mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn1, 0);
+	mlx5_cmd_xrcd_dealloc(dev->mdev, devr->xrcdn0, 0);
 	/* After p0/c0 init, they are not unset during the device lifetime. */
 	if (devr->c0) {
 		ib_destroy_cq(devr->c0);

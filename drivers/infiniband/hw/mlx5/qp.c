@@ -2518,11 +2518,27 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		MLX5_SET(qpc, qpc, xrcd, devr->xrcdn0);
 		MLX5_SET(qpc, qpc, srqn_rmpn_xrqn,
 			 to_msrq(attr->srq)->msrq.srqn);
-	} else {
+	} else if (devr->s1) {
 		MLX5_SET(qpc, qpc, xrcd, devr->xrcdn1);
 		MLX5_SET(qpc, qpc, srqn_rmpn_xrqn,
 			 to_msrq(devr->s1)->msrq.srqn);
 	}
+	/*
+	 * else: dev_res's default XRC SRQ has not been lazy-initialised
+	 * (no XRC-class / GSI QP has triggered mlx5_ib_dev_res_srq_init()
+	 * yet on this device, or this is a restored VF where srq_init
+	 * intentionally stays gated -- see main.c). FW does not consume
+	 * qpc.xrcd or qpc.srqn_rmpn_xrqn for non-XRC kernel QPs that
+	 * don't reference an SRQ (e.g. the UMR QP), so leaving these
+	 * fields zero is correct. Without this gate
+	 * to_msrq(devr->s1) NULL-derefs in create_kernel_qp() the very
+	 * first time mlx5_ib_reg_user_mr() lazily creates the UMR QP on
+	 * a restored VF.
+	 *
+	 * Mirrors the same gate already present in the XRC-tgt path
+	 * above; kept structurally identical so future audits see the
+	 * pattern in both branches.
+	 */
 
 	if (attr->send_cq)
 		MLX5_SET(qpc, qpc, cqn_snd, to_mcq(attr->send_cq)->mcq.cqn);

@@ -736,6 +736,17 @@ void vfmig_iova_kcoherent_unmap_phys(struct vfmig_iova_domain *dom,
 unsigned long vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom);
 
 /*
+ * Diagnostic counter: number of times vfmig_iova_alloc_slot() has
+ * routed a runtime kernel allocation to the kcoherent sub-arena
+ * because the requested migration-tracked slot's cursor walked past
+ * the source's recorded footprint (drift_armed && expected_count > 0
+ * MISS branch). Non-zero on any restored VF that grew past the
+ * source's per-slot HWM. Read with READ_ONCE / atomic_long_read; no
+ * locking needed.
+ */
+unsigned long vfmig_iova_kcoherent_fallback_hits(struct vfmig_iova_domain *dom);
+
+/*
  * Acquire one DMA-coherent region from the per-VF domain's pre-mapped
  * transient arena.
  *
@@ -938,6 +949,8 @@ vfmig_iova_kcoherent_unmap_phys(struct vfmig_iova_domain *dom,
 				dma_addr_t iova, size_t len) { }
 static inline unsigned long
 vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom) { return 0; }
+static inline unsigned long
+vfmig_iova_kcoherent_fallback_hits(struct vfmig_iova_domain *dom) { return 0; }
 static inline void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom) { }
 static inline void
 vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom) { }

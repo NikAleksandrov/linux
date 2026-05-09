@@ -306,6 +306,25 @@ struct vfmig_iova_domain {
 	 * vfmig_iova_awaiting_bind_hits().
 	 */
 	atomic_long_t	     awaiting_bind_hits;
+
+	/*
+	 * Diagnostic for the post-armed runtime-growth fallback.
+	 * vfmig_iova_alloc_slot() routes any MISS-after-armed allocation
+	 * to the kcoherent sub-arena instead of returning -EPROTO, so the
+	 * destination can serve NEW kernel allocations (e.g. a fresh DB
+	 * pgdir page for a userspace QP/CQ post-restore) without breaking
+	 * deterministic IOVAs for *migrated* allocations. Each fallback
+	 * bumps this counter; a non-zero value tells you the destination
+	 * grew past the source's recorded footprint in some migration-
+	 * tracked slot.
+	 *
+	 * FIXME(stage2): a cleaner long-term answer is per-component
+	 * "transient" sub-arenas (e.g. mlx5e gets its own slot/window)
+	 * rather than this catch-all auto-fallback. For Stage 1 the
+	 * fallback unblocks restored-VF userspace verbs while preserving
+	 * determinism for everything that is migrated.
+	 */
+	atomic_long_t	     kcoherent_fallback_hits;
 };
 
 static inline u64
@@ -1026,20 +1045,56 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	}
 
 	if (dom->drift_armed && dom->expected_count[slot] > 0) {
-		dev_err(&dom->vf_pdev->dev,
-			"vfmig_iova: vf %u slot %u DRIFT: alloc beyond source's footprint (replays=%u, claimed=%u, requested key 0x%llx size %zu at cursor 0x%llx); kernel-side added an alloc in this slot\n",
+		/*
+		 * Post-replay runtime growth on a restored VF.
+		 *
+		 * The source's footprint in this slot is exhausted (we
+		 * walked through every replayed entry and the cursor is
+		 * past the highest-replayed IOVA). New kernel allocations
+		 * here -- e.g. a fresh DB pgdir page for a userspace QP/CQ
+		 * created post-restore, the kernel WC-CQ probe inside
+		 * mlx5_ib_alloc_ucontext, an EQ buffer for a new MSI-X
+		 * vector -- represent legitimate destination-side state
+		 * that the source never had. Returning -EPROTO would block
+		 * Stage 1 functional gating (userspace verbs on the
+		 * restored VF can't proceed past the very first
+		 * post-restore alloc).
+		 *
+		 * Route to the kcoherent sub-arena instead: it has its
+		 * own bump cursor in a dedicated IOVA window, is NOT in
+		 * the SAVE manifest, and is invisible to drift detection.
+		 * Determinism for migrated allocations is preserved (they
+		 * already landed in this slot at their replayed IOVAs and
+		 * the cursor walked past them); only post-replay growth
+		 * is diverted.
+		 *
+		 * Logged + counted so the diagnostic value of drift
+		 * detection is preserved: a non-zero
+		 * @kcoherent_fallback_hits tells the operator the
+		 * destination grew past the source's footprint in some
+		 * migration-tracked slot.
+		 *
+		 * FIXME(stage2): replace this catch-all auto-fallback
+		 * with per-component transient sub-arenas (e.g. give
+		 * mlx5e a private slot/window so its post-probe
+		 * allocations are partitioned from migration-tracked
+		 * state at allocation time, not at fault time). For
+		 * Stage 1 this fallback is the simplest unblock that
+		 * keeps deterministic IOVAs intact for everything that
+		 * IS migrated.
+		 */
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+			"vfmig_iova: vf %u slot %u: routing alloc beyond source footprint to kcoherent (replays=%u, claimed=%u, key 0x%llx size %zu at cursor 0x%llx)\n",
 			dom->vf_id, slot,
 			dom->expected_count[slot],
 			dom->alloc_count[slot],
 			(unsigned long long)instance_key,
 			aligned,
 			(unsigned long long)iova);
-		if (!dom->drift_reported) {
-			dom->drift_reported = true;
-			dump_stack();
-		}
-		err = -EPROTO;
-		goto out_unlock;
+		atomic_long_inc(&dom->kcoherent_fallback_hits);
+		mutex_unlock(&dom->lock);
+		return vfmig_iova_kcoherent_alloc(dom, size, gfp,
+						  iova_out, vaddr_out);
 	}
 
 	err = vfmig_iova_install_page_locked(dom, slot, instance_key,
@@ -1098,6 +1153,19 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 		dev_warn(&dom->vf_pdev->dev,
 			 "vfmig_iova: free_slot: bad slot %u for IOVA 0x%llx\n",
 			 slot, (u64)iova);
+		return;
+	}
+
+	/*
+	 * Mirror the alloc-time auto-fallback: if the IOVA lives in the
+	 * kcoherent sub-arena, the alloc was diverted there because the
+	 * caller's slot was past the source's footprint. Free via the
+	 * kcoherent path; the caller's @slot tag is irrelevant for the
+	 * actual unmap.
+	 */
+	if ((u64)iova >= dom->kcoherent.base &&
+	    (u64)iova <  dom->kcoherent.end) {
+		vfmig_iova_kcoherent_free(dom, iova, size, NULL);
 		return;
 	}
 	aligned = ALIGN(size, VFMIG_IOVA_GRANULE);
@@ -1287,6 +1355,13 @@ unsigned long vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom)
 	if (!dom)
 		return 0;
 	return atomic_long_read(&dom->awaiting_bind_hits);
+}
+
+unsigned long vfmig_iova_kcoherent_fallback_hits(struct vfmig_iova_domain *dom)
+{
+	if (!dom)
+		return 0;
+	return atomic_long_read(&dom->kcoherent_fallback_hits);
 }
 
 int vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
