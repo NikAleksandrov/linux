@@ -215,6 +215,24 @@ struct vfmig_iova_domain {
 	u32		     vf_id;
 
 	/*
+	 * Set by vfmig_iova_domain_detach_dev() once the iommu_dom has
+	 * been detached from @vf_pdev and the dma_ops shim removed.
+	 * Guards vfmig_iova_domain_destroy() from doing the detach a
+	 * second time. The split exists because the iommu_dom attach
+	 * MUST be torn down before pci_disable_sriov() fires device_del
+	 * on the VF (otherwise the iommu core's BUS_NOTIFY_REMOVED_DEVICE
+	 * notifier WARNs at drivers/iommu/iommu.c:715 -- the per-VF group
+	 * goes empty while still holding our unmanaged domain instead of
+	 * the default), but the rest of the domain teardown (page-list
+	 * drain, kcoherent drain, kfree) must run AFTER pci_disable_sriov
+	 * returns because per-VF mlx5_core remove_one paths free DMA
+	 * mappings through vfmig_iova_free_slot() which still derefs
+	 * @dom. Splitting "detach iommu/dma_ops" from "destroy domain"
+	 * lets both invariants hold.
+	 */
+	bool		     dev_detached;
+
+	/*
 	 * Per-VF IOVA window. The full hardware-visible range is
 	 * [base, base + VFMIG_IOVA_PER_VF). The first
 	 *   VFMIG_IOVA_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES
@@ -881,6 +899,58 @@ static void vfmig_kcoherent_drain(struct vfmig_iova_domain *dom)
 	a->n_pages = 0;
 }
 
+/*
+ * Detach the per-VF iommu_dom and dma_ops shim from the VF's PCI device.
+ * Leaves the domain struct (page list, kcoherent arena, transient slots,
+ * iommu_dom pointer) intact so vfmig_iova_free_slot() / kcoherent_free()
+ * still work for any teardown DMA calls that race after the iommu detach.
+ * Idempotent: a second call is a no-op.
+ *
+ * Required call ordering for the SR-IOV teardown path:
+ *
+ *   pci_disable_sriov(pf_pdev)             // tears down each VF:
+ *     for each vf:
+ *       device_release_driver(vf)
+ *         mlx5_core remove_one(vf)
+ *           ... FW commands, EQ drain, DMA frees ...
+ *           [HOOK] vfmig_iova_domain_detach_dev(dom_for_this_vf)
+ *       pci_remove_bus_device(vf)
+ *         device_del(vf)
+ *           iommu core BUS_NOTIFY_REMOVED_DEVICE notifier      <-- no WARN
+ *   mlx5_vfmig_pf_drop_iova_domains(pf)    // frees the domain structs
+ *     for each dom:
+ *       vfmig_iova_domain_destroy(dom)     // drain pages, kcoherent,
+ *                                          //   skip detach (already done)
+ */
+void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom)
+{
+	struct pci_dev *vf_pdev;
+
+	if (!dom || dom->dev_detached)
+		return;
+
+	vf_pdev = dom->vf_pdev;
+	if (!vf_pdev)
+		return;
+
+	/*
+	 * Reverse of domain_create: undo dma_ops first so any racing
+	 * DMA path routes through the default dma-iommu shim before we
+	 * tear down the iommu_domain it depends on. Caller contract is
+	 * that no in-flight FW DMA is outstanding by the time we get
+	 * here -- on the SR-IOV teardown path this is guaranteed because
+	 * we're called from mlx5_core remove_one's tail, after
+	 * mlx5_pci_close() has drained the cmd ring + EQs.
+	 */
+	vfmig_dma_ops_detach(vf_pdev);
+	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
+	dom->dev_detached = true;
+
+	dev_info(&vf_pdev->dev,
+		 "vfmig_iova: vf %u domain detached from device (struct kept for cleanup)\n",
+		 dom->vf_id);
+}
+
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 {
 	struct vfmig_iova_page *p, *tmp;
@@ -914,9 +984,18 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 		 * unbound by caller contract -- but be safe) routes
 		 * through the default dma-iommu shim before we tear
 		 * down the iommu_domain it depends on.
+		 *
+		 * If the caller already invoked vfmig_iova_domain_detach_dev()
+		 * during the VF's mlx5_core remove_one (the recommended
+		 * teardown ordering, see comment on @dev_detached) then
+		 * this is a no-op and we go straight to iommu_domain_free()
+		 * + kfree.
 		 */
-		vfmig_dma_ops_detach(vf_pdev);
-		iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
+		if (!dom->dev_detached) {
+			vfmig_dma_ops_detach(vf_pdev);
+			iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
+			dom->dev_detached = true;
+		}
 		dev_info(&vf_pdev->dev,
 			 "vfmig_iova: vf %u domain detached and freed\n",
 			 dom->vf_id);

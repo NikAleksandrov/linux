@@ -109,6 +109,18 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * VF-side helper: detach this VF's vfmig_iova_dom from its PCI device
+ * (iommu_dom + dma_ops shim) without freeing the domain struct itself.
+ * Idempotent; no-op on PFs, untracked VFs, and orphaned VFs whose PF
+ * has gone away. Intended call site is the VF's mlx5_core remove_one()
+ * tail, run after mlx5_pci_close() has drained all FW DMA and before
+ * pci_disable_sriov()'s device_del() fires the iommu core's notifier.
+ * The matching domain struct is freed later by
+ * mlx5_vfmig_pf_drop_iova_domains() at the end of mlx5_sriov_disable().
+ */
+void mlx5_vfmig_vf_detach_iova_domain(struct mlx5_core_dev *vf_mdev);
+
+/*
  * Returns true iff @dev is a VF and its PF has marked it as restored.
  * Safe to call unconditionally on any mlx5_core_dev. Internally takes
  * and releases mlx5_vf_get_core_dev() / mlx5_vf_put_core_dev() on the
@@ -257,6 +269,7 @@ static inline int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev) { return 0;
 static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev) { }
+static inline void mlx5_vfmig_vf_detach_iova_domain(struct mlx5_core_dev *vf_mdev) { }
 static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev,
 						  u16 *vhca_id_out)
 {

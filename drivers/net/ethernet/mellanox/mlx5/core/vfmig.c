@@ -3460,6 +3460,58 @@ mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev)
 	return dom;
 }
 
+/*
+ * Detach the per-VF vfmig_iova_domain from this VF's PCI device.
+ * Called from mlx5_core remove_one() for VFs so the iommu attachment
+ * is gone before pci_disable_sriov() fires device_del. See the comment
+ * on vfmig_iova_domain_detach_dev() for the WARN this avoids.
+ *
+ * No-op on PFs, on untracked VFs, on a VF whose PF has gone away, and
+ * on a domain that's already been detached. The domain struct itself
+ * remains in vfs_ctx[vf_id].vfmig_iova_dom and is freed later by
+ * vfmig_pf_drop_iova_domains_locked() at the end of mlx5_sriov_disable.
+ */
+void mlx5_vfmig_vf_detach_iova_domain(struct mlx5_core_dev *vf_mdev)
+{
+	struct pci_dev *vf_pdev;
+	struct mlx5_core_dev *pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	struct vfmig_iova_domain *dom;
+	int vf_id;
+
+	if (!vf_mdev)
+		return;
+	vf_pdev = vf_mdev->pdev;
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return;
+
+	vf_id = pci_iov_vf_id(vf_pdev);
+	if (vf_id < 0)
+		return;
+
+	pf_mdev = mlx5_vf_get_core_dev(vf_pdev);
+	if (!pf_mdev)
+		return;
+
+	sriov = &pf_mdev->priv.sriov;
+	dom = NULL;
+	if (sriov->vfs_ctx && vf_id < sriov->num_vfs)
+		dom = sriov->vfs_ctx[vf_id].vfmig_iova_dom;
+
+	/*
+	 * The detach itself can sleep (iommu_detach_device may take an
+	 * iommu group mutex), so we don't hold any vfmig locks while
+	 * doing it. The dom pointer is stable for the duration of this
+	 * call because vfmig_pf_drop_iova_domains_locked() only runs
+	 * after pci_disable_sriov() returns, which is well after this
+	 * hook in remove_one() has completed.
+	 */
+	mlx5_vf_put_core_dev(pf_mdev);
+
+	if (dom)
+		vfmig_iova_domain_detach_dev(dom);
+}
+
 bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev, u16 *vhca_id_out)
 {
 	struct pci_dev *vf_pdev = dev->pdev;

@@ -2232,6 +2232,25 @@ static void remove_one(struct pci_dev *pdev)
 	mlx5_sriov_disable(pdev, false);
 	mlx5_uninit_one(dev);
 	mlx5_pci_close(dev);
+	/*
+	 * Detach the per-VF vfmig_iova_dom from its PCI device now, after
+	 * FW DMA has drained via mlx5_pci_close() and before
+	 * pci_disable_sriov()'s subsequent device_del() fires the iommu
+	 * core's BUS_NOTIFY_REMOVED_DEVICE notifier; otherwise that
+	 * notifier WARNs at drivers/iommu/iommu.c:715 because the per-VF
+	 * iommu_group becomes empty while still holding our unmanaged
+	 * paging domain.
+	 *
+	 * The helper internally short-circuits to a no-op for PFs and
+	 * for VFs that have no vfmig_iova_dom attached, so it's safe
+	 * (and cheap) to call unconditionally from this generic
+	 * remove_one() path -- same convention as mlx5_sriov_disable()
+	 * above and mlx5_vfmig_vf_consume_restored() at probe time. The
+	 * domain struct itself is freed later by the PF's
+	 * mlx5_vfmig_pf_drop_iova_domains() at the end of
+	 * mlx5_sriov_disable().
+	 */
+	mlx5_vfmig_vf_detach_iova_domain(dev);
 	mlx5_mdev_uninit(dev);
 	mlx5_adev_idx_free(dev->priv.adev_idx);
 	mlx5_devlink_free(devlink);

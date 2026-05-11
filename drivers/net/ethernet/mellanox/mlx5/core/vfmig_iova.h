@@ -461,6 +461,21 @@ int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
 
 /*
+ * Early-detach helper: tears down the iommu_dom attachment to the VF
+ * PCI device and removes the per-VF dma_ops shim, but keeps the
+ * vfmig_iova_domain struct alive for later teardown via
+ * vfmig_iova_domain_destroy(). Idempotent.
+ *
+ * Use this from the VF's mlx5_core remove_one() tail so the iommu
+ * attachment is gone before pci_disable_sriov() fires device_del on
+ * the VF -- otherwise the iommu core's BUS_NOTIFY_REMOVED_DEVICE
+ * notifier WARNs ("group->owner_cnt || group->domain != group->default_domain")
+ * because the per-VF iommu_group goes empty while still holding our
+ * unmanaged paging domain.
+ */
+void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom);
+
+/*
  * Lookup-or-allocate a deterministic DMA-coherent region in @dom from
  * the IOVA sub-window owned by @slot.
  *
@@ -886,6 +901,7 @@ static inline int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	return -EOPNOTSUPP;
 }
 static inline void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom) { }
+static inline void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom) { }
 static inline int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 					enum vfmig_iova_slot slot,
 					u64 instance_key,
