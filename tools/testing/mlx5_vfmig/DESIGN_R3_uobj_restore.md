@@ -31,7 +31,7 @@ end-to-end correctness, not initial scaffolding.
 
 | # | ask | where | priority | size |
 |---|---|---|---|---|
-| K1 | Add `RDMA_NLDEV_ATTR_RES_CTXN` emission in `fill_res_qp_entry`, `fill_res_mr_entry`, `fill_res_srq_entry`, `fill_res_cm_id_entry` (PD/CQ already emit) | §6.1 | high | one line per fn |
+| K1 | Add `RDMA_NLDEV_ATTR_RES_CTXN` emission in `fill_res_qp_entry`, `fill_res_mr_entry`, `fill_res_srq_entry`, `fill_res_cm_id_entry` (PD/CQ already emit). **Not v0-blocking**: CRIU joins QP/MR/SRQ to ctxn through PDN against the PD inventory (PD entries do emit CTXN). K1 makes discovery one-hop instead of two-hop and removes the "PD must be enumerated first" implicit ordering. CM_ID has neither PDN nor CTXN today, so K1 is also the only path to CM_ID identity preservation in any future-CM_ID-restore work | §6.1 | low (cleanup) | one line per fn |
 | K2 | New generic uverbs method `UVERBS_METHOD_INFO_LIST_UOBJS(type)` that walks `ufile->uobjects` filtered by type and returns `[{handle, ...}]` (covers AH and any future non-restracked uobject) | §6.2 | high | small new ioctl |
 | K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT_FILE`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new hw-agnostic `IB_UCONTEXT_RESTORE_MODE` ucontext flag, which mlx5_vfmig sets when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` and rxe sets when opened with the corresponding rxe restore-mode flag. Generic verb checks the hw-agnostic flag only | §7.1, §7.2 | high | medium per type |
 | K4 | `ib_device_ops` extended with `restore_pd`, `restore_cq`, `restore_qp`, `restore_mr`, `restore_srq`, `restore_ah`, `restore_comp_channel`, `restore_async_event_file`. mlx5_vfmig populates these via `ib_set_device_ops()` when transitioning a VF into VFMIG_RESTORE state. rxe populates statically | §7.3 | high | one ops vector + per-driver impl |
@@ -39,9 +39,10 @@ end-to-end correctness, not initial scaffolding.
 | K6 | (deferred to follow-on) FW-identity-continuity verification: empirical study, mirroring `DESIGN_uar_restore.md` §3, for whether `LOAD_VHCA_STATE` preserves PD/CQ/QP/SRQ/MKEY id reservations cross-host. Drives whether mlx5 needs explicit "pre-reserve id N" verbs or just-trusts-LOAD as for UARs | §10 | medium | empirical experiment |
 | K7 | (optional, stretch) Add restrack entries for AH (`RDMA_RESTRACK_AH`). If we land K2, this is unnecessary -- but adding it later is cheap if K2 ends up not landing | §6.2 | low | optional |
 
-Item K1, K2, K3, K4 together unblock R3 v0 end-to-end correctness. K5 is
-already done. K6 is investigation that may or may not result in an additional
-kernel ask, depending on outcome.
+**Items K2, K3, K4** together unblock R3 v0 end-to-end correctness. K1 is
+not v0-blocking (PDN-join workaround in CRIU userspace, see §6.1 detail);
+land it as cleanup. K5 is already done. K6 is investigation that may or
+may not result in an additional kernel ask, depending on outcome.
 
 ## 1. Goal and scope
 
@@ -195,7 +196,9 @@ CTXN on PD/CQ/CTX), and pid + kernel-name.
 
 What NLDEV doesn't cover today, that R3 needs:
 
-* CTXN on QP/MR/SRQ/CM_ID (currently only on PD/CQ/CTX). K1.
+* CTXN on QP/MR/SRQ/CM_ID (currently only on PD/CQ/CTX). K1 -- not
+  v0-blocking; PDN-join is the v0 workaround for QP/MR/SRQ. CM_ID has
+  no PDN and is out of v0 scope.
 * AH at all (no `RDMA_RESTRACK_AH`). Solved by K2 instead.
 * MW/FLOW/XRCD/DM/DEVX (deferred per §1.3).
 * Driver-private FW state per uobject (FW pdn, mkey, etc.). Solved by
@@ -210,8 +213,9 @@ backing ibdev.
 
 For comp channel fds and async event fds, the same ctxn is exposed via
 the same fdinfo mechanism (already landed). So discovery is purely:
-walk fdinfo -> get ctxn per fd -> NLDEV query (filter by ctxn for K1
-types) + LIST_UOBJS query (for AH and other non-restracked types) ->
+walk fdinfo -> get ctxn per fd -> NLDEV per-resource walk (filter by
+ctxn directly for PD/CQ; join via PDN for QP/MR/SRQ; K1 makes this
+uniform) + LIST_UOBJS query (for AH and other non-restracked types) ->
 compose DAG.
 
 ## 3. Empirical foundation
@@ -255,10 +259,13 @@ compose DAG.
 
 Three surfaces, used additively per uobject type:
 
-1. **NLDEV CTXN-filtered walk** (after K1) for PD/CQ/QP/MR/SRQ/CM_ID. CRIU
-   userspace iterates `RDMA_NLDEV_CMD_RES_<TYPE>_GET` filtered by ibdev,
-   then by ctxn (from fdinfo). Yields per-uobject hw-agnostic attrs and
-   xref edges (PDN-of-QP, CQN-of-QP, ...).
+1. **NLDEV per-resource walk + ctxn join** for PD/CQ/QP/MR/SRQ. CRIU
+   userspace iterates `RDMA_NLDEV_CMD_RES_<TYPE>_GET` per ibdev. PD and
+   CQ entries already emit CTXN; QP/MR/SRQ entries emit PDN, so CRIU
+   joins through the PD inventory (PD restrack id -> ctxn) to recover
+   the owning ucontext. K1 (when it lands) collapses this to a one-hop
+   filter; until then the join works for v0 because every user-mode
+   QP/MR/SRQ has a parent PD that's also in the inventory.
 2. **Generic uverbs `LIST_UOBJS(type)`** (K2) for AH and any other type
    not in NLDEV. Walks `ufile->uobjects` filtered by type, returns
    `[{handle, ...}]`.
@@ -552,8 +559,9 @@ plugin contribution.
 
 ### 5.3 QP
 
-* **Discovery**: NLDEV `RES_QP_GET` (needs CTXN emission per K1). Yields
-  type, port, qp_state, src/dst PSN, src/dst QPN. Hw-agnostic `ib_qp_attr`
+* **Discovery**: NLDEV `RES_QP_GET`, ctxn derived via PDN-join against
+  the PD inventory (one-hop after K1). Yields type, port, qp_state,
+  src/dst PSN, src/dst QPN. Hw-agnostic `ib_qp_attr`
   fields not in NLDEV are recoverable via `IB_USER_VERBS_CMD_QUERY_QP`
   (existing uverbs command, no kernel change needed). Plugin adds FW qpn
   context via `MLX5_IB_METHOD_VFMIG_QUERY_QP(handle)` returning
@@ -573,8 +581,9 @@ plugin contribution.
 
 ### 5.4 MR
 
-* **Discovery**: NLDEV `RES_MR_GET` (needs CTXN emission per K1). Yields
-  MRLEN, RKEY/LKEY (with CAP_NET_ADMIN). Other fields (virt_addr,
+* **Discovery**: NLDEV `RES_MR_GET`, ctxn derived via PDN-join (one-hop
+  after K1). Yields MRLEN, RKEY/LKEY (with CAP_NET_ADMIN). Other fields
+  (virt_addr,
   access_flags, iova) recoverable via uverbs query path. Plugin adds FW
   mkey context via `MLX5_IB_METHOD_VFMIG_QUERY_MR(handle)`.
 * **Xref**: PD (XR_PARENT_PD).
@@ -593,8 +602,9 @@ plugin contribution.
 
 ### 5.5 SRQ
 
-* **Discovery**: NLDEV `RES_SRQ_GET` (needs CTXN per K1). Yields type
-  (BASIC/XRC), max_wr/max_sge. Plugin adds FW srqn + buffer map.
+* **Discovery**: NLDEV `RES_SRQ_GET`, ctxn derived via PDN-join (one-hop
+  after K1). Yields type (BASIC/XRC), max_wr/max_sge. Plugin adds FW
+  srqn + buffer map.
 * **Xref**: PD (XR_PARENT_PD), optionally CQ (XR_SRQ has a CQ in some
   paths; check at impl time).
 * **Restore order**: after PD, CQ.
@@ -765,9 +775,9 @@ the flag is supplied -- e.g. install GIDs at the requested indices via
 the netlink RDMA_NLDEV_CMD_SYS_SET command path. SHAREABLE plugins (rxe)
 trust the orchestrator and only validate.
 
-## 7. Driver-side changes (kernel asks K1-K4)
+## 7. Driver-side changes (kernel asks K2-K4 for v0 + K1 cleanup)
 
-### 7.1 K1: NLDEV CTXN emission completeness
+### 7.1 K1: NLDEV CTXN emission completeness (cleanup, not v0-blocking)
 
 ```diff
  static int fill_res_qp_entry(...) {
@@ -782,6 +792,12 @@ trust the orchestrator and only validate.
      ...
  }
 ```
+
+Without K1, CRIU joins QP/MR/SRQ to ctxn through their PDN against the
+PD inventory it already gets with CTXN. The join is correct for v0 (every
+user-mode QP/MR/SRQ has a parent PD that's in the same inventory), so
+this is a cleanup not a blocker. K1 land order is independent of the
+rest of R3.
 
 Same shape for `fill_res_mr_entry`, `fill_res_srq_entry`,
 `fill_res_cm_id_entry`. Mirrors the existing PD / CQ emitters at
@@ -1008,8 +1024,7 @@ config, ...) is the orchestrator's responsibility.
   CRIU-side commit set.**
 * **S2: PD restore on rxe**. Implement K3 PD method + rxe restore_pd
   callback. `run_uverbs_cr.sh` flips to PASS for the PD round-trip.
-  K1 CTXN extension lands alongside (rxe doesn't need it for PD since
-  PD already emits CTXN, but lands here for forward use).
+  K1 is independent of this stage and can land any time as cleanup.
 * **S3: PD restore on mlx5_vfmig**. Implement mlx5 restore_pd. K6
   empirical experiment runs; outcome dictates whether restore_pd needs
   pdn pre-reserve plumbing.
