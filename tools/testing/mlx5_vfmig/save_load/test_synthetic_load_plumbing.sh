@@ -14,18 +14,21 @@
 #     will reject them ("LOAD_VHCA_STATE ... failed" expected). That's
 #     fine: we are testing the *kernel-side* plumbing in isolation.
 #
-# Usage: sudo PF=0000:00:08.0 ./test_m2_synth.sh
+# Usage: sudo PF=0000:00:08.0 ./test_synthetic_load_plumbing.sh
 
 set -euxo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR/.."
+
 PF=${PF:-0000:00:08.0}
-TOOL=${TOOL:-./mlx5_vfmig}
-SYNTH=${SYNTH:-./mlx5_vfmig_synth}
+TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
+SYNTH=${SYNTH:-$ROOT_DIR/tools/synthetic_blob_emit}
 BLOB=${BLOB:-/tmp/vf_synth.blob}
 SIZE=${SIZE:-4096}
 
-[ -x "$TOOL" ]  || { echo "build $TOOL first";  exit 1; }
-[ -x "$SYNTH" ] || { echo "build $SYNTH first"; exit 1; }
+[ -x "$TOOL" ]  || { echo "build $TOOL first: make -C $ROOT_DIR"; exit 1; }
+[ -x "$SYNTH" ] || { echo "build $SYNTH first: make -C $ROOT_DIR"; exit 1; }
 
 # 0. clean slate
 echo 0 | sudo tee /sys/bus/pci/devices/$PF/sriov_numvfs

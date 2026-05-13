@@ -233,7 +233,7 @@ enum mlx5_ib_objects {
 	/*
 	 * Verb-only namespace (no per-instance state, no IDR) for the
 	 * VFMIG (CRIU SR-IOV migration) per-ucontext save/restore verbs.
-	 * See tools/testing/mlx5_vfmig/DESIGN_uar_restore.md.
+	 * See tools/testing/mlx5_vfmig/design/uar_restore.md.
 	 */
 	MLX5_IB_OBJECT_VFMIG,
 };
@@ -378,7 +378,7 @@ enum mlx5_ib_get_data_direct_sysfs_path_attrs {
  * state was imported by SAVE_VHCA_STATE / LOAD_VHCA_STATE from the
  * source VHCA they were captured on.
  *
- * See tools/testing/mlx5_vfmig/DESIGN_uar_restore.md.
+ * See tools/testing/mlx5_vfmig/design/uar_restore.md.
  */
 enum mlx5_ib_vfmig_methods {
 	MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT = (1U << UVERBS_ID_NS_SHIFT),

@@ -13,15 +13,18 @@
 #   5. The VF probe then fails downstream with "bad system state (0x4)"
 #      because LOAD_VHCA_STATE has not been wired yet -- expected at M1'.
 #
-# Usage: sudo PF=0000:00:08.0 ./test.sh
+# Usage: sudo PF=0000:00:08.0 ./test_pf_cdev_smoke.sh
 
 set -euxo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR/.."
+
 PF=${PF:-0000:00:08.0}
-TOOL=${TOOL:-./mlx5_vfmig}
+TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
 CDEV=/dev/mlx5_vfmig/$PF
 
-[ -x "$TOOL" ] || { echo "build $TOOL first: gcc -O2 -Wall -I../../../include/uapi -o mlx5_vfmig mlx5_vfmig.c"; exit 1; }
+[ -x "$TOOL" ] || { echo "build $TOOL first: make -C $ROOT_DIR"; exit 1; }
 
 # 0. clean slate
 echo 0 | sudo tee /sys/bus/pci/devices/$PF/sriov_numvfs

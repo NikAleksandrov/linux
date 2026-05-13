@@ -205,7 +205,7 @@ struct mlx5_ib_ucontext {
 	 * set, bfregi->sys_pages[] is sentinel-filled (MLX5_IB_INVALID_UAR_INDEX)
 	 * and any UAR mmap() is refused.
 	 *
-	 * See tools/testing/mlx5_vfmig/DESIGN_uar_restore.md.
+	 * See tools/testing/mlx5_vfmig/design/uar_restore.md.
 	 */
 	bool			vfmig_restore_pending;
 };

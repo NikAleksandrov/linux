@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * mlx5_vfmig_uctx - userspace exerciser for mlx5_ib's VFMIG ucontext
- * vendor verbs. Each subcommand opens /dev/infiniband/uverbs<N>
+ * ucontext_vendor_verbs - userspace exerciser for mlx5_ib's VFMIG
+ * ucontext vendor verbs. Each subcommand opens /dev/infiniband/uverbs<N>
  * directly, bypassing libibverbs, so we can drive raw flag bits and
  * vendor methods that libmlx5 doesn't expose.
  *
@@ -49,10 +49,10 @@
  * with flag, RESTORE, QUERY, close).
  *
  * Build:
- *   cc -O2 -Wall -o mlx5_vfmig_uctx mlx5_vfmig_uctx.c
+ *   make -C tools/testing/mlx5_vfmig tools/ucontext_vendor_verbs
  *
  * Use:
- *   mlx5_vfmig_uctx alloc_uctx_with_flag mlx5_2
+ *   ucontext_vendor_verbs alloc_uctx_with_flag mlx5_2
  *
  * The <ibdev> argument is an InfiniBand device name as listed in
  * /sys/class/infiniband, e.g. "mlx5_2".
@@ -1008,7 +1008,7 @@ out:
 
 /*
  * On-disk format for the cross-host UCTX snapshot used by step 4 of
- * the UAR-restore plan (test_m2r_iova.sh's UCTX=1 mode).
+ * the UAR-restore plan (test_iova_tracked_save_load.sh's UCTX=1 mode).
  *
  *   [vfmig_uctx_blob_hdr]            16 bytes
  *   [mlx5_ib_vfmig_ucontext_meta]    32 bytes

@@ -5,8 +5,8 @@ restore layer that brings end-to-end RDMA workload checkpoint/restore to the
 point where `ib_write_bw` (default polling mode) round-trips intact across a
 CRIU dump+restore on a tracked + migrated VF.
 
-Builds on `DESIGN_uar_restore.md` (which delivered ucontext + UAR restore).
-Independent of, but compatible with, `DESIGN_user_mr_dma.md` (which delivers
+Builds on `uar_restore.md` (which delivered ucontext + UAR restore).
+Independent of, but compatible with, `user_mr_dma.md` (which delivers
 user-MR DMA continuity at the IOMMU layer; R3 carries identity, that doc
 carries page-backing).
 
@@ -31,8 +31,8 @@ end-to-end correctness, not initial scaffolding.
 
 | # | ask | where | priority | size |
 |---|---|---|---|---|
-| K6 | **v0 gate.** FW-identity-continuity experiment: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id reservations the way it provably does for UARs? Mirrors `DESIGN_uar_restore.md` §3. Outcome decides whether K3/K4 mlx5 handlers are a small alloc-with-hint extension (best case) or require new "pre-reserve id N" FW commands (worst case, possibly FW patch). Run this first. | §8.2, §10 | **very high** | empirical experiment + small probe ioctl |
-| K2 | **Already exists upstream as `UVERBS_METHOD_INFO_HANDLES` on `UVERBS_OBJECT_DEVICE`** (drivers/infiniband/core/uverbs_std_types_device.c). Takes a `UVERBS_ATTR_INFO_OBJECT_ID` (u16 -- accepts ANY core or driver-namespace object id via `uapi_key_obj()`), walks `ufile->uobjects` under `uobjects_lock` filtered by `obj->uapi_object`, returns `UVERBS_ATTR_INFO_HANDLES_LIST` (u32[]) and `UVERBS_ATTR_INFO_TOTAL_HANDLES` (filled count). Covers AH and every other non-restracked uobject. Drives the pre-suspend coverage check (DEVX/MW/FLOW/XRCD rejection) by enumerating those types and failing the dump if any are present. Validated end-to-end by `k2_info_handles_probe` -- see §7.2 | §6.2 | done | zero kernel work |
+| K6 | **v0 gate.** FW-identity-continuity experiment: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id reservations the way it provably does for UARs? Mirrors `uar_restore.md` §3. Outcome decides whether K3/K4 mlx5 handlers are a small alloc-with-hint extension (best case) or require new "pre-reserve id N" FW commands (worst case, possibly FW patch). Run this first. | §8.2, §10 | **very high** | empirical experiment + small probe ioctl |
+| K2 | **Already exists upstream as `UVERBS_METHOD_INFO_HANDLES` on `UVERBS_OBJECT_DEVICE`** (drivers/infiniband/core/uverbs_std_types_device.c). Takes a `UVERBS_ATTR_INFO_OBJECT_ID` (u16 -- accepts ANY core or driver-namespace object id via `uapi_key_obj()`), walks `ufile->uobjects` under `uobjects_lock` filtered by `obj->uapi_object`, returns `UVERBS_ATTR_INFO_HANDLES_LIST` (u32[]) and `UVERBS_ATTR_INFO_TOTAL_HANDLES` (filled count). Covers AH and every other non-restracked uobject. Drives the pre-suspend coverage check (DEVX/MW/FLOW/XRCD rejection) by enumerating those types and failing the dump if any are present. Validated end-to-end by `info_handles_probe` -- see §7.2 | §6.2 | done | zero kernel work |
 | K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive — XA-insert at caller-specified handle, return `-EBUSY` if taken — is already proven by the UAR restore path; this is plumbing, not new core | §7.3 | medium | reuse existing helper |
 | K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new hw-agnostic `IB_UCONTEXT_RESTORE_MODE` ucontext flag, which mlx5_vfmig sets when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` and rxe sets when opened with the corresponding rxe restore-mode flag. Generic verb checks the hw-agnostic flag only | §7.1, §7.2 | high | medium per type |
 | K4 | `ib_device_ops` extended with `restore_pd`, `restore_cq`, `restore_qp`, `restore_mr`, `restore_srq`, `restore_ah`, `restore_comp_channel`, `restore_async_event`. Each driver installs its restore-mode ops vector once, at VF/device **probe** time, when the device is entering VFMIG_RESTORE state (i.e. before any uverbs cdev opens against it). No mid-life ops swapping | §7.3, §7.4 | high | one ops vector + per-driver impl |
@@ -108,7 +108,7 @@ new-handle map maintained in CRIU userspace.
   full CMA-layer continuity is a follow-on.
 * **MAD agent registrations** -- mostly IB SM; not RoCE-relevant for v0.
 * **Backward compatibility** of the image format -- still in-flux while the
-  R3 schema settles. Same posture as `DESIGN_uar_restore.md`.
+  R3 schema settles. Same posture as `uar_restore.md`.
 
 ### 1.4 Topology coverage
 
@@ -157,7 +157,7 @@ Where:
 
 * **uverbs cdev fd**: the user's "handle" to a ucontext. CRIU restores this
   via the existing `RDMA_OPEN_UVERBS_CDEV` plugin hook (already shipped in
-  `DESIGN_uar_restore.md` work). The plugin returns a fd that already has
+  `uar_restore.md` work). The plugin returns a fd that already has
   `GET_CONTEXT` issued and (for vfmig) `RESTORE_UCONTEXT`/`RESTORE_DYN_UARS`
   applied. CRIU installs that fd at the user's saved fd number.
 
@@ -180,7 +180,7 @@ Within one `ib_uverbs_file`, uobjects form a DAG:
 
 * **PD** has no incoming xrefs from other uobjects (it's a root).
 * **CQ** has no incoming xrefs (root). May reference a comp channel.
-* **MR** xrefs PD. (Stage 2 of `DESIGN_user_mr_dma.md` adds an MR-on-DM
+* **MR** xrefs PD. (Stage 2 of `user_mr_dma.md` adds an MR-on-DM
   variant that xrefs DM; out of scope here.)
 * **SRQ** xrefs PD, optionally CQ.
 * **AH** xrefs PD.
@@ -229,11 +229,11 @@ compose DAG.
 
 ### 3.1 What's known to work
 
-* **UAR table preservation across LOAD_VHCA_STATE** (`DESIGN_uar_restore.md`
+* **UAR table preservation across LOAD_VHCA_STATE** (`uar_restore.md`
   §3): cross-host empirically confirmed. Source's FW UAR ids re-installable
   on destination via the new RESTORE_UCONTEXT/RESTORE_DYN_UARS verbs.
   R3 leans on the same property for the rest of the uobject ids if K6 holds.
-* **User-MR DMA on tracked VFs** (`DESIGN_user_mr_dma.md` stage 1): landed
+* **User-MR DMA on tracked VFs** (`user_mr_dma.md` stage 1): landed
   in kernel HEAD. `ibv_reg_mr` succeeds on a tracked VF without the
   `IB_WC_MW_BIND_ERR` failure mode. Means MR creation in the destination
   (during R3 restore) won't itself fail at the IOMMU layer; only the
@@ -261,7 +261,7 @@ compose DAG.
 ### 3.2 What's not yet known
 
 * **K6: cross-host preservation of PD/CQ/QP/SRQ/MR id reservations across
-  LOAD_VHCA_STATE.** Mirror the `DESIGN_uar_restore.md` §3 experiment shape:
+  LOAD_VHCA_STATE.** Mirror the `uar_restore.md` §3 experiment shape:
   on host A, allocate uobjects of each kind, log their FW ids, SAVE; on
   host B, LOAD, then probe "what's the next id FW would hand out?" via a
   PF-cdev ioctl. If next-id starts above the SAVE-time peak for a class,
@@ -472,7 +472,7 @@ Image-format notes:
   silently. Restore allocates fresh restrack ids on the destination
   ibdev; the source's are not preserved. Documented as a known
   externally-visible identity discontinuity (parallel to the wire-rkey
-  discontinuity stage 3 of `DESIGN_user_mr_dma.md` solves for MRs).
+  discontinuity stage 3 of `user_mr_dma.md` solves for MRs).
   No mitigation in v0; lifted only if a real consumer needs it.
 * `xref` edges always reference `restrack_id` (the cross-resource key).
   Restore translates `restrack_id` -> `ufile_handle` via the per-ufile
@@ -616,7 +616,7 @@ plugin contribution.
 * **Kernel verb**: `UVERBS_METHOD_RESTORE_MR(target_handle, virt_addr,
   length, access_flags, lkey_hint, rkey_hint, blob, pd_handle)`. Honours
   rkey/lkey as identity hints.
-* **Driver-side (mlx5_vfmig)**: see also `DESIGN_user_mr_dma.md` stage 3,
+* **Driver-side (mlx5_vfmig)**: see also `user_mr_dma.md` stage 3,
   which is the user-MR-DMA-side counterpart to this verb. R3 owns the
   uobject identity; user_mr_dma stage 3 owns the IOMMU-side mkey-keyed
   page binding. The two land together as a coherent per-MR restore.
@@ -715,7 +715,7 @@ For each ufile in image (in dependency-free order across ufiles):
 ```
 
 v0 ships exactly **one** plugin hook: `post_restore_mr`. It exists
-because MR restore couples with `DESIGN_user_mr_dma.md` stage 3 (rkey
+because MR restore couples with `user_mr_dma.md` stage 3 (rkey
 continuity at the IOMMU layer) -- the post-MR hook is where the plugin
 re-binds the per-MR IOVA map after the kernel verb has allocated the
 mkey. Every other class restores cleanly from the kernel verb alone in
@@ -753,12 +753,12 @@ them. Indirect evidence:
   is in user memory, which `user_mr_dma` preserves at the IOMMU layer.
 
 Direct empirical evidence (committed alongside this design --
-`MLX5_VFMIG_IOC_QUERY_QP` PF cdev ioctl + `test_k6_id_continuity.sh`
+`MLX5_VFMIG_IOC_QUERY_QP` PF cdev ioctl + `test_fw_id_continuity.sh`
 piggyback driven by `K6_POST_RECV_WRS=N`):
 
 ```
 On host A (source):
-  (1) k6_id_probe alloc PD/CQ/QP(RC)/MR; modify_qp(INIT);
+  (1) fw_id_continuity_probe alloc PD/CQ/QP(RC)/MR; modify_qp(INIT);
       post N receive WRs.
   (2) PF cdev QUERY_QP @ qpn -> record QPC subset.
   (3) SAVE_VHCA_STATE while the probe holds the QP alive.
@@ -939,7 +939,7 @@ needs for both the per-type enumeration and the DEVX/MW/FLOW/XRCD
 coverage check.
 
 Empirically validated end-to-end by
-`tools/testing/mlx5_vfmig/k2_info_handles_probe.c`. Run output on
+`tools/testing/mlx5_vfmig/uobject_restore/info_handles/info_handles_probe.c`. Run output on
 ConnectX-6 Dx, `mlx5_0`, after allocating 3 PDs + 2 CQs + 2 MRs +
 2 QPs via libibverbs:
 
@@ -1249,7 +1249,7 @@ UARs.
 
 For UARs the criterion was simply "indexes increase across restore"
 because user-allocated UARs were directly enumerable on the restored
-VHCA via the dynamic UAR query verb (`DESIGN_uar_restore.md` §3).
+VHCA via the dynamic UAR query verb (`uar_restore.md` §3).
 For the other classes the analogous shape is **"the FW's next-allocation
 cursor for class C on the restored VHCA sits above the source's
 SAVE-time peak for that class."** Per-class pass criterion:
@@ -1270,7 +1270,7 @@ emits -- the FW ids are user-visible via `rdma resource show`. The
 
 The experiment is **kernel-side standalone** and doesn't depend on the
 generic CRIU restore path. We can run it today using the existing
-`mlx5_vfmig_uctx` test harness + a small driver extension:
+`ucontext_vendor_verbs` test harness + a small driver extension:
 
 ```
 On host A (source):
@@ -1334,7 +1334,7 @@ across rxe + mlx5_vfmig per class. The minimum set for an RC send/recv
 round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
 
 * **S0: K6 empirical experiment.** Land the PF cdev probe ioctl
-  (next-id-per-class). Run on a single host via `mlx5_vfmig_uctx`
+  (next-id-per-class). Run on a single host via `ucontext_vendor_verbs`
   fork-save-load; then cross-host. Output classifies each of
   `{PD, CQ, QP, MKEY, SRQ}` as "preserved" or "not preserved". Drives
   K3/K4 mlx5 handler shape. Piggyback the §6.3 `QUERY_QP` RQ-head/tail
@@ -1348,7 +1348,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   **First landable CRIU-side commit set.** Lands in parallel with S0.
 * **S2: K2 (LIST_UOBJS).** **Done -- already upstream as
   `UVERBS_METHOD_INFO_HANDLES`.** Validated by
-  `k2_info_handles_probe`. CRIU plugin will call it for AH discovery
+  `info_handles_probe`. CRIU plugin will call it for AH discovery
   and the DEVX/MW/FLOW/XRCD pre-suspend coverage check; no kernel
   patch needed.
 * **S3: PD restore (rxe + mlx5_vfmig together).** Implement K3
@@ -1356,7 +1356,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   shape determined by S0. Both `run_uverbs_cr.sh` and
   `run_vfmig_cr.sh` flip to PASS for the PD round-trip.
 * **S4: MR restore (rxe + mlx5_vfmig together).** Implement
-  `RESTORE_MR` + both drivers. Couples with `DESIGN_user_mr_dma.md`
+  `RESTORE_MR` + both drivers. Couples with `user_mr_dma.md`
   stage 3 (rkey continuity at the IOMMU layer); the kernel verb and
   the user_mr_dma IOMMU-layer binding land together as a coherent
   per-MR restore. With PD + MR working, the `rdma_test_agent` send
@@ -1390,7 +1390,7 @@ restore rather than by post-restore re-creation).
 
 ### 9.3 Diagnostics
 
-Mirror `DESIGN_user_mr_dma.md` §5.2's rkey-logging idiom. CRIU emits
+Mirror `user_mr_dma.md` §5.2's rkey-logging idiom. CRIU emits
 prefixed log lines per uobject restored:
 
 ```
@@ -1410,7 +1410,7 @@ assertions in CRIU itself, since FW behaviour is the empirical variable.
    for PD/CQ/QP/MKEY (SRQ skipped pending the known restored-VF SRQ
    gate, deferred to S7). K3/K4 mlx5 handlers can use the
    alloc-with-id-hint pattern; no FW patch required for v0.
-   See `test_k6_id_continuity.sh`.
+   See `test_fw_id_continuity.sh`.
 2. **Pending RQ/SQ WR preservation across `LOAD_VHCA_STATE`**:
    **Answered (2026-05-13)**: structural PASS -- the FW QPC
    round-trips byte-equal across LOAD_VHCA_STATE for all 13 fields we
@@ -1420,7 +1420,7 @@ assertions in CRIU itself, since FW behaviour is the empirical variable.
    replay. No driver-side `QUERY_QP_PENDING_WRS` ioctl needed.
    Caveat: live RTR/RTS confirmation is gated on the netdev TX-dropper
    on tracked VFs and was not run; structural argument is sufficient
-   for v0. See `test_k6_id_continuity.sh K6_POST_RECV_WRS=N` and §6.3.
+   for v0. See `test_fw_id_continuity.sh K6_POST_RECV_WRS=N` and §6.3.
 3. **modify_qp split**: per-uobj restore lands QP in RTR or RTS? §6.3
    commits to RTR + fini-pass RTS as default; revisit if concrete
    problems arise.
@@ -1457,11 +1457,11 @@ assertions in CRIU itself, since FW behaviour is the empirical variable.
 
 ## 11. Sequencing relative to other work
 
-* **Builds on** `DESIGN_uar_restore.md`: the ucontext + UAR restore is
+* **Builds on** `uar_restore.md`: the ucontext + UAR restore is
   the substrate R3 lives on top of. R3 cannot start until ucontext
   restore works (it does, end-to-end as of `87e9813c6` in CRIU and
   matching kernel commits).
-* **Parallel to** `DESIGN_user_mr_dma.md`: the user-MR DMA work
+* **Parallel to** `user_mr_dma.md`: the user-MR DMA work
   preserves IOMMU-level page binding identity; R3 preserves uobject-level
   user-handle and rkey identity. The two converge at MR restore (S7) and
   must land together to deliver end-to-end MR continuity. Stages 1-6 of
@@ -1474,8 +1474,8 @@ assertions in CRIU itself, since FW behaviour is the empirical variable.
 
 ## 12. References
 
-* `DESIGN_uar_restore.md` -- ucontext + UAR restore (R3's substrate).
-* `DESIGN_user_mr_dma.md` -- user-MR DMA continuity (R3's MR-restore
+* `uar_restore.md` -- ucontext + UAR restore (R3's substrate).
+* `user_mr_dma.md` -- user-MR DMA continuity (R3's MR-restore
   partner).
 * `criu/rdma.c` -- existing CRIU RDMA core (claim arbitration,
   pre-suspend coverage check, NLDEV scaffolding).
@@ -1485,7 +1485,7 @@ assertions in CRIU itself, since FW behaviour is the empirical variable.
 * `drivers/infiniband/core/uverbs_std_types*.c` -- where K2 + K3 land.
 * `include/rdma/ib_verbs.h` -- where K4 lands (`ib_device_ops`).
 * `include/uapi/rdma/ib_user_ioctl_cmds.h` -- where K3's UAPI lands.
-* `tools/testing/mlx5_vfmig/test_m2r_iova.sh` -- existing kernel-side
+* `tools/testing/mlx5_vfmig/save_load/test_iova_tracked_save_load.sh` -- existing kernel-side
   end-to-end test harness; R3's S6/S8 will extend it.
 * `criu/test/rdma/run_uverbs_cr.sh`, `criu/test/rdma/run_vfmig_cr.sh` --
   existing CRIU-side end-to-end tests; today fail at the PD-uobject gap;

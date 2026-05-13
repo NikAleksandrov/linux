@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * mlx5_vfmig_save - drain a VFIO mlx5 STOP_COPY data_fd into a file.
+ * vfio_stop_copy_save - drain a VFIO mlx5 STOP_COPY data_fd into a file.
  *
- * Helper for the M2 end-to-end test: the source side uses the upstream
- * VFIO mlx5 variant driver (mlx5_vfio_pci) to produce a migration blob
- * which is then consumed by our mlx5_vfmig cdev's LOAD_VHCA_STATE.
+ * Helper for the VFIO-source M2 end-to-end test: the source side uses
+ * the upstream VFIO mlx5 variant driver (mlx5_vfio_pci) to produce a
+ * migration blob which is then consumed by our mlx5_vfmig cdev's
+ * LOAD_VHCA_STATE.
  *
- * Build:
- *   cc -O2 -Wall -o mlx5_vfmig_save mlx5_vfmig_save.c
+ * Build via the directory Makefile (opt-in -- requires sanitized
+ * userspace headers for <linux/iommufd.h> + <linux/vfio.h>):
+ *   make -C tools/testing/mlx5_vfmig vfio-helper
  *
  * Use:
  *   echo $VF > /sys/bus/pci/devices/$VF/driver_override   # already
  *   echo mlx5_vfio_pci > .../driver_override
  *   echo $VF > /sys/bus/pci/drivers/mlx5_vfio_pci/bind
- *   mlx5_vfmig_save <vf-bdf> <out-blob-path>
+ *   vfio_stop_copy_save <vf-bdf> <out-blob-path>
  *
  * The VF must already be bound to mlx5_vfio_pci. We open the VFIO cdev
  * for it via /sys/bus/pci/devices/<bdf>/vfio-dev/vfio<N>/dev.

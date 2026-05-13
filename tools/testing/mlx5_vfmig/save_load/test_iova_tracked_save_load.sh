@@ -6,7 +6,7 @@
 # single-host (default) and cross-host operation, plus an optional
 # post-restore ping smoke test.
 #
-# Three behaviors vs. test_m2r.sh:
+# Three behaviors vs. test_inkernel_save_load_roundtrip.sh:
 #
 #   1. After each sriov_numvfs=1 (source provisioning in Phase A,
 #      destination provisioning in Phase C), it issues
@@ -34,24 +34,27 @@
 # Usage:
 #
 #   Single-host round-trip (default):
-#     sudo PF=0000:08:00.0 ./test_m2r_iova.sh
+#     sudo PF=0000:08:00.0 ./test_iova_tracked_save_load.sh
 #
 #   Cross-host:
 #     # on source host:
-#     sudo PF=0000:08:00.0 ROLE=source ./test_m2r_iova.sh
+#     sudo PF=0000:08:00.0 ROLE=source ./test_iova_tracked_save_load.sh
 #     scp /tmp/vf_m2r_iova.blob /tmp/vf_m2r_iova.blob.meta \
 #         user@dest:/tmp/
 #     # on destination host:
-#     sudo PF=0000:08:00.0 ROLE=destination ./test_m2r_iova.sh
+#     sudo PF=0000:08:00.0 ROLE=destination ./test_iova_tracked_save_load.sh
 #
 #   Optional post-restore ping (any ROLE that runs Phase D-E):
 #     sudo PF=... PING_LOCAL_CIDR=10.0.0.2/24 PING_TARGET=10.0.0.1 \
-#         ROLE=destination ./test_m2r_iova.sh
+#         ROLE=destination ./test_iova_tracked_save_load.sh
 
 set -euxo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR/.."
+
 PF=${PF:-0000:00:08.0}
-TOOL=${TOOL:-./mlx5_vfmig}
+TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
 BLOB=${BLOB:-/tmp/vf_m2r_iova.blob}
 META=${META:-${BLOB}.meta}
 SAVE_FLAGS=${SAVE_FLAGS:-}   # e.g. "keep_suspended"
@@ -92,7 +95,7 @@ PINGPONG=${PINGPONG:-0}
 # Stand-alone (no CRIU dependency); validates the wire claim
 # end-to-end at user space.
 UCTX=${UCTX:-0}
-UCTX_TOOL=${UCTX_TOOL:-./mlx5_vfmig_uctx}
+UCTX_TOOL=${UCTX_TOOL:-$ROOT_DIR/tools/ucontext_vendor_verbs}
 UCTX_BLOB=${UCTX_BLOB:-${BLOB}.uctx}
 
 case "$ROLE" in
@@ -100,10 +103,10 @@ case "$ROLE" in
     *) echo "ROLE must be one of: source, destination, both"; exit 2 ;;
 esac
 
-[ -x "$TOOL" ] || { echo "build $TOOL first"; exit 1; }
+[ -x "$TOOL" ] || { echo "build $TOOL first: make -C $ROOT_DIR"; exit 1; }
 
 if [ "$UCTX" = "1" ]; then
-    [ -x "$UCTX_TOOL" ] || { echo "build $UCTX_TOOL first (UCTX=1)"; exit 1; }
+    [ -x "$UCTX_TOOL" ] || { echo "build $UCTX_TOOL first (UCTX=1): make -C $ROOT_DIR"; exit 1; }
 fi
 
 CDEV="/dev/mlx5_vfmig/$PF"

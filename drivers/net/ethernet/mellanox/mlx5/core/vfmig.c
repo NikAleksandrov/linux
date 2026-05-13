@@ -953,7 +953,7 @@ out_unlock:
  *
  * Issues a raw FW QUERY_QP(opcode 0x50b) on the bound VF's mdev for
  * the supplied qpn and reports the subset of the QPC needed by the
- * §6.3 piggyback experiment in DESIGN_R3_uobj_restore.md.
+ * §6.3 piggyback experiment in tools/testing/mlx5_vfmig/design/uobject_restore.md.
  *
  * VF mdev lookup mirrors vfmig_ioc_probe_uid: resolve the VF pci_dev
  * from the PF + vf_id, take device_lock to keep ->driver and drvdata

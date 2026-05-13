@@ -23,16 +23,19 @@
 #     errors, no probe error code)
 #   - Post-restore baseline (link, MAC, vhca_id) matches pre-save
 #
-# Usage: sudo PF=0000:00:08.0 ./test_m2r.sh
+# Usage: sudo PF=0000:00:08.0 ./test_inkernel_save_load_roundtrip.sh
 
 set -euxo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR/.."
+
 PF=${PF:-0000:00:08.0}
-TOOL=${TOOL:-./mlx5_vfmig}
+TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
 BLOB=${BLOB:-/tmp/vf_m2r.blob}
 SAVE_FLAGS=${SAVE_FLAGS:-}   # e.g. "keep_suspended"
 
-[ -x "$TOOL" ] || { echo "build $TOOL first"; exit 1; }
+[ -x "$TOOL" ] || { echo "build $TOOL first: make -C $ROOT_DIR"; exit 1; }
 
 CDEV="/dev/mlx5_vfmig/$PF"
 [ -e "$CDEV" ] || { echo "missing $CDEV (mlx5_core not loaded?)"; exit 1; }

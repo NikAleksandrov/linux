@@ -8,7 +8,7 @@
 # Phase A (save):
 #   - sriov_drivers_autoprobe=0; sriov_numvfs=1
 #   - bind the resulting VF to mlx5_vfio_pci via driver_override
-#   - run mlx5_vfmig_save to drain a STOP_COPY data_fd into a blob file
+#   - run vfio_stop_copy_save to drain a STOP_COPY data_fd into a blob file
 #   - unbind the VF, sriov_numvfs=0
 #
 # Phase B (load):
@@ -27,17 +27,20 @@
 #      is created
 #
 # Usage:
-#   sudo PF=0000:00:08.0 ./test_m2.sh
+#   sudo PF=0000:00:08.0 ./test_vfio_save_load_roundtrip.sh
 
 set -euxo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR/.."
+
 PF=${PF:-0000:00:08.0}
-TOOL=${TOOL:-./mlx5_vfmig}
-SAVE=${SAVE:-./mlx5_vfmig_save}
+TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
+SAVE=${SAVE:-$ROOT_DIR/tools/vfio_stop_copy_save}
 BLOB=${BLOB:-/tmp/vf.blob}
 
-[ -x "$TOOL" ] || { echo "build $TOOL: cc -O2 -Wall -o mlx5_vfmig mlx5_vfmig.c"; exit 1; }
-[ -x "$SAVE" ] || { echo "build $SAVE: cc -O2 -Wall -o mlx5_vfmig_save mlx5_vfmig_save.c"; exit 1; }
+[ -x "$TOOL" ] || { echo "build $TOOL: make -C $ROOT_DIR"; exit 1; }
+[ -x "$SAVE" ] || { echo "build $SAVE: make -C $ROOT_DIR vfio-helper"; exit 1; }
 
 # 0. clean slate
 echo 0 | sudo tee /sys/bus/pci/devices/$PF/sriov_numvfs

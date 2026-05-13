@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * k6_id_probe -- empirical probe for DESIGN_R3_uobj_restore.md §8.2
- * ("K6 FW identity continuity") and §6.3 (RQ-head/tail preservation
- * piggyback experiment).
+ * fw_id_continuity_probe -- empirical probe for
+ * design/uobject_restore.md §8.2 ("FW identity continuity") and §6.3
+ * (RQ-head/tail preservation piggyback experiment).
  *
  * Allocates one of each FW-id-bearing user-mode resource class --
  * PD, CQ, QP (RC), MR, SRQ -- against the given ib_device, prints
@@ -32,11 +32,12 @@
  * a standard MR; only the access bits differ between them).
  *
  * Build:
- *   make k6_id_probe
+ *   make -C tools/testing/mlx5_vfmig \
+ *        uobject_restore/fw_id_continuity/fw_id_continuity_probe
  *
  * Usage:
- *   ./k6_id_probe <ibdev>
- *   ./k6_id_probe <ibdev> --post-recv-wrs N   # §6.3 piggyback: also
+ *   ./fw_id_continuity_probe <ibdev>
+ *   ./fw_id_continuity_probe <ibdev> --post-recv-wrs N   # §6.3 piggyback: also
  *                                              # post N receive WRs to
  *                                              # the RQ so a follow-on
  *                                              # QUERY_QP can compare

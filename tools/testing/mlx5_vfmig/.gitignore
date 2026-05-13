@@ -1,4 +1,7 @@
 # Built by tools/testing/mlx5_vfmig/Makefile
-mlx5_vfmig
-mlx5_vfmig_synth
-mlx5_vfmig_uctx
+tools/mlx5_vfmig
+tools/synthetic_blob_emit
+tools/ucontext_vendor_verbs
+tools/vfio_stop_copy_save
+uobject_restore/info_handles/info_handles_probe
+uobject_restore/fw_id_continuity/fw_id_continuity_probe

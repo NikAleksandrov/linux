@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * k2_info_handles_probe -- empirical validation of K2 (uobject
- * enumeration) from DESIGN_R3_uobj_restore.md.
+ * info_handles_probe -- empirical validation of generic uobject
+ * enumeration via UVERBS_METHOD_INFO_HANDLES (design/uobject_restore.md
+ * §7.2).
  *
  * The design originally specified a NEW generic uverbs method
  * `UVERBS_METHOD_INFO_LIST_UOBJS(type)` that walks `ufile->uobjects`
@@ -46,10 +47,11 @@
  *       returns exactly `capacity` handles with TOTAL == capacity.
  *
  * Build:
- *   make k2_info_handles_probe
+ *   make -C tools/testing/mlx5_vfmig \
+ *        uobject_restore/info_handles/info_handles_probe
  *
  * Usage:
- *   ./k2_info_handles_probe <ibdev>     # e.g. mlx5_0
+ *   ./info_handles_probe <ibdev>     # e.g. mlx5_0
  */
 
 #include <errno.h>
@@ -64,7 +66,7 @@
 
 /*
  * Local copy of the uverbs ioctl wire format -- same as
- * mlx5_vfmig_uctx.c, kept minimal here. The kernel headers
+ * tools/ucontext_vendor_verbs.c, kept minimal here. The kernel headers
  * (rdma_user_ioctl_cmds.h, ib_user_ioctl_cmds.h) carry the
  * authoritative definitions; we duplicate just the fields we need to
  * avoid pulling rdma-core uapi into a tools/testing build.
@@ -131,7 +133,7 @@ struct ib_uverbs_ioctl_hdr {
 
 /* Driver-namespace probe target (we don't allocate any; we just
  * confirm the ioctl accepts the id). Keep in sync with
- * mlx5_vfmig_uctx.c's MLX5_IB_OBJECT_UAR.
+ * tools/ucontext_vendor_verbs.c's MLX5_IB_OBJECT_UAR.
  */
 #define UVERBS_ID_NS_SHIFT			12
 #define MLX5_IB_OBJECT_UAR			((1u << UVERBS_ID_NS_SHIFT) + 8)

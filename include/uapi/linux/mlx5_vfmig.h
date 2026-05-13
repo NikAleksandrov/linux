@@ -366,7 +366,7 @@ struct mlx5_vfmig_probe_uid {
  *   userspace test compare a QP's state across SAVE_VHCA_STATE +
  *   LOAD_VHCA_STATE without owning a userspace ib_qp handle for it.
  *
- *   Use-case: DESIGN_R3_uobj_restore.md §6.3 piggyback experiment.
+ *   Use-case: tools/testing/mlx5_vfmig/design/uobject_restore.md §6.3 piggyback experiment.
  *   On the source, allocate an RC QP, transition it to INIT, post N
  *   receive WRs. Snapshot the QPC via this ioctl (records state,
  *   hw/sw RQ counters, next_rcv_psn, ...). SAVE, then on the

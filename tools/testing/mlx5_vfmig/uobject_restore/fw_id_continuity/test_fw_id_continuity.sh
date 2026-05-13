@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# K6: empirical test of FW-id continuity across LOAD_VHCA_STATE.
-# Drives the experiment specified in DESIGN_R3_uobj_restore.md §8.2.
+# Empirical test of FW-id continuity across LOAD_VHCA_STATE.
+# Drives the experiment specified in design/uobject_restore.md §8.2.
 #
 # Per-class pass condition (§8.2.1): for each of {PD, CQ, QP, MKEY, SRQ}
 # the destination's first allocation after LOAD must yield a FW id
@@ -13,48 +13,54 @@
 #
 # Flow:
 #
-#   Phase A  source SR-IOV/set_tracked/bind (same as test_m2r_iova.sh).
-#   Phase B  fork k6_id_probe on source ibdev. Drain stdout to READY,
-#            record source ids. Probe stays ALIVE.
+#   Phase A  source SR-IOV/set_tracked/bind (same shape as
+#            save_load/test_iova_tracked_save_load.sh).
+#   Phase B  fork fw_id_continuity_probe on source ibdev. Drain stdout
+#            to READY, record source ids. Probe stays ALIVE.
 #   Phase C  SAVE_VHCA_STATE. Probe still alive: FW state at SAVE time
 #            includes the probe's allocations.
 #   Phase D  signal probe to quit, tear down source VF.
 #   Phase E  fresh dest VF, set_tracked, LOAD_VHCA_STATE, mark_restored,
 #            bind.
-#   Phase F  fork k6_id_probe on dest ibdev. Drain stdout to READY,
-#            record dest ids.
+#   Phase F  fork fw_id_continuity_probe on dest ibdev. Drain stdout to
+#            READY, record dest ids.
 #   Phase G  per-class compare. PASS = dest_id > source_id for all
 #            classes; otherwise tag failing classes loudly.
 #
 # Usage:
-#   sudo PF=0000:08:00.0 ./test_k6_id_continuity.sh
+#   sudo PF=0000:08:00.0 ./test_fw_id_continuity.sh
 #
 # Optional knobs:
 #   K6_POST_RECV_WRS=N    Post N recv WRs to the source QP for the
 #                         §6.3 RQ-head/tail piggyback. When > 0 the
 #                         script also issues MLX5_VFMIG_IOC_QUERY_QP
 #                         on the source qpn before SAVE and on the
-#                         SAME qpn after LOAD+bind (K6 has already
-#                         shown the qpn reservation survives), and
-#                         compares the QPC subset that matters for
-#                         pending-WR survival (state, sw/hw RQ
-#                         counters, next_rcv_psn). PASS = matching.
+#                         SAME qpn after LOAD+bind (FW-id continuity
+#                         has already shown the qpn reservation
+#                         survives), and compares the QPC subset that
+#                         matters for pending-WR survival (state,
+#                         sw/hw RQ counters, next_rcv_psn).
+#                         PASS = matching.
 #   BLOB                  Path for the SAVE blob (default /tmp/vf_k6.blob).
-#   TOOL                  mlx5_vfmig CLI (default ./mlx5_vfmig).
-#   PROBE                 k6_id_probe binary (default ./k6_id_probe).
+#   TOOL                  mlx5_vfmig CLI (default $ROOT_DIR/tools/mlx5_vfmig).
+#   PROBE                 fw_id_continuity_probe binary
+#                         (default $SCRIPT_DIR/fw_id_continuity_probe).
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR/../.."
+
 PF=${PF:-0000:00:08.0}
-TOOL=${TOOL:-./mlx5_vfmig}
-PROBE=${PROBE:-./k6_id_probe}
+TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
+PROBE=${PROBE:-$SCRIPT_DIR/fw_id_continuity_probe}
 BLOB=${BLOB:-/tmp/vf_k6.blob}
 META=${META:-${BLOB}.meta}
 K6_POST_RECV_WRS=${K6_POST_RECV_WRS:-0}
 
 CDEV="/dev/mlx5_vfmig/$PF"
-[ -x "$TOOL" ]  || { echo "build $TOOL first";  exit 1; }
-[ -x "$PROBE" ] || { echo "build $PROBE first"; exit 1; }
+[ -x "$TOOL" ]  || { echo "build $TOOL first: make -C $ROOT_DIR";  exit 1; }
+[ -x "$PROBE" ] || { echo "build $PROBE first: make -C $ROOT_DIR"; exit 1; }
 [ -e "$CDEV" ]  || { echo "missing $CDEV (mlx5_core not loaded?)"; exit 1; }
 
 # Workdir for the FIFOs that drive the K6 probes.
@@ -74,7 +80,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# --- helpers (subset of test_m2r_iova.sh) -----------------------------
+# --- helpers (subset of save_load/test_iova_tracked_save_load.sh) -----
 
 vf_path()       { echo "/sys/bus/pci/devices/$1"; }
 wait_for_path() { for i in $(seq 1 50); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
@@ -125,7 +131,7 @@ find_ib_dev_for_pci() {
     return 1
 }
 
-# Start a k6_id_probe in the background, hook stdin/stdout via FIFOs.
+# Start a fw_id_continuity_probe in the background, hook stdin/stdout via FIFOs.
 # Reads probe output until "READY" sentinel, copying key=value lines
 # into the named prefix dict (eval-form): "${prefix}_pdn=...", etc.
 #
@@ -504,7 +510,7 @@ else
     echo
     echo "K6 OVERALL: FAIL -- at least one class shows reservation loss."
     echo "             K3/K4 mlx5 handlers will need explicit pre-reserve plumbing"
-    echo "             (likely FW patch). See DESIGN_R3_uobj_restore.md §8.2.3."
+    echo "             (likely FW patch). See design/uobject_restore.md §8.2.3."
 fi
 
 if [ "$RQ_PIGGYBACK" = 1 ]; then
@@ -512,10 +518,10 @@ if [ "$RQ_PIGGYBACK" = 1 ]; then
         echo "§6.3 PIGGYBACK: PASS -- QPC (incl. RQ counters, next_rcv_psn) round-trips"
         echo "                 byte-equal across LOAD_VHCA_STATE. No driver-side"
         echo "                 QUERY_QP_PENDING_WRS + replay path is required for v0."
-        echo "                 §6.3 of DESIGN_R3_uobj_restore.md can be closed out."
+        echo "                 §6.3 of design/uobject_restore.md can be closed out."
     else
         echo "§6.3 PIGGYBACK: FAIL -- one or more QPC fields diverged across LOAD."
-        echo "                 §6.3 of DESIGN_R3_uobj_restore.md must add explicit"
+        echo "                 §6.3 of design/uobject_restore.md must add explicit"
         echo "                 pending-WR plumbing for v0 (likely a new driver"
         echo "                 ioctl that snapshots+replays the user-RQ via UMR)."
     fi

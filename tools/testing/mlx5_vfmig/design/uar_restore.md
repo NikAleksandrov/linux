@@ -115,7 +115,7 @@ actually care about:
   - New PF-cdev ioctl `MLX5_VFMIG_IOC_PROBE_UID` that calls
     `CREATE_UCTX` -> log the returned `uid` -> `DESTROY_UCTX`. This
     probes "what's the next FW UCTX id FW would hand out on this VHCA?"
-* Driver script: `tools/testing/mlx5_vfmig/probe_uar_persistence.sh` runs
+* Driver script: `tools/testing/mlx5_vfmig/uar_restore/probe_uar_persistence.sh` runs
   the SAVE side on host A then walks the operator through LOAD on host B
   and aggregates kernel-log results from `journalctl --since=$start_ts`.
 
@@ -506,7 +506,7 @@ mmap_cmd" logic, conceptually similar to MR rebinding).
 ### Step 1: alloc-with-flag (skip allocate_uars)
 
 * Land §5.1 + §6.1 + §6.2 only.
-* Extend `tools/testing/mlx5_vfmig/mlx5_vfmig.c` with a probe subcommand
+* Extend `tools/testing/mlx5_vfmig/tools/mlx5_vfmig.c` with a probe subcommand
   `alloc_uctx_with_flag <ibdev>` that opens `/dev/infiniband/uverbs<N>`,
   issues `IB_USER_VERBS_CMD_GET_CONTEXT` with the new flag bit, dumps the
   `mlx5_ib_alloc_ucontext_resp.qp_tab_size` etc. for sanity.
@@ -540,7 +540,7 @@ mmap_cmd" logic, conceptually similar to MR rebinding).
 
 ### Step 4: end-to-end with SAVE/LOAD
 
-* Extend `test_m2r_iova.sh` with a new `UCTX=1` opt-in:
+* Extend `save_load/test_iova_tracked_save_load.sh` with a new `UCTX=1` opt-in:
   1. Phase A: open ucontext on tracked source VF, QUERY -> save
      `uar_table`, `bfreg_count`, `meta`.
   2. Phase B: SAVE_VHCA_STATE.

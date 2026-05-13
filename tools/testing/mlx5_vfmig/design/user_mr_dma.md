@@ -1,7 +1,7 @@
 # DESIGN: user-MR DMA coverage in the v1 deterministic IOVA allocator
 
 Status: **proposed**, pre-implementation. This doc covers the design we
-agreed on before any code lands. Lives alongside `DESIGN_uar_restore.md`;
+agreed on before any code lands. Lives alongside `uar_restore.md`;
 the verb-level cross-driver identity model documented there carries over
 verbatim into stage 3 of this work.
 
@@ -63,7 +63,7 @@ forward-compatible.
   `iommu_attach_device`; detach into `vfmig_iova_domain_destroy()`
   immediately before `iommu_detach_device`. dma_ops lifetime is then
   exactly equal to unmanaged-domain lifetime.
-* Test plan: `PINGPONG=1 ./test_m2r_iova.sh` Phase A and Phase D both
+* Test plan: `PINGPONG=1 ./save_load/test_iova_tracked_save_load.sh` Phase A and Phase D both
   flip from FAIL to PASS. **Plus** rkey logging (see section 5.2):
   the test prints `vfmig_user_mr: source_rkey=...` and
   `vfmig_user_mr: dest_rkey=...` so we can read off, by inspection,
@@ -83,7 +83,7 @@ forward-compatible.
   Stages 2/3 deliver this.
 * DM (on-chip device memory). DM uses on-chip SRAM, not host DMA, and
   bypasses this whole path -- handled separately as part of R3 per
-  `DESIGN_uar_restore.md` section 1 ("Out of scope").
+  `uar_restore.md` section 1 ("Out of scope").
 * DMA-buf user MRs (`reg_user_mr_dmabuf`). Handled via
   `ib_umem_dmabuf_get` / `dma_buf_map_attachment`. Out of scope for
   stage 1, but **the path is compatible by design**: see section 8
@@ -551,7 +551,7 @@ diagnostic property we want to keep.
 
 ### 5.1 Positive: pingpong PASS on tracked VF
 
-Already wired in `test_m2r_iova.sh` via `PINGPONG=1`. Pre-stage 1:
+Already wired in `save_load/test_iova_tracked_save_load.sh` via `PINGPONG=1`. Pre-stage 1:
 
 * Phase A pingpong on source: FAIL ("Couldn't register MR")
 * Phase D pingpong on destination: FAIL ("Couldn't register MR")
@@ -897,5 +897,5 @@ invariant that requires the VF unbound at destroy.)
 * `drivers/infiniband/hw/mlx5/mr.c:1578` -- `mlx5_ib_reg_user_mr`.
 * `drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c` -- the
   existing v1 allocator we're extending.
-* `tools/testing/mlx5_vfmig/DESIGN_uar_restore.md` -- the verb-pattern
+* `tools/testing/mlx5_vfmig/design/uar_restore.md` -- the verb-pattern
   template stage 3 follows.

@@ -4,8 +4,8 @@
  * Intended for development and triage; production users should speak the
  * ioctls from a real CRIU plugin.
  *
- * Build:
- *   cc -O2 -Wall -o mlx5_vfmig mlx5_vfmig.c
+ * Build via the directory Makefile:
+ *   make -C tools/testing/mlx5_vfmig tools/mlx5_vfmig
  *
  * Use:
  *   mlx5_vfmig <pf-bdf> mark_restored    <vf_id>
@@ -36,7 +36,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../../../include/uapi/linux/mlx5_vfmig.h"
+#include "../../../../include/uapi/linux/mlx5_vfmig.h"
 
 static int do_enable_migratable(int fd, unsigned int vf_id)
 {
@@ -78,11 +78,11 @@ static int do_probe_uid(int fd, unsigned int vf_id)
 /*
  * EXPERIMENTAL: raw FW QUERY_QP on a bound VF's mdev.
  * Used by the §6.3 piggyback experiment in
- * DESIGN_R3_uobj_restore.md to confirm pending RQ WRs and QP state
+ * design/uobject_restore.md to confirm pending RQ WRs and QP state
  * survive LOAD_VHCA_STATE intrinsically.
  *
  * Output format is intentionally shell-eval-able (one `key=value`
- * per line) so test_k6_id_continuity.sh can capture the result into
+ * per line) so test_fw_id_continuity.sh can capture the result into
  * named variables.
  */
 static int do_query_qp(int fd, unsigned int vf_id, unsigned int qpn)

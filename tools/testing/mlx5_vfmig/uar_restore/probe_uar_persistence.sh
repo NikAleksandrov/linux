@@ -38,19 +38,26 @@
 # Usage:
 #   sudo PF=0000:08:00.0 ./probe_uar_persistence.sh
 #
-# Assumes the existing test_m2r_iova.sh has been built+installed with
-# the matching mlx5_core/mlx5_ib that prints the bfreg log line. If
-# you don't see "post-alloc kernel bfreg" in the output, dynamic_debug
-# wasn't enabled or the modules in /lib/modules are stale.
+# Assumes the existing save_load/test_iova_tracked_save_load.sh has
+# been built+installed with the matching mlx5_core/mlx5_ib that prints
+# the bfreg log line. If you don't see "post-alloc kernel bfreg" in
+# the output, dynamic_debug wasn't enabled or the modules in
+# /lib/modules are stale.
 
 set -euo pipefail
 
-PF=${PF:-0000:08:00.0}
-TOOL=${TOOL:-./mlx5_vfmig}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR/.."
 
-if [ ! -x "$SCRIPT_DIR/$TOOL" ]; then
-    echo "build $TOOL first (cd $SCRIPT_DIR && make)"; exit 1
+PF=${PF:-0000:08:00.0}
+TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
+INNER_TEST=${INNER_TEST:-$ROOT_DIR/save_load/test_iova_tracked_save_load.sh}
+
+if [ ! -x "$TOOL" ]; then
+    echo "build $TOOL first: make -C $ROOT_DIR"; exit 1
+fi
+if [ ! -x "$INNER_TEST" ]; then
+    echo "missing $INNER_TEST"; exit 1
 fi
 
 # --- Step 1: enable dbg for the bfreg line -----------------------------
@@ -79,7 +86,7 @@ echo 'format "vfmig: restored VF -- skipping dev_res" +p' \
 # --- Step 2: drive the round-trip --------------------------------------
 #
 # We read the kernel log via `journalctl --dmesg --since=$START` rather
-# than plain `dmesg`. This is deliberate: test_m2r_iova.sh issues
+# than plain `dmesg`. This is deliberate: test_iova_tracked_save_load.sh issues
 # `dmesg -C` between Phase A and Phase D to keep its own per-phase
 # tails legible, which would otherwise wipe the source's bfreg log
 # before this script has a chance to read it. journald's kmsg journal
@@ -89,22 +96,20 @@ echo 'format "vfmig: restored VF -- skipping dev_res" +p' \
 # falls back to plain dmesg with a loud warning -- that case is the
 # only one in which a single-host run can lose the source reading.
 
-cd "$SCRIPT_DIR"
-
 START_TS=$(date '+%Y-%m-%d %H:%M:%S')
 USE_JOURNAL=0
 if systemctl is-active --quiet systemd-journald 2>/dev/null; then
     USE_JOURNAL=1
 fi
 
-echo "+++ running test_m2r_iova.sh ROLE=both PROBE_UID=1 +++"
+echo "+++ running $(basename $INNER_TEST) ROLE=both PROBE_UID=1 +++"
 sudo dmesg -C
 # PROBE_UID=1 makes the harness call `mlx5_vfmig probe_uid 0` after
 # both the source bind (Phase A) and the destination bind (Phase D),
 # emitting "[probe_uid src]" / "[probe_uid dst]" lines we can parse
 # alongside the bfreg log to answer both the UAR and UID persistence
 # questions in a single round-trip.
-sudo PF="$PF" ROLE=both PROBE_UID=1 ./test_m2r_iova.sh | tee /tmp/probe_uar_test.log
+sudo PF="$PF" ROLE=both PROBE_UID=1 "$INNER_TEST" | tee /tmp/probe_uar_test.log
 
 read_kmsg() {
     if [ "$USE_JOURNAL" = "1" ]; then
@@ -131,9 +136,9 @@ if ! read_kmsg | grep -E 'post-alloc kernel bfreg'; then
     echo "  - mlx5_load() ran before dynamic_debug took effect"
     if [ "$USE_JOURNAL" = "0" ]; then
         echo "  - systemd-journald is not running, so the source bfreg log"
-        echo "    was almost certainly wiped by test_m2r_iova.sh's"
+        echo "    was almost certainly wiped by test_iova_tracked_save_load.sh's"
         echo "    in-Phase-D 'dmesg -C'. Enable journald or hand-instrument"
-        echo "    test_m2r_iova.sh to avoid that."
+        echo "    test_iova_tracked_save_load.sh to avoid that."
     fi
     exit 1
 fi
@@ -199,7 +204,7 @@ fi
 
 # --- Step 4: UID persistence verdict (PROBE_UID=1 hook) ---------------
 #
-# test_m2r_iova.sh emitted three `[probe_uid src|dst] vf 0: probe_uid -> uid=N`
+# test_iova_tracked_save_load.sh emitted three `[probe_uid src|dst] vf 0: probe_uid -> uid=N`
 # lines on stdout (which we tee'd to /tmp/probe_uar_test.log):
 #   - two on the source side (back-to-back to read the allocator's
 #     monotonic step / reuse behaviour),

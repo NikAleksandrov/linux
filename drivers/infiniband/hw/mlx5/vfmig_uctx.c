@@ -13,7 +13,7 @@
  *                              on a ucontext that was opened with
  *                              MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE.
  *
- * See tools/testing/mlx5_vfmig/DESIGN_uar_restore.md for the full
+ * See tools/testing/mlx5_vfmig/design/uar_restore.md for the full
  * design, including the rationale for living on the uverbs fd vs the
  * /dev/mlx5_vfmig PF cdev, and the empirical foundation that the
  * snapshotted FW UAR ids stay valid after LOAD_VHCA_STATE.

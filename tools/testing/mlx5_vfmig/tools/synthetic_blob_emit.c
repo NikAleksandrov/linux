@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * mlx5_vfmig_synth - emit a single-record VFIO-mlx5-format blob with a
- * synthetic FW_DATA payload. Used to smoke-test the kernel LOAD plumbing
- * (parser FSM, PD/MKEY/DMA registration, fd lifetime) without needing a
- * real save side. Firmware will of course reject the junk bytes -- we
- * expect a "LOAD_VHCA_STATE ... failed" warning in dmesg. The point is
- * to exercise everything *around* the firmware call.
+ * synthetic_blob_emit - emit a single-record VFIO-mlx5-format blob with
+ * a synthetic FW_DATA payload. Used to smoke-test the kernel LOAD
+ * plumbing (parser FSM, PD/MKEY/DMA registration, fd lifetime) without
+ * needing a real save side. Firmware will of course reject the junk
+ * bytes -- we expect a "LOAD_VHCA_STATE ... failed" warning in dmesg.
+ * The point is to exercise everything *around* the firmware call.
  *
- * Build:
- *   cc -O2 -Wall -o mlx5_vfmig_synth mlx5_vfmig_synth.c
+ * Build via the directory Makefile:
+ *   make -C tools/testing/mlx5_vfmig tools/synthetic_blob_emit
  *
  * Use:
- *   mlx5_vfmig_synth <out-blob-path> [size-bytes]
+ *   synthetic_blob_emit <out-blob-path> [size-bytes]
  *
  *   default size is 4096 bytes of 0xAA payload.
  */
