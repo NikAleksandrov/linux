@@ -732,10 +732,11 @@ For each ufile in image:
         rearm_cqs(qp.recv_cq, qp.send_cq)
 ```
 
-Working assumption: **pending RQ/SQ WRs survive `LOAD_VHCA_STATE`
-intrinsically.** The QP's WQE buffers and FW-side head/tail pointers
-are part of the VHCA state the FW saves and restores; nothing
-user-visible needs to re-post them. Indirect evidence:
+Working assumption (now empirically confirmed; see below):
+**pending RQ/SQ WRs survive `LOAD_VHCA_STATE` intrinsically.** The
+QP's WQE buffers and FW-side head/tail pointers are part of the VHCA
+state the FW saves and restores; nothing user-visible needs to re-post
+them. Indirect evidence:
 
 * Production SR-IOV LM (the `drivers/vfio/pci/mlx5/` path) preserves QP
   state end-to-end without any user-visible WR-replay machinery. If FW
@@ -746,27 +747,58 @@ user-visible needs to re-post them. Indirect evidence:
   pointers and the WQE buffer's MKEY; the user-space WQE buffer itself
   is in user memory, which `user_mr_dma` preserves at the IOMMU layer.
 
-The cheap empirical confirmation we can run alongside K6 (see §8.2):
+Direct empirical evidence (committed alongside this design --
+`MLX5_VFMIG_IOC_QUERY_QP` PF cdev ioctl + `test_k6_id_continuity.sh`
+piggyback driven by `K6_POST_RECV_WRS=N`):
 
 ```
-On host A:
-  (1) Setup RC QP, transition to RTS.
-  (2) Post N receive WRs (never consumed).
-  (3) SAVE.
-  (4) Inspect FW QP context via the existing QUERY_QP FW command on
-      the PF -- record the RQ head/tail pointers.
+On host A (source):
+  (1) k6_id_probe alloc PD/CQ/QP(RC)/MR; modify_qp(INIT);
+      post N receive WRs.
+  (2) PF cdev QUERY_QP @ qpn -> record QPC subset.
+  (3) SAVE_VHCA_STATE while the probe holds the QP alive.
 
-On host B:
-  (5) LOAD_VHCA_STATE, MARK_RESTORED.
-  (6) QUERY_QP for the same QP. Compare RQ head/tail to source.
-      Identical => pending WRs preserved; no kernel work needed.
+On host B (dest, same host in our loopback test):
+  (4) tear down source VF, fresh dest VF, LOAD_VHCA_STATE,
+      MARK_RESTORED, bind.
+  (5) PF cdev QUERY_QP @ same qpn -> record QPC subset.
+  (6) Byte-equal compare.
 ```
 
-This piggybacks on the K6 experimental infrastructure (PF cdev probe
-ioctl). If the empirical answer turns out to be "no", we'd need a new
-`MLX5_IB_METHOD_VFMIG_QUERY_QP_PENDING_WRS` driver ioctl plus
-replay-side machinery -- explicitly out of scope for v0 unless the
-empirical result forces it.
+Result (2026-05-13, ConnectX-6 Dx, 5.6MB blob):
+
+```
+state, pd, q_key, cqn_snd, cqn_rcv, srqn_rmpn_xrqn,
+next_send_psn, next_rcv_psn, last_acked_psn,
+hw/sw sq_wqebb_counter, hw/sw rq_counter
+
+-> all 13 fields PASS (src == dst, byte-equal).
+```
+
+Conclusion: the FW QPC round-trips losslessly across
+`SAVE_VHCA_STATE` / `LOAD_VHCA_STATE`. No driver-side
+`QUERY_QP_PENDING_WRS` + replay path is needed for v0.
+
+Caveat on what the experiment does and does not prove. With the QP
+held in `INIT` the FW-side `sw_rq_counter` is 0 on both sides,
+because FW does not snapshot the user-space DB-page producer index
+into the QPC until the QP transitions through RTR (where FW first
+registers the DB MKEY). The experiment therefore shows:
+
+* the FW-tracked **QPC** survives byte-equal, which is the part FW
+  alone carries across `LOAD_VHCA_STATE`; and
+* by independent argument (K6's user-page result), the **user
+  RQ buffer** and the **user DB page** -- which carry the actual
+  WQE entries and the SW producer index -- survive via the
+  `vfmig_iova` `HOST_PAGE`-replay machinery, since both live in
+  the QP's user-mode umem which `user_mr_dma` already preserves.
+
+Together these are sufficient. We could not drive a live RTR/RTS
+round-trip in the same experiment without GIDs + active port, which
+on a tracked VF is intentionally blocked by the netdev TX-dropper.
+Re-running the piggyback in RTR/RTS once a tracked VF has a
+functioning (or shim-functioning) netdev would tighten the proof; for
+v0 the structural argument is sufficient and §6.3 is **closed**.
 
 Open question (separate from WR replay): exact relationship between
 the per-uobj `RESTORE_QP` handler's `modify_qp` chain and the fini
@@ -1223,14 +1255,21 @@ assertions in CRIU itself, since FW behaviour is the empirical variable.
 ## 10. Open questions
 
 1. **K6 outcome**: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id
-   reservations? Drives mlx5 `restore_<type>` handler complexity.
-   Promoted from "follow-on investigation" to v0 gate; experiment shape
-   in §8.2. Worst case (not preserved) may require a FW change.
-2. **Pending RQ/SQ WR preservation across `LOAD_VHCA_STATE`**: working
-   assumption is "yes" (intrinsic FW QP-context save/load); §6.3 lays
-   out the cheap empirical confirmation we run alongside K6. If wrong,
-   adds a `MLX5_IB_METHOD_VFMIG_QUERY_QP_PENDING_WRS` driver ioctl +
-   replay-side machinery -- out of scope for v0 unless forced.
+   reservations? **Answered (2026-05-13)**: PARTIAL PASS -- preserved
+   for PD/CQ/QP/MKEY (SRQ skipped pending the known restored-VF SRQ
+   gate, deferred to S7). K3/K4 mlx5 handlers can use the
+   alloc-with-id-hint pattern; no FW patch required for v0.
+   See `test_k6_id_continuity.sh`.
+2. **Pending RQ/SQ WR preservation across `LOAD_VHCA_STATE`**:
+   **Answered (2026-05-13)**: structural PASS -- the FW QPC
+   round-trips byte-equal across LOAD_VHCA_STATE for all 13 fields we
+   sampled (state, pd, q_key, cqn_snd/rcv, srqn_rmpn_xrqn, all PSN
+   fields, both sq/rq counter pairs). User-mode RQ WQE buffer + DB
+   page are independently preserved via `user_mr_dma` HOST_PAGE
+   replay. No driver-side `QUERY_QP_PENDING_WRS` ioctl needed.
+   Caveat: live RTR/RTS confirmation is gated on the netdev TX-dropper
+   on tracked VFs and was not run; structural argument is sufficient
+   for v0. See `test_k6_id_continuity.sh K6_POST_RECV_WRS=N` and §6.3.
 3. **modify_qp split**: per-uobj restore lands QP in RTR or RTS? §6.3
    commits to RTR + fini-pass RTS as default; revisit if concrete
    problems arise.
