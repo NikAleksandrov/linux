@@ -948,6 +948,112 @@ out_unlock:
 	return err;
 }
 
+/*
+ * MLX5_VFMIG_IOC_QUERY_QP handler -- experimental.
+ *
+ * Issues a raw FW QUERY_QP(opcode 0x50b) on the bound VF's mdev for
+ * the supplied qpn and reports the subset of the QPC needed by the
+ * §6.3 piggyback experiment in DESIGN_R3_uobj_restore.md.
+ *
+ * VF mdev lookup mirrors vfmig_ioc_probe_uid: resolve the VF pci_dev
+ * from the PF + vf_id, take device_lock to keep ->driver and drvdata
+ * stable, match driver by KBUILD_MODNAME, verify
+ * MLX5_INTERFACE_STATE_UP. The command is issued on the VF mdev's
+ * cmdif with host kernel uid; FW returns the QPC regardless of which
+ * ucontext originally created the QP (no UID gating observed on
+ * QUERY_QP today -- if that ever changes we'll surface the FW
+ * syndrome and revisit).
+ */
+static long vfmig_ioc_query_qp(struct mlx5_vfmig_pf *vfmig,
+			       void __user *uarg)
+{
+	u32 in[MLX5_ST_SZ_DW(query_qp_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(query_qp_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_query_qp arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	void *qpc;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved_in)
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.qpn & 0xff000000)	/* QPN is 24 bits */
+		return -EINVAL;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: query_qp: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: query_qp: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	MLX5_SET(query_qp_in, in, opcode, MLX5_CMD_OP_QUERY_QP);
+	MLX5_SET(query_qp_in, in, qpn, arg.qpn);
+	err = mlx5_cmd_exec(vf_mdev, in, sizeof(in), out, sizeof(out));
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: query_qp: vf %u qpn 0x%x failed %d\n",
+			       arg.vf_id, arg.qpn, err);
+		goto out_unlock;
+	}
+
+	qpc = MLX5_ADDR_OF(query_qp_out, out, qpc);
+	arg.qpc_state             = MLX5_GET(qpc, qpc, state);
+	arg.qpc_pd                = MLX5_GET(qpc, qpc, pd);
+	arg.qpc_q_key             = MLX5_GET(qpc, qpc, q_key);
+	arg.qpc_remote_qpn        = MLX5_GET(qpc, qpc, remote_qpn);
+	arg.qpc_cqn_snd           = MLX5_GET(qpc, qpc, cqn_snd);
+	arg.qpc_cqn_rcv           = MLX5_GET(qpc, qpc, cqn_rcv);
+	arg.qpc_srqn_rmpn_xrqn    = MLX5_GET(qpc, qpc, srqn_rmpn_xrqn);
+	arg.qpc_next_send_psn     = MLX5_GET(qpc, qpc, next_send_psn);
+	arg.qpc_next_rcv_psn      = MLX5_GET(qpc, qpc, next_rcv_psn);
+	arg.qpc_last_acked_psn    = MLX5_GET(qpc, qpc, last_acked_psn);
+	arg.qpc_hw_sq_wqebb_counter = MLX5_GET(qpc, qpc, hw_sq_wqebb_counter);
+	arg.qpc_sw_sq_wqebb_counter = MLX5_GET(qpc, qpc, sw_sq_wqebb_counter);
+	arg.qpc_hw_rq_counter     = MLX5_GET(qpc, qpc, hw_rq_counter);
+	arg.qpc_sw_rq_counter     = MLX5_GET(qpc, qpc, sw_rq_counter);
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: query_qp: vf %u qpn 0x%x state=%u sw_rq=%u hw_rq=%u next_rcv_psn=0x%x\n",
+		      arg.vf_id, arg.qpn, arg.qpc_state,
+		      arg.qpc_sw_rq_counter, arg.qpc_hw_rq_counter,
+		      arg.qpc_next_rcv_psn);
+
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
 static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 				    void __user *uarg)
 {
@@ -3262,6 +3368,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_PROBE_UID:
 		ret = vfmig_ioc_probe_uid(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_QUERY_QP:
+		ret = vfmig_ioc_query_qp(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

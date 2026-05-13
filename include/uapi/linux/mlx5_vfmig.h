@@ -356,4 +356,75 @@ struct mlx5_vfmig_probe_uid {
 #define MLX5_VFMIG_IOC_PROBE_UID \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x08, struct mlx5_vfmig_probe_uid)
 
+/*
+ * MLX5_VFMIG_IOC_QUERY_QP:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_UID, NOT part of the
+ *       M2/M3 contract. ***
+ *
+ *   Issues firmware QUERY_QP(opcode 0x50b) on a *bound* VF mdev for
+ *   the supplied @qpn and returns the subset of the QPC that lets a
+ *   userspace test compare a QP's state across SAVE_VHCA_STATE +
+ *   LOAD_VHCA_STATE without owning a userspace ib_qp handle for it.
+ *
+ *   Use-case: DESIGN_R3_uobj_restore.md §6.3 piggyback experiment.
+ *   On the source, allocate an RC QP, transition it to INIT, post N
+ *   receive WRs. Snapshot the QPC via this ioctl (records state,
+ *   hw/sw RQ counters, next_rcv_psn, ...). SAVE, then on the
+ *   destination LOAD + bind and re-issue the ioctl at the SAME @qpn
+ *   (which K6 has already established remains reserved in FW). If
+ *   the destination QPC fields match the source's (state, sw_rq
+ *   counter -- the FW-visible producer position, next_rcv_psn), the
+ *   pending receive WRs intrinsically survived LOAD_VHCA_STATE and
+ *   §6.3 of the R3 design needs no kernel work. Mismatch implies a
+ *   driver-side QUERY_QP_PENDING_WRS + replay path is necessary.
+ *
+ *   The VF must currently be bound to mlx5_core and its mdev must be
+ *   MLX5_INTERFACE_STATE_UP, same constraint as PROBE_UID. UID gating
+ *   is bypassed because the command issues on the VF's own cmdif with
+ *   the kernel uid (host-privileged); FW returns the QPC regardless
+ *   of which ucontext originally allocated the QP. If a future FW
+ *   tightens this, the ioctl will return the FW-error syndrome and
+ *   we'll need to add an explicit "as_uid" argument.
+ *
+ *   Once §6.3 is empirically settled, this ioctl can be removed
+ *   without breaking any in-tree consumer (or kept around as a debug
+ *   surface -- it's a small ~30-LOC wrapper).
+ *
+ *   Returns 0 on success with the @qpc_* fields populated; -EINVAL
+ *   if vf_id is out of range or reserved fields are non-zero;
+ *   -ENODEV if the VF is unbound or its mdev interface is down;
+ *   any negative FW-error code if QUERY_QP itself fails (most
+ *   commonly "QP doesn't exist on this VHCA").
+ */
+struct mlx5_vfmig_query_qp {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 qpn;			/* in:  FW qpn to query
+					 *      (24 bits significant)
+					 */
+	__u32 reserved_in;		/* in:  must be 0 */
+
+	__u32 qpc_state;		/* out: QPC.state nibble
+					 *      (RST=0/INIT=1/RTR=2/RTS=3/...)
+					 */
+	__u32 qpc_pd;			/* out: QPC.pd      (24 bits) */
+	__u32 qpc_q_key;		/* out: QPC.q_key   (32 bits) */
+	__u32 qpc_remote_qpn;		/* out: QPC.remote_qpn (24 bits) */
+	__u32 qpc_cqn_snd;		/* out: QPC.cqn_snd (24 bits) */
+	__u32 qpc_cqn_rcv;		/* out: QPC.cqn_rcv (24 bits) */
+	__u32 qpc_srqn_rmpn_xrqn;	/* out: QPC.srqn_rmpn_xrqn (24 bits) */
+
+	__u32 qpc_next_send_psn;	/* out: QPC.next_send_psn (24 bits) */
+	__u32 qpc_next_rcv_psn;		/* out: QPC.next_rcv_psn  (24 bits) */
+	__u32 qpc_last_acked_psn;	/* out: QPC.last_acked_psn(24 bits) */
+
+	__u32 qpc_hw_sq_wqebb_counter;	/* out: QPC.hw_sq_wqebb_counter (16 bits) */
+	__u32 qpc_sw_sq_wqebb_counter;	/* out: QPC.sw_sq_wqebb_counter (16 bits) */
+	__u32 qpc_hw_rq_counter;	/* out: QPC.hw_rq_counter (32 bits) */
+	__u32 qpc_sw_rq_counter;	/* out: QPC.sw_rq_counter (32 bits) */
+
+	__u8  reserved_out[16];		/* out: zeroed */
+};
+#define MLX5_VFMIG_IOC_QUERY_QP \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x09, struct mlx5_vfmig_query_qp)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
