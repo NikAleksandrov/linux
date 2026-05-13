@@ -32,7 +32,7 @@ end-to-end correctness, not initial scaffolding.
 | # | ask | where | priority | size |
 |---|---|---|---|---|
 | K6 | **v0 gate.** FW-identity-continuity experiment: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id reservations the way it provably does for UARs? Mirrors `DESIGN_uar_restore.md` §3. Outcome decides whether K3/K4 mlx5 handlers are a small alloc-with-hint extension (best case) or require new "pre-reserve id N" FW commands (worst case, possibly FW patch). Run this first. | §8.2, §10 | **very high** | empirical experiment + small probe ioctl |
-| K2 | New generic uverbs method `UVERBS_METHOD_INFO_LIST_UOBJS(type)` that walks `ufile->uobjects` filtered by type and returns `[{handle, ...}]`. Covers AH and any future non-restracked uobject. Also drives the **pre-suspend coverage check** that rejects DEVX/MW/FLOW/XRCD-holding processes in v0 | §6.2 | high | small new ioctl |
+| K2 | **Already exists upstream as `UVERBS_METHOD_INFO_HANDLES` on `UVERBS_OBJECT_DEVICE`** (drivers/infiniband/core/uverbs_std_types_device.c). Takes a `UVERBS_ATTR_INFO_OBJECT_ID` (u16 -- accepts ANY core or driver-namespace object id via `uapi_key_obj()`), walks `ufile->uobjects` under `uobjects_lock` filtered by `obj->uapi_object`, returns `UVERBS_ATTR_INFO_HANDLES_LIST` (u32[]) and `UVERBS_ATTR_INFO_TOTAL_HANDLES` (filled count). Covers AH and every other non-restracked uobject. Drives the pre-suspend coverage check (DEVX/MW/FLOW/XRCD rejection) by enumerating those types and failing the dump if any are present. Validated end-to-end by `k2_info_handles_probe` -- see §7.2 | §6.2 | done | zero kernel work |
 | K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive — XA-insert at caller-specified handle, return `-EBUSY` if taken — is already proven by the UAR restore path; this is plumbing, not new core | §7.3 | medium | reuse existing helper |
 | K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new hw-agnostic `IB_UCONTEXT_RESTORE_MODE` ucontext flag, which mlx5_vfmig sets when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` and rxe sets when opened with the corresponding rxe restore-mode flag. Generic verb checks the hw-agnostic flag only | §7.1, §7.2 | high | medium per type |
 | K4 | `ib_device_ops` extended with `restore_pd`, `restore_cq`, `restore_qp`, `restore_mr`, `restore_srq`, `restore_ah`, `restore_comp_channel`, `restore_async_event`. Each driver installs its restore-mode ops vector once, at VF/device **probe** time, when the device is entering VFMIG_RESTORE state (i.e. before any uverbs cdev opens against it). No mid-life ops swapping | §7.3, §7.4 | high | one ops vector + per-driver impl |
@@ -40,11 +40,12 @@ end-to-end correctness, not initial scaffolding.
 | K7 | (optional, stretch) Add restrack entries for AH (`RDMA_RESTRACK_AH`). If we land K2, this is unnecessary -- but adding it later is cheap if K2 ends up not landing | §6.2 | low | optional |
 | K1 | (deprioritized, optional cleanup) Add `RDMA_NLDEV_ATTR_RES_CTXN` emission in `fill_res_qp_entry`, `fill_res_mr_entry`, `fill_res_srq_entry`, `fill_res_cm_id_entry`. Not v0-blocking: CRIU joins QP/MR/SRQ to ctxn through PDN against the PD inventory (PD entries already emit CTXN). Land only if a follow-on need surfaces | §6.1 | very low | one line per fn |
 
-**v0 ordering**: K6 first (gates K3/K4 mlx5 design). K2 in parallel (also
-needed for the pre-suspend coverage check). K2.5 / K3 / K4 implement the
-restore path, callback-by-callback across rxe + mlx5_vfmig per
-class (PD -> MR -> CQ -> QP; see §9.1). K5 is already done. K1 and K7 are
-deferred / optional.
+**v0 ordering**: K6 first (gates K3/K4 mlx5 design) -- **done, PARTIAL
+PASS, see §10**. K2 in parallel -- **discovered already implemented as
+`UVERBS_METHOD_INFO_HANDLES`, no kernel work; see §7.2**. K2.5 / K3 / K4
+implement the restore path, callback-by-callback across rxe + mlx5_vfmig
+per class (PD -> MR -> CQ -> QP; see §9.1). K5 is already done. K1 and
+K7 are deferred / optional.
 
 ## 1. Goal and scope
 
@@ -904,27 +905,84 @@ nldev.c:743 and :656.
 No new ABI; `RDMA_NLDEV_ATTR_RES_CTXN` already exists (line 103). Adds
 ~4 LOC per fill function.
 
-### 7.2 K2: generic LIST_UOBJS uverbs method
+### 7.2 K2: generic LIST_UOBJS uverbs method (already upstream)
+
+**Status (2026-05-13): no new kernel work required.** The primitive
+this section proposed already exists upstream as
+`UVERBS_METHOD_INFO_HANDLES` on `UVERBS_OBJECT_DEVICE`. From
+`drivers/infiniband/core/uverbs_std_types_device.c`:
 
 ```c
-UVERBS_HANDLER(UVERBS_METHOD_INFO_LIST_UOBJS)(struct uverbs_attr_bundle *attrs)
-{
-    /* IN:  u16 type   (UVERBS_OBJECT_*) */
-    /* OUT: variable-length [{u32 handle}] */
-
-    /* Two-pass count+fill, like our existing UAR query verbs. */
-    /* Walk ufile->uobjects under hw_destroy_rwsem (read), filter by type,
-     * emit handle (and optionally a per-class summary blob, decided at
-     * impl time -- v0 just emits handles). */
-}
+DECLARE_UVERBS_NAMED_METHOD(
+    UVERBS_METHOD_INFO_HANDLES,
+    UVERBS_ATTR_CONST_IN(UVERBS_ATTR_INFO_OBJECT_ID,
+                         enum uverbs_default_objects, UA_MANDATORY),
+    UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_INFO_TOTAL_HANDLES,
+                        UVERBS_ATTR_TYPE(u32), UA_OPTIONAL),
+    UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_INFO_HANDLES_LIST,
+                        UVERBS_ATTR_MIN_SIZE(sizeof(u32)),
+                        UA_OPTIONAL));
 ```
 
-Generic; lives in `drivers/infiniband/core/uverbs_std_types.c` or a new
-`uverbs_std_types_info.c`. No per-driver code. Two-pass count+fill is
-the same idiom we already use for `MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS`.
+Handler walks `ufile->uobjects` under `uobjects_lock`, filtered by
+`obj->uapi_object == uapi_get_object(uapi, hdr.object_id)`. The
+`uapi_get_object()` lookup goes through `uapi_key_obj()` which already
+encodes the namespace bit, so the same ioctl path accepts both core
+(`UVERBS_OBJECT_AH`, `UVERBS_OBJECT_ASYNC_EVENT`, `UVERBS_OBJECT_XRCD`,
+…) and driver-namespace object ids (`MLX5_IB_OBJECT_UAR`,
+`MLX5_IB_OBJECT_DEVX_*`, …) uniformly. That's exactly the surface CRIU
+needs for both the per-type enumeration and the DEVX/MW/FLOW/XRCD
+coverage check.
 
-For v0, `LIST_UOBJS` is consumed by CRIU only for AH (and, when XRC
-unblocks, for XRCD). Non-restracked types we know we want now.
+Empirically validated end-to-end by
+`tools/testing/mlx5_vfmig/k2_info_handles_probe.c`. Run output on
+ConnectX-6 Dx, `mlx5_0`, after allocating 3 PDs + 2 CQs + 2 MRs +
+2 QPs via libibverbs:
+
+```
+PASS PD:   3 handle(s) match libibverbs view
+PASS CQ:   2 handle(s) match libibverbs view
+PASS MR:   2 handle(s) match libibverbs view
+PASS QP:   2 handle(s) match libibverbs view
+PASS AH-empty: 0 handles
+PASS SRQ-empty: 0 handles
+PASS MLX5_IB_OBJECT_UAR: 2 handle(s)  -- driver namespace accepted
+PASS PD-saturation: TOTAL=1 with cap=1
+```
+
+Caveats to record for the CRIU consumer:
+
+* The kernel returns the **filled** count (= `min(real_total, capacity)`),
+  not the true total. Callers detect saturation by `total ==
+  capacity` and retry with a bigger buffer; otherwise the
+  enumeration is complete. There is no "sizing-only" mode (the
+  kernel rejects `LIST` len <= 0 with `-EINVAL`).
+* `hdr->driver_id` must match the bound device's `uapi->driver_id`
+  even though INFO_HANDLES is a core-namespace method
+  (`ib_uverbs_cmd_verbs()` enforces this unconditionally at
+  uverbs_ioctl.c:570). Trivial, but easy to miss.
+* `obj->uapi_object` is set at uobject commit time and never mutated;
+  the filter is therefore stable for the duration of the spinlocked
+  walk. No need to revalidate identity post-walk.
+
+The K6 sibling finding -- that current libmlx5 dispenses dynamic
+`MLX5_IB_OBJECT_UAR` uobjects on a per-QP basis (the probe observed
+N_QP=2 produced N_UAR=2) -- means S3/S4/S5/S6 will see UAR uobjects in
+the ucontext alongside the user-visible PD/CQ/MR/QP. The restore path
+already covers UAR via the existing `MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS`
+plumbing, but the enumeration order must restore UARs **before** any
+QP that references them. The R3 DAG already encodes this because the
+QP create ABI carries `bfreg.uar` as an input, so the dependency edge
+is implicit in the per-uobj blob.
+
+For v0, `INFO_HANDLES` is consumed by CRIU for:
+* every uobject class enumerated at dump (NLDEV restrack covers
+  PD/CQ/QP/MR/SRQ/CM_ID but **not** AH, ASYNC_EVENT, COMP_CHANNEL,
+  XRCD, DM, COUNTERS, DMAH; for those `INFO_HANDLES` is the primary
+  enumeration source); and
+* the pre-suspend coverage check (enumerate DEVX/MW/FLOW/XRCD; if
+  any non-empty, refuse the dump with a clear "v0 doesn't cover
+  type X" message and the offending handles).
 
 ### 7.3 K3: UVERBS_OBJECT_RESTORE namespace + per-class methods
 
@@ -1197,9 +1255,11 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   existing "PD-uobject preservation gap" failure unchanged; image
   inspection via `crit show` shows the DAG correctly captured.
   **First landable CRIU-side commit set.** Lands in parallel with S0.
-* **S2: K2 (LIST_UOBJS).** Generic uverbs method, no driver work.
-  Unblocks AH discovery + pre-suspend coverage check. Can land in
-  parallel with S0/S1.
+* **S2: K2 (LIST_UOBJS).** **Done -- already upstream as
+  `UVERBS_METHOD_INFO_HANDLES`.** Validated by
+  `k2_info_handles_probe`. CRIU plugin will call it for AH discovery
+  and the DEVX/MW/FLOW/XRCD pre-suspend coverage check; no kernel
+  patch needed.
 * **S3: PD restore (rxe + mlx5_vfmig together).** Implement K3
   `RESTORE_PD` method + both drivers' `restore_pd` callbacks. mlx5
   shape determined by S0. Both `run_uverbs_cr.sh` and
