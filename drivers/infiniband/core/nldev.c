@@ -101,6 +101,7 @@ static const struct nla_policy nldev_policy[RDMA_NLDEV_ATTR_MAX] = {
 	[RDMA_NLDEV_ATTR_RES_CQ_ENTRY]		= { .type = NLA_NESTED },
 	[RDMA_NLDEV_ATTR_RES_CTX]		= { .type = NLA_NESTED },
 	[RDMA_NLDEV_ATTR_RES_CTXN]		= { .type = NLA_U32 },
+	[RDMA_NLDEV_ATTR_RES_HANDLE]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_CTX_ENTRY]		= { .type = NLA_NESTED },
 	[RDMA_NLDEV_ATTR_RES_DST_ADDR]		= {
 			.len = sizeof(struct __kernel_sockaddr_storage) },
@@ -558,6 +559,11 @@ static int fill_res_qp_entry(struct sk_buff *msg, bool has_cap_net_admin,
 	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_PDN, qp->pd->res.id))
 		return -EMSGSIZE;
 
+	if (!rdma_is_kernel_res(res) &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE,
+			qp->uobject->uevent.uobject.id))
+		return -EMSGSIZE;
+
 	ret = fill_res_name_pid(msg, res);
 	if (ret)
 		return -EMSGSIZE;
@@ -657,6 +663,11 @@ static int fill_res_cq_entry(struct sk_buff *msg, bool has_cap_net_admin,
 			cq->uobject->uevent.uobject.context->res.id))
 		return -EMSGSIZE;
 
+	if (!rdma_is_kernel_res(res) &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE,
+			cq->uobject->uevent.uobject.id))
+		return -EMSGSIZE;
+
 	if (fill_res_name_pid(msg, res))
 		return -EMSGSIZE;
 
@@ -697,6 +708,10 @@ static int fill_res_mr_entry(struct sk_buff *msg, bool has_cap_net_admin,
 
 	if (!rdma_is_kernel_res(res) &&
 	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_PDN, mr->pd->res.id))
+		return -EMSGSIZE;
+
+	if (!rdma_is_kernel_res(res) &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE, mr->uobject->id))
 		return -EMSGSIZE;
 
 	if (fill_res_name_pid(msg, res))
@@ -742,6 +757,10 @@ static int fill_res_pd_entry(struct sk_buff *msg, bool has_cap_net_admin,
 	if (!rdma_is_kernel_res(res) &&
 	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_CTXN,
 			pd->uobject->context->res.id))
+		goto err;
+
+	if (!rdma_is_kernel_res(res) &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE, pd->uobject->id))
 		goto err;
 
 	return fill_res_name_pid(msg, res);
@@ -869,6 +888,11 @@ static int fill_res_srq_entry(struct sk_buff *msg, bool has_cap_net_admin,
 				srq->ext.cq->res.id))
 			goto err;
 	}
+
+	if (!rdma_is_kernel_res(res) &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE,
+			srq->uobject->uevent.uobject.id))
+		goto err;
 
 	if (fill_res_srq_qps(msg, srq))
 		goto err;

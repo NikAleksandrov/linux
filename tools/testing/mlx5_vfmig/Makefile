@@ -13,7 +13,8 @@ TOOL_BINARIES :=					\
 # continuity probe).
 PROBE_BINARIES :=						\
 	uobject_restore/info_handles/info_handles_probe		\
-	uobject_restore/fw_id_continuity/fw_id_continuity_probe
+	uobject_restore/fw_id_continuity/fw_id_continuity_probe	\
+	uobject_restore/nldev_res_handle/nldev_res_handle_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
 # because it pulls in <linux/iommufd.h> + <linux/vfio.h> which require
@@ -51,6 +52,13 @@ uobject_restore/fw_id_continuity/fw_id_continuity_probe: \
 # libibverbs only (no mlx5dv).
 uobject_restore/info_handles/info_handles_probe: \
 		uobject_restore/info_handles/info_handles_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# NLDEV RES_HANDLE attribute probe (design/uobject_restore.md §7.5.1).
+# Raw NETLINK_RDMA dump + libibverbs alloc; no driver-private deps.
+uobject_restore/nldev_res_handle/nldev_res_handle_probe: \
+		uobject_restore/nldev_res_handle/nldev_res_handle_probe.c \
+		../../../include/uapi/rdma/rdma_netlink.h
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 tools/vfio_stop_copy_save: tools/vfio_stop_copy_save.c
