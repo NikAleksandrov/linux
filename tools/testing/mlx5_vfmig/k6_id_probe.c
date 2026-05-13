@@ -268,17 +268,41 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * §6.3 piggyback: post N receive WRs to the QP's RQ. We have
-	 * to take the QP at least into INIT for post_recv to be legal
-	 * on some providers; on mlx5 it's accepted in RESET so we
-	 * post directly. The receive WRs reference our local MR so
-	 * they're self-contained; we never actually drive RTR/RTS.
+	 * §6.3 piggyback: post N receive WRs to the QP's RQ. We
+	 * transition the QP to INIT first so:
+	 *   (a) the QPC carries a non-zero state field, which is a
+	 *       more discriminating cross-check than "RESET on both
+	 *       sides" when comparing src and dst QUERY_QP results,
+	 *       and
+	 *   (b) we mirror what a real workload would do before
+	 *       posting receives.
+	 * We never drive RTR/RTS -- the GID/AV plumbing for that
+	 * would couple us to the netdev which is intentionally TX-
+	 * dropping on tracked VFs. INIT is enough for the FW to
+	 * populate the RQ accounting fields we want to compare.
 	 *
-	 * A follow-on QUERY_QP (driven by a PF cdev probe ioctl, not
-	 * by this tool) reads the RQ head/tail before SAVE; the dest
-	 * side compares after LOAD.
+	 * A follow-on QUERY_QP (driven by the PF cdev's
+	 * MLX5_VFMIG_IOC_QUERY_QP) reads the RQ counters before SAVE;
+	 * the dest side compares after LOAD.
 	 */
 	if (post_recv_wrs > 0) {
+		struct ibv_qp_attr attr = {
+			.qp_state        = IBV_QPS_INIT,
+			.pkey_index      = 0,
+			.port_num        = 1,
+			.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
+					   IBV_ACCESS_REMOTE_WRITE |
+					   IBV_ACCESS_REMOTE_READ,
+		};
+		int mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+			   IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS;
+		int err = ibv_modify_qp(qp, &attr, mask);
+		if (err) {
+			fprintf(stderr,
+				"k6: ibv_modify_qp(INIT) failed: %s -- "
+				"posting receives in RESET state anyway\n",
+				strerror(err));
+		}
 		for (int i = 0; i < post_recv_wrs; i++) {
 			struct ibv_sge sge = {
 				.addr = (uintptr_t)mr_buf,

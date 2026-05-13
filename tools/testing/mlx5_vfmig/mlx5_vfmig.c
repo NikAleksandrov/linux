@@ -15,6 +15,7 @@
  *   mlx5_vfmig <pf-bdf> load_vhca_state  <vf_id> <blob_path>
  *   mlx5_vfmig <pf-bdf> save_vhca_state  <vf_id> <blob_path> [keep_suspended]
  *   mlx5_vfmig <pf-bdf> enable_migratable <vf_id>
+ *   mlx5_vfmig <pf-bdf> query_qp          <vf_id> <qpn>
  *
  * Verbs accept either '_' or '-' between words.
  *
@@ -71,6 +72,56 @@ static int do_probe_uid(int fd, unsigned int vf_id)
 		return 1;
 	}
 	printf("vf %u: probe_uid -> uid=%u\n", vf_id, arg.uid);
+	return 0;
+}
+
+/*
+ * EXPERIMENTAL: raw FW QUERY_QP on a bound VF's mdev.
+ * Used by the §6.3 piggyback experiment in
+ * DESIGN_R3_uobj_restore.md to confirm pending RQ WRs and QP state
+ * survive LOAD_VHCA_STATE intrinsically.
+ *
+ * Output format is intentionally shell-eval-able (one `key=value`
+ * per line) so test_k6_id_continuity.sh can capture the result into
+ * named variables.
+ */
+static int do_query_qp(int fd, unsigned int vf_id, unsigned int qpn)
+{
+	struct mlx5_vfmig_query_qp arg = {
+		.vf_id = vf_id,
+		.qpn   = qpn,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_QUERY_QP, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(QUERY_QP requires the VF mdev to be "
+				"interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"QUERY_QP: invalid arg (vf_id=%u qpn=%u). "
+				"qpn must fit in 24 bits.\n", vf_id, qpn);
+		else
+			perror("QUERY_QP");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("qpn=%u\n", qpn);
+	printf("qpc_state=%u\n",                  arg.qpc_state);
+	printf("qpc_pd=%u\n",                     arg.qpc_pd);
+	printf("qpc_q_key=0x%08x\n",              arg.qpc_q_key);
+	printf("qpc_remote_qpn=%u\n",             arg.qpc_remote_qpn);
+	printf("qpc_cqn_snd=%u\n",                arg.qpc_cqn_snd);
+	printf("qpc_cqn_rcv=%u\n",                arg.qpc_cqn_rcv);
+	printf("qpc_srqn_rmpn_xrqn=%u\n",         arg.qpc_srqn_rmpn_xrqn);
+	printf("qpc_next_send_psn=0x%06x\n",      arg.qpc_next_send_psn);
+	printf("qpc_next_rcv_psn=0x%06x\n",       arg.qpc_next_rcv_psn);
+	printf("qpc_last_acked_psn=0x%06x\n",     arg.qpc_last_acked_psn);
+	printf("qpc_hw_sq_wqebb_counter=%u\n",    arg.qpc_hw_sq_wqebb_counter);
+	printf("qpc_sw_sq_wqebb_counter=%u\n",    arg.qpc_sw_sq_wqebb_counter);
+	printf("qpc_hw_rq_counter=%u\n",          arg.qpc_hw_rq_counter);
+	printf("qpc_sw_rq_counter=%u\n",          arg.qpc_sw_rq_counter);
 	return 0;
 }
 
@@ -401,6 +452,7 @@ static void usage(const char *argv0)
 		"  enable_migratable <vf_id>\n"
 		"  set_tracked       <vf_id> <0|1>\n"
 		"  probe_uid         <vf_id>     (experimental)\n"
+		"  query_qp          <vf_id> <qpn>  (experimental)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
 }
@@ -477,6 +529,11 @@ int main(int argc, char **argv)
 		if (argc != 4)
 			goto badargs;
 		ret = do_probe_uid(fd, strtoul(argv[3], NULL, 0));
+	} else if (verb_eq(verb, "query_qp")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_query_qp(fd, strtoul(argv[3], NULL, 0),
+				  strtoul(argv[4], NULL, 0));
 	} else {
 		fprintf(stderr, "unknown verb: %s\n", verb);
 		ret = 2;
