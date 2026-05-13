@@ -7,7 +7,7 @@ CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 # `make vfio-helper` because it is only needed by the legacy
 # test_m2.sh path and pulls in <linux/iommufd.h> + <linux/vfio.h>
 # which require sanitized userspace headers.
-BINARIES := mlx5_vfmig mlx5_vfmig_synth mlx5_vfmig_uctx
+BINARIES := mlx5_vfmig mlx5_vfmig_synth mlx5_vfmig_uctx k6_id_probe
 VFIO_BINARIES := mlx5_vfmig_save
 
 # Where to find sanitized userspace versions of <linux/iommufd.h> and
@@ -30,6 +30,12 @@ mlx5_vfmig_synth: mlx5_vfmig_synth.c
 
 mlx5_vfmig_uctx: mlx5_vfmig_uctx.c
 	$(CC) $(CFLAGS) -o $@ $<
+
+# K6 FW-id continuity probe (DESIGN_R3_uobj_restore.md §8.2).
+# Pulls in libibverbs + libmlx5 (mlx5dv) -- present on any host with
+# rdma-core installed.
+k6_id_probe: k6_id_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
 
 mlx5_vfmig_save: mlx5_vfmig_save.c
 	$(CC) $(CFLAGS) $(if $(UAPI_INCLUDE),-I$(UAPI_INCLUDE),) -o $@ $<
