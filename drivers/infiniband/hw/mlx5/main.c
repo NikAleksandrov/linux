@@ -2702,6 +2702,88 @@ static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 	return mlx5_cmd_dealloc_pd(mdev->mdev, mpd->pdn, mpd->uid);
 }
 
+/*
+ * mlx5_ib_restore_pd: CRIU-managed PD restore for the v0 critical
+ * path (non-DEVX libibverbs ucontexts). Adopts the source's FW pdn
+ * into a fresh kernel-side mlx5_ib_pd without re-issuing
+ * MLX5_CMD_OP_ALLOC_PD on the destination -- the source pdn is
+ * already reserved in the destination VF's firmware after
+ * LOAD_VHCA_STATE.
+ *
+ * Two empirical results back this "Model A":
+ *
+ *   K6 (PARTIAL PASS,
+ *       tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/):
+ *     a fresh MLX5_CMD_OP_ALLOC_PD on the destination after LOAD
+ *     returns a pdn strictly greater than the maximum pdn from the
+ *     source ucontext (consistent +3 to +5 delta vs the
+ *     destination's own mlx5_ib_dev_res internal allocations). The
+ *     FW pdn allocator's high-water mark survives LOAD, so the
+ *     source's pdn slots are reserved on the destination.
+ *
+ *   pd_adopt (WEAK PASS,
+ *       tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/):
+ *     CREATE_MKEY under uid=0 (the non-DEVX case -- mlx5_ib_alloc_pd
+ *     sets mpd->uid = context->devx_uid, which is 0 for any
+ *     ucontext that did not opt into MLX5_IB_ALLOC_UCTX_DEVX) is
+ *     ungated by firmware on mkc.pd validity, so subsequent FW
+ *     ops referencing the adopted pdn succeed without any gate
+ *     to satisfy.
+ *
+ * DEVX-aware applications (mlx5dv_*, devx_obj_create, ...) are not
+ * covered by this v0; they need a PROBE_UID-delta-based validation
+ * first because their downstream FW ops run under devx_uid != 0
+ * where firmware gating *does* apply.
+ *
+ * The dispatcher in uverbs_std_types_restore.c has already:
+ *   - gated on mlx5_ib_ucontext_is_restore_mode
+ *     (context->vfmig_restore_mode is true);
+ *   - reserved target_handle in the ufile idr via
+ *     rdma_alloc_begin_uobject_at_handle();
+ *   - allocated a zeroed mlx5_ib_pd of the right size via
+ *     rdma_zalloc_drv_obj.
+ * Our job is to populate mpd->pdn / mpd->uid; everything else is
+ * already in place.
+ */
+static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
+			      struct ib_udata *udata)
+{
+	struct mlx5_ib_pd *pd = to_mpd(ibpd);
+	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
+		udata, struct mlx5_ib_ucontext, ibucontext);
+	struct mlx5_ib_restore_pd_req req = {};
+	int err;
+
+	if (!context)
+		return -EINVAL;
+
+	/*
+	 * The generic dispatcher already gated on
+	 * mlx5_ib_ucontext_is_restore_mode. Belt & suspenders here so a
+	 * driver-direct caller (devx fast path, future test harnesses)
+	 * cannot bypass the per-ucontext sticky bool.
+	 */
+	if (!context->vfmig_restore_mode)
+		return -EPERM;
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return -EINVAL;
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return err;
+	if (req.reserved || req.reserved2)
+		return -EINVAL;
+	/* FW pdn is a 24-bit field (see PRM "alloc_pd_out"). */
+	if (req.pdn & ~0xffffffU || req.pdn == 0)
+		return -EINVAL;
+
+	(void)target_handle; /* ufile-handle slot is the dispatcher's job */
+
+	pd->pdn = req.pdn;
+	pd->uid = context->devx_uid;
+	return 0;
+}
+
 static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
@@ -4540,6 +4622,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.req_notify_cq = mlx5_ib_arm_cq,
 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
 	.resize_cq = mlx5_ib_resize_cq,
+	.restore_pd = mlx5_ib_restore_pd,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
 
