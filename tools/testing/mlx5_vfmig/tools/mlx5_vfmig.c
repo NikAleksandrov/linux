@@ -125,6 +125,48 @@ static int do_query_qp(int fd, unsigned int vf_id, unsigned int qpn)
 	return 0;
 }
 
+/*
+ * EXPERIMENTAL: §S3b empirical -- "is the source's FW pdn still
+ * usable on the destination under a given uid scope after
+ * LOAD_VHCA_STATE?". See include/uapi/linux/mlx5_vfmig.h's
+ * MLX5_VFMIG_IOC_PROBE_PD block for the full methodology.
+ *
+ * Output is one key=value per line so the shell harness can
+ * capture it into named variables.
+ */
+static int do_probe_pd(int fd, unsigned int vf_id, unsigned int pdn,
+		       unsigned int uid_hint)
+{
+	struct mlx5_vfmig_probe_pd arg = {
+		.vf_id    = vf_id,
+		.pdn      = pdn,
+		.uid_hint = uid_hint,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_PD, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(PROBE_PD requires the VF mdev to be "
+				"interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"PROBE_PD: invalid arg "
+				"(vf_id=%u pdn=%u uid_hint=%u). "
+				"pdn must fit in 24 bits, uid in 16.\n",
+				vf_id, pdn, uid_hint);
+		else
+			perror("PROBE_PD");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("pdn=%u\n", pdn);
+	printf("uid_hint=%u\n", uid_hint);
+	printf("fw_syndrome=0x%08x\n", arg.fw_syndrome);
+	printf("fw_accept=%u\n", arg.fw_syndrome == 0 ? 1 : 0);
+	return 0;
+}
+
 static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
 {
 	struct mlx5_vfmig_set_tracked arg = {
@@ -453,6 +495,7 @@ static void usage(const char *argv0)
 		"  set_tracked       <vf_id> <0|1>\n"
 		"  probe_uid         <vf_id>     (experimental)\n"
 		"  query_qp          <vf_id> <qpn>  (experimental)\n"
+		"  probe_pd          <vf_id> <pdn> [<uid_hint=0>]  (experimental)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
 }
@@ -534,6 +577,15 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_query_qp(fd, strtoul(argv[3], NULL, 0),
 				  strtoul(argv[4], NULL, 0));
+	} else if (verb_eq(verb, "probe_pd")) {
+		unsigned int uid_hint = 0;
+
+		if (argc != 5 && argc != 6)
+			goto badargs;
+		if (argc == 6)
+			uid_hint = strtoul(argv[5], NULL, 0);
+		ret = do_probe_pd(fd, strtoul(argv[3], NULL, 0),
+				  strtoul(argv[4], NULL, 0), uid_hint);
 	} else {
 		fprintf(stderr, "unknown verb: %s\n", verb);
 		ret = 2;
