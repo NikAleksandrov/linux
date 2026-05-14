@@ -15,7 +15,8 @@ PROBE_BINARIES :=						\
 	uobject_restore/info_handles/info_handles_probe		\
 	uobject_restore/fw_id_continuity/fw_id_continuity_probe	\
 	uobject_restore/nldev_res_handle/nldev_res_handle_probe	\
-	uobject_restore/pd_restore/pd_restore_probe_rxe
+	uobject_restore/pd_restore/pd_restore_probe_rxe		\
+	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
 # because it pulls in <linux/iommufd.h> + <linux/vfio.h> which require
@@ -71,6 +72,18 @@ uobject_restore/nldev_res_handle/nldev_res_handle_probe: \
 # for the new rxe_alloc_ucontext_req).
 uobject_restore/pd_restore/pd_restore_probe_rxe: \
 		uobject_restore/pd_restore/pd_restore_probe_rxe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# RESTORE_PD + mlx5_ib_restore_pd S3b end-to-end probe
+# (design/uobject_restore.md §9.1 S3b). Same shape as the rxe S3a
+# probe: libibverbs only for ibdev->uverbs cdev mapping, then we
+# open /dev/infiniband/uverbsN directly so we can drive the
+# MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE flag in GET_CONTEXT udata and
+# pass the new struct mlx5_ib_restore_pd_req as the RESTORE_PD UHW
+# blob. Both are inlined in the probe; libmlx5 has no plumbing for
+# either today.
+uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig: \
+		uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 tools/vfio_stop_copy_save: tools/vfio_stop_copy_save.c
