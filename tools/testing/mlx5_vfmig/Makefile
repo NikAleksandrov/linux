@@ -14,7 +14,8 @@ TOOL_BINARIES :=					\
 PROBE_BINARIES :=						\
 	uobject_restore/info_handles/info_handles_probe		\
 	uobject_restore/fw_id_continuity/fw_id_continuity_probe	\
-	uobject_restore/nldev_res_handle/nldev_res_handle_probe
+	uobject_restore/nldev_res_handle/nldev_res_handle_probe	\
+	uobject_restore/pd_restore/pd_restore_probe_rxe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
 # because it pulls in <linux/iommufd.h> + <linux/vfio.h> which require
@@ -59,6 +60,17 @@ uobject_restore/info_handles/info_handles_probe: \
 uobject_restore/nldev_res_handle/nldev_res_handle_probe: \
 		uobject_restore/nldev_res_handle/nldev_res_handle_probe.c \
 		../../../include/uapi/rdma/rdma_netlink.h
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# RESTORE_PD + rxe_restore_pd S3a probe (design/uobject_restore.md §9.4).
+# libibverbs only used for ibdev->uverbs cdev mapping; the GET_CONTEXT
+# udata path needs the rxe RXE_ALLOC_UCTX_RESTORE_MODE flag which
+# librxe has no plumbing for, so the probe opens /dev/infiniband/uverbsN
+# directly and issues raw write/ioctl. UAPI structs are inlined in the
+# probe source (system rdma-core uapi lags the in-tree kernel headers
+# for the new rxe_alloc_ucontext_req).
+uobject_restore/pd_restore/pd_restore_probe_rxe: \
+		uobject_restore/pd_restore/pd_restore_probe_rxe.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 tools/vfio_stop_copy_save: tools/vfio_stop_copy_save.c
