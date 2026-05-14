@@ -16,7 +16,8 @@ PROBE_BINARIES :=						\
 	uobject_restore/fw_id_continuity/fw_id_continuity_probe	\
 	uobject_restore/nldev_res_handle/nldev_res_handle_probe	\
 	uobject_restore/pd_restore/pd_restore_probe_rxe		\
-	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig
+	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig	\
+	uobject_restore/mr_restore/mr_restore_probe_rxe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
 # because it pulls in <linux/iommufd.h> + <linux/vfio.h> which require
@@ -84,6 +85,14 @@ uobject_restore/pd_restore/pd_restore_probe_rxe: \
 # either today.
 uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig: \
 		uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# RESTORE_MR + rxe_restore_mr S4a probe (design/uobject_restore.md §9.5).
+# Same libibverbs-only / raw-uverbs pattern as pd_restore_probe_rxe; UAPI
+# bits inlined in the source for the same reason (system rdma-core uapi
+# lags the in-tree kernel for the new RESTORE_MR attrs).
+uobject_restore/mr_restore/mr_restore_probe_rxe: \
+		uobject_restore/mr_restore/mr_restore_probe_rxe.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 tools/vfio_stop_copy_save: tools/vfio_stop_copy_save.c
