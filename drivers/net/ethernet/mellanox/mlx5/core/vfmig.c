@@ -1054,6 +1054,153 @@ out_unlock:
 	return err;
 }
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_PD handler -- experimental, §S3b empirical.
+ *
+ * Issues a transient CREATE_MKEY(uid, pd, access_mode=PA, length64=1)
+ * followed by DESTROY_MKEY on the bound VF mdev's cmdif. The whole
+ * point is to answer the §S3b question: "can a uid that has no
+ * destination-side ucontext owner still be used by FW to validate a
+ * PD reference in a fresh CREATE_MKEY?" If yes (FW accepts), Model A
+ * for mlx5_ib_restore_pd is sound: we can build a kernel-side
+ * mlx5_ib_pd wrapping (src_pdn, src_uid) without first allocating a
+ * fresh PD via mlx5_cmd_alloc_pd.
+ *
+ * VF mdev lookup mirrors vfmig_ioc_query_qp (which itself mirrors
+ * vfmig_ioc_probe_uid): resolve the VF pci_dev from PF + vf_id, take
+ * device_lock to pin ->driver and drvdata, match driver by
+ * KBUILD_MODNAME, require MLX5_INTERFACE_STATE_UP. CREATE_MKEY and
+ * DESTROY_MKEY both run on the VF mdev's cmdif with cmdif-uid=0
+ * (host-privileged); the create_mkey_in.uid field is set from
+ * @uid_hint independently, and that is the field FW reads for the
+ * (uid, pd) gating check we want to exercise.
+ */
+static long vfmig_ioc_probe_pd(struct mlx5_vfmig_pf *vfmig,
+			       void __user *uarg)
+{
+	u32 in[MLX5_ST_SZ_DW(create_mkey_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(create_mkey_out)] = {};
+	u32 dmk_in[MLX5_ST_SZ_DW(destroy_mkey_in)] = {};
+	u32 dmk_out[MLX5_ST_SZ_DW(destroy_mkey_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_pd arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	u32 mkey_index;
+	void *mkc;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved_in)
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.pdn & 0xff000000)		/* pdn is 24 bits */
+		return -EINVAL;
+	if (arg.uid_hint & 0xffff0000)		/* uid is 16 bits */
+		return -EINVAL;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_pd: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_pd: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	/*
+	 * Minimal PA-mode mkey, cribbed from mlx5_ib_data_direct's
+	 * placeholder mkey in drivers/infiniband/hw/mlx5/main.c. We
+	 * want length64=1 + qpn=0xffffff (== "any qp may use this
+	 * mkey") to skip any qp-pinning gating; the only field whose
+	 * acceptance we care about empirically is the (uid, pd) pair.
+	 */
+	MLX5_SET(create_mkey_in, in, opcode, MLX5_CMD_OP_CREATE_MKEY);
+	MLX5_SET(create_mkey_in, in, uid, arg.uid_hint);
+	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
+	MLX5_SET(mkc, mkc, access_mode_1_0, MLX5_MKC_ACCESS_MODE_PA);
+	MLX5_SET(mkc, mkc, lr, 1);
+	MLX5_SET(mkc, mkc, pd, arg.pdn);
+	MLX5_SET(mkc, mkc, length64, 1);
+	MLX5_SET(mkc, mkc, qpn, 0xffffff);
+
+	err = mlx5_cmd_exec(vf_mdev, in, sizeof(in), out, sizeof(out));
+	if (err) {
+		/*
+		 * mlx5_cmd_exec() converts FW syndromes to negative errnos
+		 * before returning, but stamps the original 32-bit
+		 * syndrome onto out[1] via cmd_status_to_err()'s caller.
+		 * Surface it to userspace so the test can distinguish
+		 * "invalid PD" (0x...) from "invalid UID" (0x...) from
+		 * transport errors.
+		 */
+		arg.fw_syndrome = MLX5_GET(create_mkey_out, out, syndrome);
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: probe_pd: vf %u pdn 0x%x uid 0x%x CREATE_MKEY err %d syndrome 0x%x\n",
+			      arg.vf_id, arg.pdn, arg.uid_hint, err,
+			      arg.fw_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+
+	arg.fw_syndrome = 0;
+	mkey_index = MLX5_GET(create_mkey_out, out, mkey_index);
+
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: probe_pd: vf %u pdn 0x%x uid 0x%x CREATE_MKEY ok mkey_index=0x%x\n",
+		      arg.vf_id, arg.pdn, arg.uid_hint, mkey_index);
+
+	/*
+	 * Tear down the probe mkey. We hand-build the destroy_mkey_in
+	 * rather than calling mlx5_core_destroy_mkey() because the
+	 * core helper hardcodes uid=0 in destroy_mkey_in (it has no
+	 * caller that needs the uid form). If DESTROY_MKEY fails we
+	 * log + warn but return success to the caller -- the leaked
+	 * mkey is bounded by the VHCA lifetime, acceptable for a debug
+	 * ioctl on a controlled experiment.
+	 */
+	MLX5_SET(destroy_mkey_in, dmk_in, opcode, MLX5_CMD_OP_DESTROY_MKEY);
+	MLX5_SET(destroy_mkey_in, dmk_in, uid, arg.uid_hint);
+	MLX5_SET(destroy_mkey_in, dmk_in, mkey_index, mkey_index);
+	err = mlx5_cmd_exec(vf_mdev, dmk_in, sizeof(dmk_in),
+			    dmk_out, sizeof(dmk_out));
+	if (err)
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_pd: vf %u DESTROY_MKEY(mkey_index=0x%x) failed %d -- leaking probe mkey\n",
+			       arg.vf_id, mkey_index, err);
+	err = 0;	/* CREATE_MKEY succeeded; this is the result. */
+
+out_copy:
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
 static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 				    void __user *uarg)
 {
@@ -3371,6 +3518,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_QUERY_QP:
 		ret = vfmig_ioc_query_qp(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_PROBE_PD:
+		ret = vfmig_ioc_probe_pd(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

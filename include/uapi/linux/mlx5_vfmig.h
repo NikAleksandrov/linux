@@ -427,4 +427,104 @@ struct mlx5_vfmig_query_qp {
 #define MLX5_VFMIG_IOC_QUERY_QP \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x09, struct mlx5_vfmig_query_qp)
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_PD:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_UID and QUERY_QP, NOT
+ *       part of the M2/M3 contract. ***
+ *
+ *   Drives the §S3b empirical question: "After LOAD_VHCA_STATE the
+ *   firmware has the source's user-mode PDs alive on the destination
+ *   VF -- but can a *fresh* destination ucontext (with a *new*
+ *   devx_uid allocated by mlx5_ib_devx_create) reference one of those
+ *   PDs in a subsequent FW operation?"
+ *
+ *   This question matters because mlx5_ib gates every uid-scoped op
+ *   (CREATE_MKEY / CREATE_QP / CREATE_TIS / CREATE_TIR / ...) by
+ *   `to_mpd(pd)->uid`. That field is intentionally decoupled from
+ *   `context->devx_uid`: in the steady state they happen to match
+ *   because mlx5_ib_alloc_pd() sets `pd->uid = context->devx_uid`
+ *   at create time, but the runtime path doesn't enforce equality.
+ *   So a Model-A `mlx5_ib_restore_pd` can build a kernel-side
+ *   mlx5_ib_pd with `pdn = src_pdn, uid = src_uid` regardless of
+ *   the owning ucontext's fresh devx_uid -- PROVIDED the FW lets
+ *   subsequent ops referencing that pd succeed under uid=src_uid
+ *   even though no ucontext on the destination owns src_uid.
+ *   That is what this ioctl validates.
+ *
+ *   Mechanism: issues a transient CREATE_MKEY(uid=@uid_hint,
+ *   pd=@pdn, access_mode=PA, length64=1) followed immediately by
+ *   DESTROY_MKEY(uid=@uid_hint, mkey_index=<returned>) on the bound
+ *   VF mdev's cmdif. If CREATE_MKEY returns 0, the FW accepted the
+ *   (uid, pd) pair as legitimate; pdn is alive in the uid scope.
+ *   If CREATE_MKEY fails, the FW syndrome is returned in
+ *   @fw_syndrome (the caller can distinguish "bad PDN" from "bad
+ *   UID" by re-issuing with a known-good pair). On a CREATE_MKEY
+ *   success followed by a DESTROY_MKEY failure we log at warn level
+ *   and still return 0 to the caller: the test mkey leaks until
+ *   the VHCA is torn down, which is acceptable for a debug ioctl.
+ *
+ *   Methodology (mirrors PROBE_UID + QUERY_QP from K6):
+ *
+ *     - Source post-bind, BEFORE opening any ucontext:
+ *         ioctl(PROBE_UID, src_vf) -> U_baseline
+ *     - ibv_open_device(src_vf) -- libmlx5 calls GET_CONTEXT which
+ *       allocates a devx_uid via mlx5_ib_devx_create; the FW uid
+ *       allocator yields U_baseline (we recorded it BEFORE the
+ *       open, so the next allocation matches).
+ *     - ibv_alloc_pd(...) -- returns a PD whose FW pdn we capture
+ *       via mlx5dv_pd or the (now landed) NLDEV RES_HANDLE
+ *       cross-reference.
+ *     - SAVE_VHCA_STATE on src, LOAD_VHCA_STATE on dst.
+ *     - On dst, BEFORE any ucontext is bound to the restored VHCA:
+ *         ioctl(PROBE_PD, dst_vf, pdn=src_pdn, uid_hint=U_baseline)
+ *       Expected: 0 (and @fw_syndrome == 0).
+ *     - Negative control 1: same call with a bogus pdn (e.g.
+ *       0x00ffffff). Expected: non-zero @fw_syndrome with the
+ *       FW's "invalid PD" code.
+ *     - Negative control 2: same call with a bogus uid_hint
+ *       (e.g. PROBE_UID baseline + 1000). Expected: non-zero
+ *       @fw_syndrome with the FW's "invalid UID" / "access
+ *       denied" code.
+ *
+ *   The VF must currently be bound to mlx5_core and its mdev must
+ *   be MLX5_INTERFACE_STATE_UP, same constraint as PROBE_UID and
+ *   QUERY_QP. The command is issued on the VF mdev's cmdif with
+ *   the kernel uid_hint=0 placeholder in the cmdif header (FW
+ *   reads @uid_hint from the create_mkey_in.uid field, not the
+ *   cmdif uid). UID gating on CREATE_MKEY is the very property we
+ *   are validating, so this ioctl deliberately exposes it.
+ *
+ *   Once §S3b empirical validation is settled, this ioctl can be
+ *   removed without breaking any in-tree consumer (or kept around
+ *   as a debug surface -- it's a small ~40-LOC wrapper).
+ *
+ *   Returns 0 on success with @fw_syndrome=0 (FW accepted the
+ *   (uid, pd) pair); 0 with @fw_syndrome!=0 if CREATE_MKEY itself
+ *   reported a syndrome (caller inspects @fw_syndrome to classify
+ *   the rejection); -EINVAL if @vf_id is out of range, @pdn or
+ *   @uid_hint exceed their 24-bit / 16-bit ranges, or any reserved
+ *   field is non-zero; -ENODEV if the VF is unbound or its mdev
+ *   interface is down; any negative kernel/FW err code on cmdif
+ *   transport failure.
+ */
+struct mlx5_vfmig_probe_pd {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 pdn;			/* in:  FW pdn to test
+					 *      (24 bits significant)
+					 */
+	__u32 uid_hint;			/* in:  FW uid scope to test
+					 *      against (16 bits significant)
+					 */
+	__u32 reserved_in;		/* in:  must be 0 */
+
+	__u32 fw_syndrome;		/* out: 0 on FW accept, else
+					 *      the firmware syndrome
+					 *      returned by CREATE_MKEY
+					 *      (a 32-bit FW error code).
+					 */
+	__u8  reserved_out[12];		/* out: zeroed */
+};
+#define MLX5_VFMIG_IOC_PROBE_PD \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0a, struct mlx5_vfmig_probe_pd)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
