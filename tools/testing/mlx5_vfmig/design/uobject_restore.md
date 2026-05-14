@@ -1423,15 +1423,40 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   `rxe_restore_pd` is a pass-through to `rxe_alloc_pd`. Validates
   the generic dispatcher's choreography end-to-end on a software
   device before mlx5 layers FW-id-hint complexity on top.
-* **S3b: PD restore on mlx5_vfmig.** Implement `mlx5_ib_restore_pd`
-  using FW alloc-with-id-hint (the K6 PARTIAL PASS confirmed PDN
-  reservations survive `LOAD_VHCA_STATE`, so the hint pattern is
-  sound). New `MLX5_VFMIG_IOC_QUERY_PD` PF cdev ioctl for FW-side
-  verification, paralleling the `MLX5_VFMIG_IOC_QUERY_QP` we added
-  for the §6.3 piggyback. New `pd_restore_probe_mlx5_vfmig` runs
-  end-to-end SAVE -> LOAD -> `RESTORE_PD(target_handle = src_pdn)`
-  and verifies the dst `mlx5_ib_pd.pdn` matches via the new
-  ioctl. `run_vfmig_cr.sh` flips to PASS for the PD round-trip.
+* **S3b: PD restore on mlx5_vfmig (landed: C3+C4).** Implement
+  `mlx5_ib_restore_pd` via **Model A** -- adopt the source's FW
+  `pdn` into a fresh kernel-side `mlx5_ib_pd` with no destination
+  FW round-trip. CRIU passes the source `pdn` in the
+  driver-private UHW payload (`struct mlx5_ib_restore_pd_req`,
+  `include/uapi/rdma/mlx5-abi.h`); the handler sets
+  `mpd->pdn = req.pdn`, `mpd->uid = context->devx_uid` and
+  returns. Model A is sound for the v0 critical path (non-DEVX
+  `libibverbs`) because of two empirical results:
+
+  * **K6 PARTIAL PASS**
+    (`tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/`):
+    after `LOAD_VHCA_STATE` the FW `pdn` allocator's high-water
+    mark is preserved, so source `pdn` slots are reserved on the
+    destination VF.
+  * **`pd_adopt` WEAK PASS**
+    (`tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/`,
+    driven by the new `MLX5_VFMIG_IOC_PROBE_PD` PF-cdev ioctl):
+    `CREATE_MKEY` under `uid=0` is ungated by firmware on
+    `mkc.pd` validity, so downstream FW ops referencing the
+    adopted `pdn` succeed without any FW gate to satisfy.
+    Combined: no FW round-trip is required.
+
+  **DEVX-aware ucontexts** (`mlx5dv_*`, `devx_obj_create`, ...)
+  remain unsupported in v0. Their downstream FW ops run under
+  `devx_uid != 0` where firmware gating *does* apply; they need
+  a `PROBE_UID`-delta-based probe variant before any DEVX-side
+  PD restore work. **Next stage** for v0 closure: a
+  `pd_restore_probe_mlx5_vfmig` driver-end-to-end probe that
+  opens a `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` ucontext on a
+  bound, post-LOAD VF, invokes `RESTORE_PD(target_handle = U,
+  pdn = src_pdn)`, and verifies via `MLX5_VFMIG_IOC_PROBE_PD`
+  (or a follow-on `CREATE_MKEY` via `fw_id_continuity_probe`)
+  that the adopted `pdn` is referenceable.
 * **S4: MR restore (rxe + mlx5_vfmig together).** Implement
   `RESTORE_MR` + both drivers. Couples with `user_mr_dma.md`
   stage 3 (rkey continuity at the IOMMU layer); the kernel verb and
@@ -1538,9 +1563,14 @@ Failure modes the probe explicitly distinguishes:
 1. **K6 outcome**: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id
    reservations? **Answered (2026-05-13)**: PARTIAL PASS -- preserved
    for PD/CQ/QP/MKEY (SRQ skipped pending the known restored-VF SRQ
-   gate, deferred to S7). K3/K4 mlx5 handlers can use the
-   alloc-with-id-hint pattern; no FW patch required for v0.
-   See `test_fw_id_continuity.sh`.
+   gate, deferred to S7). Combined with the `pd_adopt` follow-up
+   (`uobject_restore/pd_adopt/test_pd_adopt.sh`, WEAK PASS), which
+   established that `CREATE_MKEY` under `uid=0` is FW-ungated on
+   `mkc.pd` validity, the v0 mlx5 restore handlers can adopt
+   source FW ids directly into fresh kernel-side wrappers (Model
+   A, "no destination FW round-trip"); no FW patch required.
+   `mlx5_ib_restore_pd` landed in S3b (C3+C4). See
+   `test_fw_id_continuity.sh` and `test_pd_adopt.sh`.
 2. **Pending RQ/SQ WR preservation across `LOAD_VHCA_STATE`**:
    **Answered (2026-05-13)**: structural PASS -- the FW QPC
    round-trips byte-equal across LOAD_VHCA_STATE for all 13 fields we
