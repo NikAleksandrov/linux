@@ -1450,13 +1450,44 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   remain unsupported in v0. Their downstream FW ops run under
   `devx_uid != 0` where firmware gating *does* apply; they need
   a `PROBE_UID`-delta-based probe variant before any DEVX-side
-  PD restore work. **Next stage** for v0 closure: a
-  `pd_restore_probe_mlx5_vfmig` driver-end-to-end probe that
+  PD restore work.
+
+  **v0 dealloc-ordering invariant.** Because v0 only restores
+  PDs into the kernel ufile (S3b), the source's pdn-rooted
+  CQ/QP/MR/SRQ remain alive on the destination *firmware* after
+  `LOAD_VHCA_STATE` with no corresponding kernel uobjects. The
+  kernel therefore cannot dealloc those FW dependents before
+  attempting `MLX5_CMD_OP_DEALLOC_PD`, so firmware *must* reject
+  an orphan DEALLOC_PD with status `BAD_RES_STATE` (0x9), which
+  `cmd_status_to_err` maps to `-EINVAL`. Dmesg shows this as
+  `mlx5_core ... DEALLOC_PD(...) op_mod(0x0) failed, status bad
+  resource state(0x9), syndrome (0x...), err(-22)`. This is the
+  *correct* CRIU restore-ordering invariant -- the proper
+  cascade is `RESTORE_PD -> RESTORE_{CQ,QP,MR,SRQ} -> user
+  destroys QP/MR/CQ/SRQ -> user destroys PD -> FW DEALLOC_PD
+  succeeds`. `uverbs_destroy_uobject` propagates the FW error
+  out of `destroy_hw` without clearing `uobj->object` or
+  removing the idr handle, so the adopted PD's uobj stays
+  parked in the ufile, waiting for the future
+  RESTORE_CQ/MR/QP/SRQ teardown cascade (S4..S7) to drain it.
+  `pd_restore_probe_mlx5_vfmig`'s subtest 7 (`v0 dealloc
+  semantics`) locks this invariant in: DEALLOC_PD on the
+  orphan adopted PD MUST fail with `-EINVAL`/`-EBUSY`/`-EREMOTEIO`
+  and INFO_HANDLES MUST still report the handle.
+
+  **Empirical validation harness.** The
+  `pd_restore_probe_mlx5_vfmig` driver-end-to-end probe at
+  `tools/testing/mlx5_vfmig/uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig.c`
   opens a `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` ucontext on a
-  bound, post-LOAD VF, invokes `RESTORE_PD(target_handle = U,
-  pdn = src_pdn)`, and verifies via `MLX5_VFMIG_IOC_PROBE_PD`
-  (or a follow-on `CREATE_MKEY` via `fw_id_continuity_probe`)
-  that the adopted `pdn` is referenceable.
+  bound, post-LOAD VF, walks subtests 1-5 (gate, UAPI rejection
+  x2, happy path, collision), parks at READY, lets the harness
+  invoke `MLX5_VFMIG_IOC_PROBE_PD` (Phase G FW-liveness check),
+  and on `quit` runs subtest 7 (v0 dealloc semantics).
+  The shell wrapper
+  `test_pd_restore_mlx5_vfmig.sh` mirrors Phases A-E of
+  `test_pd_adopt.sh` and adds Phases F-I. Source FW state
+  preservation is validated independently by
+  `test_fw_id_continuity.sh K6_POST_RECV_WRS=N`.
 * **S4: MR restore (rxe + mlx5_vfmig together).** Implement
   `RESTORE_MR` + both drivers. Couples with `user_mr_dma.md`
   stage 3 (rkey continuity at the IOMMU layer); the kernel verb and
