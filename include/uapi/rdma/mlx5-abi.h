@@ -174,6 +174,43 @@ struct mlx5_ib_alloc_pd_resp {
 	__u32	pdn;
 };
 
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_PD on
+ * mlx5. CRIU-managed restore passes the source's FW pdn here so
+ * mlx5_ib_restore_pd can adopt it into a fresh kernel-side
+ * mlx5_ib_pd without re-issuing FW ALLOC_PD. The (independent)
+ * ufile target handle is carried by the core
+ * UVERBS_ATTR_RESTORE_PD_HANDLE attribute on the verb.
+ *
+ * The adopted pdn must come from the source's pre-SAVE state and
+ * is expected to still be reserved in firmware on the
+ * destination VF after LOAD_VHCA_STATE. See
+ * tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/ for
+ * the K6 evidence and uobject_restore/pd_adopt/ for the
+ * empirical validation of the no-FW-round-trip adoption model.
+ *
+ * NOTE on size (>8 bytes): the uverbs UHW dispatch path treats a
+ * UHW_IN payload with len <= sizeof(u64) as INLINE -- it stuffs
+ * the attr->data u64 into a kernel-side staging slot and sets
+ * udata->inbuf to a kernel pointer. ib_copy_from_udata() then
+ * calls copy_from_user() on that kernel pointer, which on x86_64
+ * with masked-user-access support clamps the address to
+ * USER_PTR_MAX and zero-fills the destination. We deliberately
+ * size this struct above that threshold (two u64-equivalent
+ * payload + reserved bytes) so the dispatcher takes the ptr path
+ * unconditionally: udata->inbuf becomes a real userspace pointer
+ * and ib_copy_from_udata() works as expected. The extra reserved
+ * bytes also leave room for future DEVX-uid hints and other
+ * forward-compat flags without growing the struct again.
+ */
+struct mlx5_ib_restore_pd_req {
+	__u32	pdn;		/* FW pdn to adopt (24 bits significant) */
+	__u32	reserved;	/* must be 0 */
+	__aligned_u64 reserved2; /* must be 0; pads above inline-UHW
+				  * threshold and reserves room for
+				  * future DEVX-uid / flags. */
+};
+
 struct mlx5_ib_tso_caps {
 	__u32 max_tso; /* Maximum tso payload size in bytes */
 
