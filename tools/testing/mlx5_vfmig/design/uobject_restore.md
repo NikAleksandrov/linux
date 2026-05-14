@@ -1051,122 +1051,133 @@ Concretely the per-driver predicate is wired as follows:
   and sets `rxe_ucontext.restore_mode = true` when present.
   `rxe_ucontext_is_restore_mode()` returns it.
 
-Per-method shape:
+**Status (2026-05-14): RESTORE_PD landed as `e06868342fce`.** The
+namespace and dispatcher infrastructure described below is in place;
+RESTORE_CQ / RESTORE_QP / RESTORE_MR / RESTORE_SRQ / RESTORE_AH /
+RESTORE_COMP_CHANNEL / RESTORE_ASYNC_EVENT will reuse the exact same
+pattern (UVERBS_ATTR_PTR_IN target_handle + per-class init params +
+UHW driver blob).
+
+Per-method shape -- shown for PD, the first landed concrete example.
+The attr key is a plain `UVERBS_ATTR_PTR_IN` u32 carrying the target
+ufile handle. We intentionally do NOT use `UVERBS_ATTR_IDR(...,
+UVERBS_ACCESS_NEW)`: that mode lets the framework choose the next
+free id, which is the opposite of what we need. Instead the handler
+calls `rdma_alloc_begin_uobject_at_handle()` directly on the
+caller-supplied u32, and does the commit/abort itself (the standard
+ioctl dispatch only auto-finalises declared IDR attrs).
 
 ```c
 DECLARE_UVERBS_NAMED_METHOD(
     UVERBS_METHOD_RESTORE_PD,
-    UVERBS_ATTR_IDR(UVERBS_ATTR_RESTORE_PD_HANDLE,
-                    UVERBS_OBJECT_PD,
-                    UVERBS_ACCESS_NEW,
-                    UA_MANDATORY,
-                    UA_TARGET_HANDLE),       /* new attr semantic:
-                                              * NEW + caller-specified id */
-    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_PD_ATTRS,
-                       UVERBS_ATTR_TYPE(struct ib_uverbs_restore_pd_attrs),
-                       UA_MANDATORY),
-    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_PD_BLOB,
-                       UVERBS_ATTR_MIN_SIZE(0),
-                       UA_OPTIONAL),
-    UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_PD_USER_HANDLE,
-                        UVERBS_ATTR_TYPE(__u32),
-                        UA_MANDATORY));
+    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_PD_HANDLE,
+                       UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+    UVERBS_ATTR_UHW());
 ```
 
-Handler:
+Handler (abbreviated -- see
+`drivers/infiniband/core/uverbs_std_types_restore.c`):
 
 ```c
 static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_PD)(
     struct uverbs_attr_bundle *attrs)
 {
-    struct ib_uverbs_file *ufile = attrs->ufile;
-    struct ib_device *dev;
+    struct ib_ucontext *ctx;
+    struct ib_device   *ib_dev;
+    struct ib_uobject  *uobj;
+    struct ib_pd       *pd;
     u32 target_handle;
-    int err;
+    int ret;
 
-    /* Gating: parent ucontext must be in restore mode. The check
-     * goes through the per-driver ib_device_ops.ucontext_is_restore_mode
-     * predicate; absent callback means this driver doesn't implement
-     * CRIU restore and no ucontext on it may restore. See the
-     * "Restore-mode gate" rationale above for why this is a
-     * predicate rather than a sticky bit on struct ib_ucontext. */
-    ctx = ib_uverbs_get_ucontext(attrs);
-    if (IS_ERR(ctx))
-        return PTR_ERR(ctx);
-    dev = ctx->device;
-    if (!dev->ops.ucontext_is_restore_mode ||
-        !dev->ops.ucontext_is_restore_mode(ctx))
-        return -EPERM;
-    if (!dev->ops.restore_pd)
+    /* Per-driver predicate gate; opt-in default. */
+    ret = restore_check_ucontext(attrs, &ctx);
+    if (ret)
+        return ret;
+    ib_dev = ctx->device;
+    if (!ib_dev->ops.restore_pd)
         return -EOPNOTSUPP;
 
-    target_handle = uobj_get_target_handle(attrs);
-    /* unpack attrs blob, parent xrefs */
+    ret = uverbs_copy_from(&target_handle, attrs,
+                           UVERBS_ATTR_RESTORE_PD_HANDLE);
+    if (ret)
+        return ret;
 
-    err = dev->ops.restore_pd(ufile, target_handle, &init_attr,
-                              blob, blob_len);
-    if (err)
-        return err;
+    /* Atomic xa_insert; -EBUSY if handle taken. */
+    uobj = rdma_alloc_begin_uobject_at_handle(attrs, UVERBS_OBJECT_PD,
+                                              target_handle);
+    if (IS_ERR(uobj))
+        return PTR_ERR(uobj);
 
-    /* Emit new ib_uobject; install at target_handle. */
-    return uverbs_install_uobj_at(attrs, target_handle);
+    pd = rdma_zalloc_drv_obj(ib_dev, ib_pd);
+    /* ... pd->device / pd->uobject / restrack_new / restrack_set_name ... */
+
+    ret = ib_dev->ops.restore_pd(pd, target_handle, &attrs->driver_udata);
+    if (ret)
+        goto err_restrack;
+    rdma_restrack_add(&pd->res);
+
+    uobj->object = pd;
+    rdma_alloc_commit_uobject(uobj, attrs);
+    return 0;
+
+    /* error paths: rdma_restrack_put + kfree(pd);
+     *               rdma_alloc_abort_uobject(uobj, attrs, false). */
 }
 ```
 
-**K2.5: caller-specified handle plumbing.** The "install at exactly the
-caller's user_handle, fail with `-EBUSY` if taken" semantic is **not**
-new core work; the helper already exists in
-`drivers/infiniband/core/rdma_core.c`:
+**Caller-specified handle plumbing (K2.5).** The "install at exactly
+the caller's user_handle, fail with `-EBUSY` if taken" primitive
+already exists in `drivers/infiniband/core/rdma_core.c`:
 
 ```c
 struct ib_uobject *rdma_alloc_begin_uobject_at_handle(
     struct uverbs_attr_bundle *attrs,
-    const struct uverbs_api_object *obj,
-    u32 target_handle);
+    u16 object_id, u32 target_handle);
 ```
 
-It was added by the UAR restore work (see
-`drivers/infiniband/hw/mlx5/vfmig_uctx.c:556` for the existing user) and
-implements the XA-insert-at-handle behaviour with the right errno
-contract. Each `RESTORE_<TYPE>` handler reuses this helper. The
-`UA_TARGET_HANDLE` attr semantic is just the uapi shape that drives it
--- the attr passes the caller-specified handle through to the helper.
+It was added by the UAR restore work and implements the
+XA-insert-at-handle behaviour with the right errno contract. Each
+`RESTORE_<TYPE>` handler reuses this helper.
 
-Repeat per-class with the appropriate attr blob shape. Total: 8 new
-methods (PD, CQ, COMP_CHANNEL, SRQ, MR, AH, QP, ASYNC_EVENT).
+Future per-class methods (CQ/QP/MR/SRQ/AH/COMP_CHANNEL/ASYNC_EVENT)
+will mirror the shape above: one `UVERBS_ATTR_PTR_IN` u32 target
+handle, plus whatever per-class init params are needed (e.g. CQ
+will add `cqe`, `comp_vector`, `comp_channel_handle`; QP will add
+`pd_handle`, `send_cq_handle`, `recv_cq_handle`, init/modify attrs,
+state). Total: 8 new methods (PD landed, 7 remaining).
 
 ### 7.4 K4: ib_device_ops.restore_<type> callbacks
 
-```diff
- struct ib_device_ops {
-     ...
-+    int (*restore_pd)(struct ib_uverbs_file *ufile, u32 target_handle,
-+                      const struct ib_pd_init_attr *attr,
-+                      const void *blob, size_t blob_len);
-+    int (*restore_cq)(struct ib_uverbs_file *ufile, u32 target_handle,
-+                      const struct ib_cq_init_attr *attr,
-+                      const void *blob, size_t blob_len,
-+                      u32 comp_channel_handle);
-+    int (*restore_qp)(struct ib_uverbs_file *ufile, u32 target_handle,
-+                      const struct ib_qp_init_attr *init_attr,
-+                      const struct ib_qp_attr *attr, int attr_mask,
-+                      const void *blob, size_t blob_len,
-+                      u32 pd_handle, u32 send_cq, u32 recv_cq,
-+                      u32 srq_handle);
-+    int (*restore_mr)(...);
-+    int (*restore_srq)(...);
-+    int (*restore_ah)(...);
-+    int (*restore_comp_channel)(...);
-+    int (*restore_async_event_file)(...);
+**Status (2026-05-14): restore_pd landed as `e06868342fce`.** Shape
+deliberately mirrors the driver's existing `alloc_pd` plus an extra
+`u32 target_handle` hint and the standard `ib_udata` for driver
+vendor-private bytes. The generic dispatcher has already reserved
+the requested ufile handle via `rdma_alloc_begin_uobject_at_handle()`
+by the time this callback is invoked; the driver's job is just to
+make the `ib_pd` hw-usable. Drivers that ignore the hint (rxe)
+behave identically to alloc_pd. Drivers that consume the hint (mlx5,
+once landed) use it as the FW pdn allocate-with-id input.
+
+```c
+struct ib_device_ops {
+    ...
+    int (*restore_pd)(struct ib_pd *pd, u32 target_handle,
+                      struct ib_udata *udata);
+    /* future: restore_cq, restore_qp, restore_mr, restore_srq,
+     * restore_ah, restore_comp_channel, restore_async_event_file.
+     * Each mirrors the shape of its existing alloc/create
+     * counterpart plus a u32 target_handle hint. */
 };
 ```
 
 Driver-side population:
 
 * **rxe**: populated statically at module load via `rxe_set_device_ops`.
-  Each handler is the standard alloc+modify path with identity-hint
-  extension on the id allocators. Roughly `rxe_alloc_pd_with_id_hint(...)`
-  etc.
+  Landed example: `rxe_restore_pd` is just `return rxe_alloc_pd(...)`
+  -- rxe has no hw-side id whose value must round-trip, so the
+  `target_handle` hint is intentionally unused. Future per-class
+  callbacks will have the same shape (delegate to the existing
+  alloc path).
 * **mlx5_vfmig**: populated **once at VF probe time**, when
   `mlx5_vfmig_vf_consume_restored()` flips the device into
   `VFMIG_RESTORE` state, **before** any uverbs cdev is opened against
@@ -1404,10 +1415,23 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   `info_handles_probe`. CRIU plugin will call it for AH discovery
   and the DEVX/MW/FLOW/XRCD pre-suspend coverage check; no kernel
   patch needed.
-* **S3: PD restore (rxe + mlx5_vfmig together).** Implement K3
-  `RESTORE_PD` method + both drivers' `restore_pd` callbacks. mlx5
-  shape determined by S0. Both `run_uverbs_cr.sh` and
-  `run_vfmig_cr.sh` flip to PASS for the PD round-trip.
+* **S3a: PD restore on rxe (landed).** Generic
+  `UVERBS_METHOD_RESTORE_PD` dispatcher + `rxe_restore_pd` landed as
+  `e06868342fce`. Validated empirically by `pd_restore_probe_rxe`
+  (see §9.4). rxe-side is intentionally simpler than mlx5: no FW id
+  to preserve, so the `target_handle` hint is unused and
+  `rxe_restore_pd` is a pass-through to `rxe_alloc_pd`. Validates
+  the generic dispatcher's choreography end-to-end on a software
+  device before mlx5 layers FW-id-hint complexity on top.
+* **S3b: PD restore on mlx5_vfmig.** Implement `mlx5_ib_restore_pd`
+  using FW alloc-with-id-hint (the K6 PARTIAL PASS confirmed PDN
+  reservations survive `LOAD_VHCA_STATE`, so the hint pattern is
+  sound). New `MLX5_VFMIG_IOC_QUERY_PD` PF cdev ioctl for FW-side
+  verification, paralleling the `MLX5_VFMIG_IOC_QUERY_QP` we added
+  for the §6.3 piggyback. New `pd_restore_probe_mlx5_vfmig` runs
+  end-to-end SAVE -> LOAD -> `RESTORE_PD(target_handle = src_pdn)`
+  and verifies the dst `mlx5_ib_pd.pdn` matches via the new
+  ioctl. `run_vfmig_cr.sh` flips to PASS for the PD round-trip.
 * **S4: MR restore (rxe + mlx5_vfmig together).** Implement
   `RESTORE_MR` + both drivers. Couples with `user_mr_dma.md`
   stage 3 (rkey continuity at the IOMMU layer); the kernel verb and
@@ -1455,6 +1479,59 @@ rdma_r3: pid=<P> ufile=<U> type=QP source_handle=N -> dest_handle=M
 
 Easy `grep rdma_r3` to confirm what survived round-trip; no hard
 assertions in CRIU itself, since FW behaviour is the empirical variable.
+
+### 9.4 pd_restore_probe_rxe -- empirical S3a validation
+
+Lives at
+`tools/testing/mlx5_vfmig/uobject_restore/pd_restore/pd_restore_probe_rxe.c`.
+Runs on any host with `CONFIG_RDMA_RXE=m`, no privileged access
+required. The probe walks the full RESTORE_PD contract on rxe so we
+can be sure the generic dispatcher (`uverbs_std_types_restore.c`)
+is correct before mlx5 piles FW-id-hint complexity on top.
+
+The probe exercises five subtests against `rxe0`:
+
+1. **Gate (negative).** Open a ucontext WITHOUT
+   `RXE_ALLOC_UCTX_RESTORE_MODE`. Invoke `UVERBS_METHOD_RESTORE_PD`
+   with `target_handle = 0x4242`. Expect `-EPERM` from the
+   per-driver `ucontext_is_restore_mode` predicate; the call must
+   not touch the ufile's idr.
+
+2. **Happy path.** Open a second ucontext WITH
+   `RXE_ALLOC_UCTX_RESTORE_MODE`. Invoke `RESTORE_PD` with
+   `target_handle = 0x4242`. Expect success. Verify via
+   `UVERBS_METHOD_INFO_HANDLES(UVERBS_OBJECT_PD)` that the
+   returned handle list contains `0x4242`. Optionally verify via
+   NLDEV `RES_PD_GET` that the per-PD entry carries
+   `RDMA_NLDEV_ATTR_RES_HANDLE = 0x4242` (cross-check against the
+   K8a path already validated by `nldev_res_handle_probe`).
+
+3. **Collision.** Invoke `RESTORE_PD(0x4242)` again on the
+   restore-mode ucontext. Expect `-EBUSY` from the
+   `xa_insert()` inside `rdma_alloc_begin_uobject_at_handle`.
+
+4. **No interference with normal alloc.** Invoke the legacy
+   write-path `IB_USER_VERBS_CMD_ALLOC_PD` (via libibverbs's
+   `ibv_alloc_pd`). Expect a fresh `pd->handle` that is NOT
+   `0x4242`; the restored PD remains addressable at `0x4242`.
+
+5. **Destroy round-trip.** Invoke
+   `IB_USER_VERBS_CMD_DEALLOC_PD(handle = 0x4242)`. Expect
+   success and that `INFO_HANDLES` no longer returns `0x4242`.
+
+Combined with `nldev_res_handle_probe` (already PASS on the same
+running kernel) this gives us full coverage of the
+PD-restore-via-handle flow before any mlx5 work is touched.
+
+Failure modes the probe explicitly distinguishes:
+* `-EOPNOTSUPP` from RESTORE_PD on a restore-mode ucontext =>
+  generic dispatcher couldn't find `dev->ops.restore_pd` (rxe ops
+  registration regression).
+* `-EPERM` on a restore-mode ucontext => `rxe_ucontext_is_restore_mode`
+  is misreading the bit or the rxe alloc-ucontext udata parse is
+  wrong.
+* Success on a NON-restore-mode ucontext => predicate isn't being
+  consulted (security regression).
 
 ## 10. Open questions
 
