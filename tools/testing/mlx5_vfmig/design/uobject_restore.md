@@ -34,7 +34,7 @@ end-to-end correctness, not initial scaffolding.
 | K6 | **v0 gate.** FW-identity-continuity experiment: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id reservations the way it provably does for UARs? Mirrors `uar_restore.md` §3. Outcome decides whether K3/K4 mlx5 handlers are a small alloc-with-hint extension (best case) or require new "pre-reserve id N" FW commands (worst case, possibly FW patch). Run this first. | §8.2, §10 | **very high** | empirical experiment + small probe ioctl |
 | K2 | **Already exists upstream as `UVERBS_METHOD_INFO_HANDLES` on `UVERBS_OBJECT_DEVICE`** (drivers/infiniband/core/uverbs_std_types_device.c). Takes a `UVERBS_ATTR_INFO_OBJECT_ID` (u16 -- accepts ANY core or driver-namespace object id via `uapi_key_obj()`), walks `ufile->uobjects` under `uobjects_lock` filtered by `obj->uapi_object`, returns `UVERBS_ATTR_INFO_HANDLES_LIST` (u32[]) and `UVERBS_ATTR_INFO_TOTAL_HANDLES` (filled count). Covers AH and every other non-restracked uobject. Drives the pre-suspend coverage check (DEVX/MW/FLOW/XRCD rejection) by enumerating those types and failing the dump if any are present. Validated end-to-end by `info_handles_probe` -- see §7.2 | §6.2 | done | zero kernel work |
 | K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive — XA-insert at caller-specified handle, return `-EBUSY` if taken — is already proven by the UAR restore path; this is plumbing, not new core | §7.3 | medium | reuse existing helper |
-| K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new hw-agnostic `IB_UCONTEXT_RESTORE_MODE` ucontext flag, which mlx5_vfmig sets when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` and rxe sets when opened with the corresponding rxe restore-mode flag. Generic verb checks the hw-agnostic flag only | §7.1, §7.2 | high | medium per type |
+| K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new opt-in `ib_device_ops.ucontext_is_restore_mode` predicate that each driver implements over its own per-ucontext sticky bool (mlx5: `mlx5_ib_ucontext.vfmig_restore_mode`, set when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE`; rxe: `rxe_ucontext.restore_mode`, set when opened with `RXE_ALLOC_UCTX_RESTORE_MODE`). Generic dispatch treats missing callback as "no ucontext on this device may restore", so adding RESTORE_* support is strictly opt-in and the `ib_ucontext` core struct stays lean | §7.1, §7.2 | high | medium per type |
 | K4 | `ib_device_ops` extended with `restore_pd`, `restore_cq`, `restore_qp`, `restore_mr`, `restore_srq`, `restore_ah`, `restore_comp_channel`, `restore_async_event`. Each driver installs its restore-mode ops vector once, at VF/device **probe** time, when the device is entering VFMIG_RESTORE state (i.e. before any uverbs cdev opens against it). No mid-life ops swapping | §7.3, §7.4 | high | one ops vector + per-driver impl |
 | K8 | **v0 required.** Expose the per-uobject `ufile_handle` (= `obj->id` from `ufile->uobjects`) at dump time, paired with `restrack_id`. K3's `target_handle` install semantic requires CRIU to know `ufile_handle` per uobject so the destination kernel re-installs at exactly the value user code's restored memory still references. Two viable shapes -- (K8a) one `nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE, <type>->uobject->id)` per `fill_res_<type>_entry` (PD/CQ/QP/MR/SRQ -- five lines); (K8b) extend `UVERBS_METHOD_INFO_HANDLES` with an optional `UVERBS_ATTR_INFO_RESTRACK_LIST` u32[] paired with `INFO_HANDLES_LIST`. Without K8 there is no way to cross-join NLDEV's `restrack_id` view (used for parent-edge encoding) with `INFO_HANDLES`'s `ufile_handle` view (used for `target_handle` install). K8a preferred -- symmetric with existing PDN/CQN/MRN/SRQN emission, smaller patch | §7.5 | high | one nla_put per fn |
 | K5 | (already landed) `show_fdinfo` for cdev (`52721d09a`), async event fd (`551a1355f`), comp event fd (`a753315597`). No further fdinfo work | §6.3 | done | -- |
@@ -991,8 +991,67 @@ For v0, `INFO_HANDLES` is consumed by CRIU for:
 ### 7.3 K3: UVERBS_OBJECT_RESTORE namespace + per-class methods
 
 New uverbs object namespace, one method per uobject class. Lives in
-`drivers/infiniband/core/uverbs_std_types_restore.c` (new). Per-method
-shape:
+`drivers/infiniband/core/uverbs_std_types_restore.c` (new).
+
+**Restore-mode gate (design rationale).** The handler must reject
+calls from ucontexts that were not opened in CRIU-restore mode --
+otherwise a non-restore application could mint uobjects at
+caller-chosen ufile handles, which is at minimum surprising and at
+worst lets a malicious caller deny-of-service-collide future
+`ALLOC_*` handles.
+
+There are two natural designs for the gate:
+
+1. **Sticky bit on `struct ib_ucontext`** -- e.g.
+   `ucontext->flags & IB_UCONTEXT_RESTORE_MODE`. Cheap to test, but
+   adds driver-flavoured state to a core struct that intentionally
+   stays lean, and the driver still owns the truth (only the
+   driver's `alloc_ucontext` knows whether the caller asked for
+   restore mode).
+
+2. **Per-driver predicate `ib_device_ops.ucontext_is_restore_mode`**
+   -- a `bool (*)(struct ib_ucontext *)` callback the generic
+   handler consults. Default `NULL` = "this driver does not
+   implement CRIU restore, no ucontext on it may restore". Drivers
+   that implement restore latch a sticky bool in their own
+   per-ucontext storage at `alloc_ucontext` time and report it.
+
+We chose (2). Reasons:
+
+* The state is intrinsically driver-owned; (1) would just shadow
+  the driver's truth into the core struct.
+* The gate runs once per RESTORE_* method invocation (~6 calls per
+  CRIU-restored ucontext); a virtual call is free at that rate.
+* `ib_ucontext` stays lean. No new field on a struct shared by
+  every RDMA driver in the tree.
+* Opt-in default. A driver that hasn't been audited for the
+  restore semantics cannot accidentally accept RESTORE_* calls
+  just because someone passes a flag at GET_CONTEXT.
+
+Concretely the per-driver predicate is wired as follows:
+
+* **mlx5_ib**: `mlx5_ib_alloc_ucontext()` sets
+  `mlx5_ib_ucontext.vfmig_restore_mode = true` when the caller
+  passes `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE`. This bit is
+  intentionally separate from the pre-existing
+  `vfmig_restore_pending` bool: the latter is single-shot and
+  cleared by `MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT` (the UAR
+  snapshot consume), whereas `vfmig_restore_mode` is sticky for
+  the ucontext's lifetime. The sticky bit MUST outlive
+  `vfmig_restore_pending` because RESTORE_PD/CQ/QP/... run AFTER
+  RESTORE_UCONTEXT (those resources need a usable UAR at
+  hw-create time, so the UAR snapshot must already have seeded
+  `bfregi->sys_pages[]`). `mlx5_ib_ucontext_is_restore_mode()`
+  returns `vfmig_restore_mode`.
+* **rxe**: new uapi `struct rxe_alloc_ucontext_req { __u32 flags;
+  __u32 reserved; }` carried in `udata` to GET_CONTEXT, plus
+  `RXE_ALLOC_UCTX_RESTORE_MODE = 1u << 0`. `rxe_alloc_ucontext()`
+  parses the req when `udata->inlen > 0` (older librxe userspace
+  passes `inlen=0` and is unaffected), validates unknown flags,
+  and sets `rxe_ucontext.restore_mode = true` when present.
+  `rxe_ucontext_is_restore_mode()` returns it.
+
+Per-method shape:
 
 ```c
 DECLARE_UVERBS_NAMED_METHOD(
@@ -1025,20 +1084,19 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_PD)(
     u32 target_handle;
     int err;
 
-    /* Gating: parent ucontext must be in restore mode. The generic
-     * `IB_UCONTEXT_RESTORE_MODE` flag is hw-agnostic; each driver sets
-     * it from its own restore-mode entry path:
-     *   - mlx5_vfmig: set when ucontext opened with
-     *     MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE.
-     *   - rxe: set when opened with the rxe restore-mode flag (small
-     *     additive change to rxe's GET_CONTEXT path; rxe doesn't have
-     *     a pre-existing restore concept).
-     * Generic verb tests only the hw-agnostic flag, so adding new
-     * providers later doesn't grow the gating check. */
-    if (!(ufile->ucontext->flags & IB_UCONTEXT_RESTORE_MODE))
+    /* Gating: parent ucontext must be in restore mode. The check
+     * goes through the per-driver ib_device_ops.ucontext_is_restore_mode
+     * predicate; absent callback means this driver doesn't implement
+     * CRIU restore and no ucontext on it may restore. See the
+     * "Restore-mode gate" rationale above for why this is a
+     * predicate rather than a sticky bit on struct ib_ucontext. */
+    ctx = ib_uverbs_get_ucontext(attrs);
+    if (IS_ERR(ctx))
+        return PTR_ERR(ctx);
+    dev = ctx->device;
+    if (!dev->ops.ucontext_is_restore_mode ||
+        !dev->ops.ucontext_is_restore_mode(ctx))
         return -EPERM;
-
-    dev = ufile->device->ib_dev;
     if (!dev->ops.restore_pd)
         return -EOPNOTSUPP;
 
