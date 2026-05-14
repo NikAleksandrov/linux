@@ -36,20 +36,20 @@ end-to-end correctness, not initial scaffolding.
 | K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive — XA-insert at caller-specified handle, return `-EBUSY` if taken — is already proven by the UAR restore path; this is plumbing, not new core | §7.3 | medium | reuse existing helper |
 | K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new opt-in `ib_device_ops.ucontext_is_restore_mode` predicate that each driver implements over its own per-ucontext sticky bool (mlx5: `mlx5_ib_ucontext.vfmig_restore_mode`, set when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE`; rxe: `rxe_ucontext.restore_mode`, set when opened with `RXE_ALLOC_UCTX_RESTORE_MODE`). Generic dispatch treats missing callback as "no ucontext on this device may restore", so adding RESTORE_* support is strictly opt-in and the `ib_ucontext` core struct stays lean | §7.1, §7.2 | high | medium per type |
 | K4 | `ib_device_ops` extended with `restore_pd`, `restore_cq`, `restore_qp`, `restore_mr`, `restore_srq`, `restore_ah`, `restore_comp_channel`, `restore_async_event`. Each driver installs its restore-mode ops vector once, at VF/device **probe** time, when the device is entering VFMIG_RESTORE state (i.e. before any uverbs cdev opens against it). No mid-life ops swapping | §7.3, §7.4 | high | one ops vector + per-driver impl |
-| K8 | **v0 required.** Expose the per-uobject `ufile_handle` (= `obj->id` from `ufile->uobjects`) at dump time, paired with `restrack_id`. K3's `target_handle` install semantic requires CRIU to know `ufile_handle` per uobject so the destination kernel re-installs at exactly the value user code's restored memory still references. Two viable shapes -- (K8a) one `nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE, <type>->uobject->id)` per `fill_res_<type>_entry` (PD/CQ/QP/MR/SRQ -- five lines); (K8b) extend `UVERBS_METHOD_INFO_HANDLES` with an optional `UVERBS_ATTR_INFO_RESTRACK_LIST` u32[] paired with `INFO_HANDLES_LIST`. Without K8 there is no way to cross-join NLDEV's `restrack_id` view (used for parent-edge encoding) with `INFO_HANDLES`'s `ufile_handle` view (used for `target_handle` install). K8a preferred -- symmetric with existing PDN/CQN/MRN/SRQN emission, smaller patch | §7.5 | high | one nla_put per fn |
+| K8 | **Landed as `0601c496b413` (K8a NLDEV emit).** Per-uobject `ufile_handle` (== `obj->id` from `ufile->uobjects`) now emitted alongside the existing restrack-id attr from every `fill_res_<type>_entry` whose resource is user-created (PD/CQ/QP/MR/SRQ), gated by `!rdma_is_kernel_res(res)`. New UAPI attr `RDMA_NLDEV_ATTR_RES_HANDLE`. Validated end-to-end by `nldev_res_handle_probe` (asserts both presence and exact `obj->handle` equality, plus the kernel-only "MUST NOT carry" contract). Lets a CRIU dump plugin join NLDEV's restrack-id view (parent-edge encoding) with the uverbs `INFO_HANDLES` ufile-handle view (`target_handle` install) without an extra cross-reference dispatch. K8b alternative (extend `INFO_HANDLES` with a paired restrack list) recorded in §7.5 as the rejected-but-considered shape | §7.5 | done | -- |
 | K5 | (already landed) `show_fdinfo` for cdev (`52721d09a`), async event fd (`551a1355f`), comp event fd (`a753315597`). No further fdinfo work | §6.3 | done | -- |
 | K7 | (optional, stretch) Add restrack entries for AH (`RDMA_RESTRACK_AH`). If we land K2, this is unnecessary -- but adding it later is cheap if K2 ends up not landing | §6.2 | low | optional |
 | K1 | (deprioritized, optional cleanup) Add `RDMA_NLDEV_ATTR_RES_CTXN` emission in `fill_res_qp_entry`, `fill_res_mr_entry`, `fill_res_srq_entry`, `fill_res_cm_id_entry`. Not v0-blocking: CRIU joins QP/MR/SRQ to ctxn through PDN against the PD inventory (PD entries already emit CTXN). Land only if a follow-on need surfaces | §6.1 | very low | one line per fn |
 
 **v0 ordering**: K6 first (gates K3/K4 mlx5 design) -- **done, PARTIAL
 PASS, see §10**. K2 in parallel -- **discovered already implemented as
-`UVERBS_METHOD_INFO_HANDLES`, no kernel work; see §7.2**. K2.5 / K3 / K4
-/ K8 implement the restore path, callback-by-callback across rxe +
-mlx5_vfmig per class (PD -> MR -> CQ -> QP; see §9.1). K8 unblocks
-correct `target_handle` propagation and is required before any K3
-`RESTORE_<TYPE>` handler can be exercised end-to-end; K8a is a trivial
-patch and lands ahead of (or alongside) the first K3 method. K5 is
-already done. K1 and K7 are deferred / optional.
+`UVERBS_METHOD_INFO_HANDLES`, no kernel work; see §7.2**. K8 landed as
+**`0601c496b413` (K8a NLDEV emit)**, unblocking `target_handle`
+propagation; CRIU now consumes `RDMA_NLDEV_ATTR_RES_HANDLE` directly
+from its existing per-type NLDEV walk. K2.5 / K3 / K4 implement the
+restore path, callback-by-callback across rxe + mlx5_vfmig per class
+(PD -> MR -> CQ -> QP; see §9.1). K5 is already done. K1 and K7 are
+deferred / optional.
 
 ## 1. Goal and scope
 
@@ -1181,92 +1181,87 @@ Driver-side population:
 Default if unset: kernel returns `-EOPNOTSUPP` from the generic verb,
 which CRIU surfaces as "this driver doesn't support R3 restore yet".
 
-### 7.5 K8: per-uobject ufile_handle exposure (v0 required)
+### 7.5 K8: per-uobject ufile_handle exposure (landed)
 
-**Why required.** K3's `RESTORE_<TYPE>` methods install at a
-caller-specified `target_handle` (= the per-ufile `obj->id` user code
-holds in restored memory). To produce that value at dump, CRIU has to
-read `ufile_handle` per uobject from the kernel and pair it with the
-`restrack_id`-keyed view it already has from NLDEV (which encodes
-parent-edges -- e.g. QP's `parent_pdn`). Today the two views can't be
-cross-joined:
+**Status (2026-05-13): landed as `0601c496b413` via K8a (NLDEV emit).**
+The K-ask was driven by the join problem: K3's `RESTORE_<TYPE>` methods
+install at a caller-specified `target_handle` (= the per-ufile `obj->id`
+user code holds in restored memory), so at dump time CRIU has to pair
+`ufile_handle` with `restrack_id` (which encodes the parent-edge graph,
+e.g. QP's `parent_pdn`). Before K8, the two kernel views couldn't be
+joined:
 
-* **NLDEV** emits `restrack_id` (`PDN`/`CQN`/`MRN`/`SRQN`) per
+* **NLDEV** emits `restrack_id` (`PDN`/`CQN`/`LQPN`/`MRN`/`SRQN`) per
   resource via `fill_res_<type>_entry`, but not `obj->id`.
 * **`UVERBS_METHOD_INFO_HANDLES`** (K2) returns a flat `u32[]` of
-  `obj->id` values per type per ufile, but no `restrack_id`
-  alongside.
+  `obj->id` values per type per ufile, but no `restrack_id` alongside.
 
-So a QP entry can record `parent_pdn=5` (NLDEV) without any way to
+A QP entry could record `parent_pdn=5` (NLDEV) without any way to
 translate "PDN 5 lives at ufile_handle 2" -- which is what
 `target_handle` needs.
 
-**Proposed shapes** (kernel agent picks):
+#### 7.5.1 K8a -- NLDEV emit `RES_HANDLE` (the path that landed)
 
-#### 7.5.1 K8a -- NLDEV emit `RES_HANDLE` (preferred)
+Patch shape (`drivers/infiniband/core/nldev.c`):
 
 ```diff
  static int fill_res_pd_entry(struct sk_buff *msg, struct rdma_restrack_entry *res) {
      ...
      if (!rdma_is_kernel_res(res) &&
          nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_PDN, pd->res.id))
-         return -EMSGSIZE;
+         goto err;
 +    if (!rdma_is_kernel_res(res) &&
 +        nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_HANDLE, pd->uobject->id))
-+        return -EMSGSIZE;
++        goto err;
      ...
  }
 ```
 
 Same shape repeated in `fill_res_cq_entry`, `fill_res_qp_entry`,
-`fill_res_mr_entry`, `fill_res_srq_entry`. Five fns, one `nla_put_u32`
-each. Mirrors the existing per-class id emission. New attr
-`RDMA_NLDEV_ATTR_RES_HANDLE` (one line in `rdma_netlink.h`).
+`fill_res_mr_entry`, `fill_res_srq_entry`. New UAPI attr
+`RDMA_NLDEV_ATTR_RES_HANDLE` registered in `nldev_policy[]`. Each
+emission gated by `!rdma_is_kernel_res(res)` so kernel-internal
+restrack entries (no backing `ib_uobject`) keep their attribute set
+unchanged.
 
-* Pros: symmetric with existing NLDEV layout, reuses CRIU's existing
-  per-type NLDEV walk, no second ioctl per ufile per type.
-* Cons: only covers types NLDEV knows about (PD/CQ/QP/MR/SRQ). AH,
-  COMP_CHANNEL, ASYNC_EVENT still need INFO_HANDLES anyway, but for
-  those we don't need the pairing -- they have no parent edges that
-  reference them via restrack.
+Classes intentionally not touched (per the commit message): `ucontext`
+(RES_CTXN already identifies it; "no handle within itself"), `cm_id`
+(lives in the ucma fd namespace; no `ib_uobject` to take an id from),
+`counter` (kernel-only stat counter state).
 
-#### 7.5.2 K8b -- extend `INFO_HANDLES` to pair restrack ids
+Validated end-to-end by
+`tools/testing/mlx5_vfmig/uobject_restore/nldev_res_handle/nldev_res_handle_probe.c`,
+which:
 
-```c
-DECLARE_UVERBS_NAMED_METHOD(
-    UVERBS_METHOD_INFO_HANDLES,
-    UVERBS_ATTR_CONST_IN(UVERBS_ATTR_INFO_OBJECT_ID, ...),
-    UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_INFO_TOTAL_HANDLES, ...),
-    UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_INFO_HANDLES_LIST, ...),
-+   UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_INFO_RESTRACK_LIST,
-+                       UVERBS_ATTR_MIN_SIZE(sizeof(u32)),
-+                       UA_OPTIONAL));
-```
+* allocates one of each `{PD, CQ, QP, MR, SRQ}` via libibverbs;
+* runs `RDMA_NLDEV_CMD_RES_*_GET` dumps over a raw `NETLINK_RDMA`
+  socket;
+* finds each entry by `pid + ibdev`;
+* asserts (a) `RDMA_NLDEV_ATTR_RES_HANDLE` is present, (b) its value
+  exactly equals libibverbs's `obj->handle`, (c) kernel-internal
+  entries (matched by `RES_KERN_NAME`) MUST NOT carry the new attr.
 
-Handler walks `ufile->uobjects` once, emits both `obj->id` and
-`obj->object`'s underlying `restrack_entry.id` (zero when the type has
-no restrack). One file touched, one fn.
+CRIU consumer side: `rdma_nl_for_each_resource()` in
+`criu/rdma_netlink.c` parses each NLDEV per-resource entry attr-by-attr
+in `parse_res_entry()`; populating `rdma_nl_res_entry.ufile_handle` from
+`RDMA_NLDEV_ATTR_RES_HANDLE` is a few-line addition per type, with no
+new ioctl plumbing.
+
+#### 7.5.2 K8b -- extend `INFO_HANDLES` to pair restrack ids (rejected)
+
+Recorded for posterity. The alternative was to extend
+`UVERBS_METHOD_INFO_HANDLES` with an optional `UVERBS_ATTR_INFO_RESTRACK_LIST`
+u32[] paired with `INFO_HANDLES_LIST`, so the same call returned both
+keys in one go.
 
 * Pros: more general -- extends naturally to any future restracked
   type without per-type fill changes.
-* Cons: slightly larger surface (new attr to `UVERBS_OBJECT_DEVICE`),
-  requires CRIU to issue `INFO_HANDLES` per (ufile, type) which is the
-  shape it'd use for AH/COMP_CHANNEL/ASYNC_EVENT anyway -- but adds
-  per-ufile-per-type calls for PD/CQ/QP/MR/SRQ on top of the existing
-  per-device NLDEV walk. Net more ioctls, less attractive at scale.
+* Cons: required CRIU to issue `INFO_HANDLES` per (ufile, type) for
+  PD/CQ/QP/MR/SRQ on top of its existing per-device NLDEV walk. Net
+  more ioctls per dump, larger uapi surface.
 
-#### 7.5.3 Recommendation
-
-**K8a.** Smaller patch, matches the existing NLDEV per-resource layout,
-no churn to the device ioctl surface. CRIU consumes `RES_HANDLE`
-inline during the existing per-type NLDEV walks (`rdma_nl_for_each_resource`
-in `criu/rdma_netlink.c`); zero new ioctl plumbing on the CRIU side.
-
-**Without K8** the design has no path to preserve user-visible handle
-identity across restore. The fallback ("don't preserve handles, mutate
-user memory") was rejected in §10.5 as it violates the libibverbs ABI
-boundary. Surface this clearly: K8 is a hard prerequisite for the
-first K3 method to work end-to-end.
+K8a was preferred and landed: smaller patch, symmetric with the
+existing NLDEV per-resource layout, zero new CRIU dispatch.
 
 ### 7.6 One-plugin-per-port invariant
 
