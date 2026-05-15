@@ -2847,7 +2847,8 @@ static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
  * errno mapping on failure.
  */
 static int mlx5_ib_restore_pd_fw_probe(struct mlx5_ib_dev *dev, u32 pdn,
-				       u16 uid)
+				       u16 uid, u8 *fw_status,
+				       u32 *fw_syndrome)
 {
 	u32 in[MLX5_ST_SZ_DW(create_mkey_in)] = {};
 	u32 out[MLX5_ST_SZ_DW(create_mkey_out)] = {};
@@ -2856,6 +2857,11 @@ static int mlx5_ib_restore_pd_fw_probe(struct mlx5_ib_dev *dev, u32 pdn,
 	u32 mkey_index;
 	void *mkc;
 	int err;
+
+	if (fw_status)
+		*fw_status = 0;
+	if (fw_syndrome)
+		*fw_syndrome = 0;
 
 	MLX5_SET(create_mkey_in, in, opcode, MLX5_CMD_OP_CREATE_MKEY);
 	MLX5_SET(create_mkey_in, in, uid, uid);
@@ -2867,8 +2873,39 @@ static int mlx5_ib_restore_pd_fw_probe(struct mlx5_ib_dev *dev, u32 pdn,
 	MLX5_SET(mkc, mkc, qpn, 0xffffff);
 
 	err = mlx5_cmd_exec(dev->mdev, in, sizeof(in), out, sizeof(out));
-	if (err)
+	if (err) {
+		/*
+		 * mlx5_cmd_exec() has already converted the FW status to
+		 * a negative errno but stamped the original 8-bit status
+		 * and 32-bit syndrome onto out[0] in their header
+		 * positions. Surface both so the caller can distinguish
+		 * the three failure shapes we care about:
+		 *
+		 *   - status BAD_PARAM (0x3) on the body: unknown uid /
+		 *     uid not registered on the VHCA. The hallmark of
+		 *     "LOAD_VHCA_STATE did not preserve uctx
+		 *     registration" -- v0 DEVX adoption blind spot.
+		 *   - status BAD_PARAM (0x3) on mkc.pd: pdn does not
+		 *     exist in the FW pdn allocator. The hallmark of
+		 *     "caller passed a stale pdn" (restrack id vs FW
+		 *     pdn confusion).
+		 *   - status BAD_RES_STATE (0x9): pdn exists but is in
+		 *     a state incompatible with CREATE_MKEY (post-teardown
+		 *     cascade, mid-rebind, etc.).
+		 *
+		 * The specific syndrome value (24-bit FW codepoint) is the
+		 * fastest way to triangulate which one we're hitting; map
+		 * it against the PRM "syndrome dictionary" or the
+		 * `pd_adopt`'s reference matrix in
+		 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/.
+		 */
+		if (fw_status)
+			*fw_status = MLX5_GET(create_mkey_out, out, status);
+		if (fw_syndrome)
+			*fw_syndrome =
+				MLX5_GET(create_mkey_out, out, syndrome);
 		return err;
+	}
 
 	mkey_index = MLX5_GET(create_mkey_out, out, mkey_index);
 
@@ -2931,28 +2968,68 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 		context->devx_uid, context->vfmig_restore_mode);
 
 	/*
-	 * Hard-fail Model A's silent-adoption blind spot: confirm FW
-	 * actually has a PD numbered req.pdn under context->devx_uid
-	 * before we set mpd. The CREATE_MKEY probe catches both
-	 * stale-pdn (caller passed the source's restrack id instead of
-	 * its FW pdn) and uid-mismatch (caller passed a real FW pdn but
-	 * the destination ucontext didn't adopt the source's devx_uid)
-	 * cases, which present at later FW ops as opaque
-	 * CREATE_QP/CREATE_MKEY BAD_PARAM. -ENOENT here surfaces the
-	 * problem at the precise restore step that caused it.
+	 * Defense-in-depth: confirm the (pdn, uid) the caller wants to
+	 * adopt is actually usable on the destination VHCA before we
+	 * stamp it onto mpd. The probe issues CREATE_MKEY(pdn, uid)
+	 * with mode=PA + a discardable mkey index, then DESTROY_MKEY
+	 * on success. -ENOENT here surfaces the problem at the precise
+	 * restore step that caused it instead of as an opaque
+	 * BAD_PARAM at the first downstream CREATE_QP/CREATE_MKEY.
 	 *
-	 * The probe is weak for non-DEVX adoption (uid=0) -- FW empirically
-	 * ungated on (pdn, uid=0) for CREATE_MKEY -- but is the strongest
-	 * gate we can apply without round-tripping ALLOC_PD (which we
-	 * specifically don't want in Model A). For DEVX adoption it's a
-	 * hard gate.
+	 * Two empirically-distinguishable failure modes (decoded from
+	 * fw_status + fw_syndrome; cross-check with the matrix in
+	 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/test_pd_adopt.sh):
+	 *
+	 *   1) Stale pdn (uid=0 lane). pdn is the source's restrack id
+	 *      rather than its FW pdn, or the slot was never reserved
+	 *      on this VHCA. Hallmark: CREATE_MKEY rejects with status
+	 *      bad_parameter(0x3); the BOGUS_PDN row of the test matrix
+	 *      shows the same shape, the src_pdn row passes. Fix is
+	 *      caller-side -- ship the actual FW pdn (driver-private
+	 *      named TLV "fw_pdn" off RDMA_NLDEV_ATTR_DRIVER on the
+	 *      source's PD restrack entry).
+	 *
+	 *   2) DEVX-adoption blind spot (uid != 0 lane). LOAD_VHCA_STATE
+	 *      preserves the FW next_free_uctx counter (so probe_uid on
+	 *      the destination advances past the source's high-water
+	 *      mark) but does NOT preserve the uctx registration table
+	 *      itself -- the (uid -> uctx_attrs) map is wiped. Every uid
+	 *      in the low/"user" range is therefore unregistered
+	 *      post-LOAD and FW rejects CREATE_MKEY with a consistent
+	 *      "unknown uid" syndrome regardless of pdn. The test
+	 *      matrix's P_devx and N_devx cells both reject with
+	 *      identical fw_syndrome to demonstrate this. There is no
+	 *      caller-side fix: re-issuing CREATE_UCTX on the dest
+	 *      yields a *new* uid (e.g. uid=4 past source's high-water),
+	 *      which still cannot bind to source-owned (pdn, uid) FW
+	 *      records. The v0 mitigation is for the CRIU plugin to
+	 *      *not* propagate the source's devx_uid: open the dest
+	 *      ucontext WITHOUT MLX5_IB_ALLOC_UCTX_DEVX /
+	 *      MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID, leaving
+	 *      context->devx_uid = 0, which lands in the ungated uid=0
+	 *      lane proven by the P_zero/N_zero cells. Restored
+	 *      processes lose DEVX features (mlx5dv_*); basic verbs
+	 *      work. See tools/testing/mlx5_vfmig/design/uobject_restore.md
+	 *      §9.1 S3b "DEVX-adoption blind spot" for the full empirical
+	 *      chain and future-FW options.
 	 */
-	err = mlx5_ib_restore_pd_fw_probe(dev, req.pdn, context->devx_uid);
-	if (err) {
-		mlx5_ib_warn(dev,
-			     "restore_pd: FW probe rejected (pdn=0x%x, uid=%u): %d -- caller passed a stale pdn or the destination ucontext did not adopt the source's devx_uid\n",
-			     req.pdn, context->devx_uid, err);
-		return -ENOENT;
+	{
+		u8 fw_status = 0;
+		u32 fw_syndrome = 0;
+
+		err = mlx5_ib_restore_pd_fw_probe(dev, req.pdn,
+						  context->devx_uid,
+						  &fw_status, &fw_syndrome);
+		if (err) {
+			mlx5_ib_warn(dev,
+				     "restore_pd: FW probe rejected (pdn=0x%x, uid=%u): err=%d fw_status=0x%x fw_syndrome=0x%x -- %s; decode with tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/test_pd_adopt.sh\n",
+				     req.pdn, context->devx_uid, err,
+				     fw_status, fw_syndrome,
+				     context->devx_uid
+				     ? "DEVX-adoption blind spot (LOAD_VHCA_STATE does not preserve the FW uctx registry); open the dest ucontext without DEVX so adopted resources live under uid=0"
+				     : "stale pdn (caller likely shipped the source's restrack id rather than its FW pdn -- consume the 'fw_pdn' driver-private TLV)");
+			return -ENOENT;
+		}
 	}
 
 	pd->pdn = req.pdn;

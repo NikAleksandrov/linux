@@ -100,32 +100,46 @@ enum mlx5_ib_alloc_uctx_v2_flags {
 	 */
 	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE	= 1 << 1,
 	/*
-	 * Bound to the SR-IOV-VFMIG CRIU restore pipeline: the destination
-	 * VF's firmware already carries the source ucontext's devx_uid
-	 * (FW CREATE_UCTX state was imported by LOAD_VHCA_STATE) so the
-	 * usual fresh CREATE_UCTX in mlx5_ib_devx_create() would either
-	 * collide with the imported uid or, when the alloc happens to
-	 * return a different uid, leave the dest ucontext owning a
-	 * different uid than the one source-side PDs/CQs/QPs/MKEYs were
-	 * created under -- producing FW BAD_PARAM on any later op that
-	 * cross-checks (pdn, uid) ownership (CREATE_QP/MKEY/...).
-	 *
-	 * When this flag is set together with MLX5_IB_ALLOC_UCTX_DEVX
-	 * and MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE, the kernel skips
+	 * Bound to the SR-IOV-VFMIG CRIU restore pipeline. When set
+	 * together with MLX5_IB_ALLOC_UCTX_DEVX and
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE, the kernel skips
 	 * mlx5_ib_devx_create() and assigns
 	 *   context->devx_uid = mlx5_ib_alloc_ucontext_req_v2::adopt_devx_uid
-	 * directly. The subsequent mlx5_ib_alloc_transport_domain()
-	 * issues FW ALLOC_TRANSPORT_DOMAIN under that uid -- which
-	 * doubles as a FW-side liveness probe, so a stale adopt_devx_uid
-	 * surfaces at the ucontext alloc step rather than at the first
-	 * downstream PD/QP op.
+	 * directly. adopt_devx_uid is mandatory (must be non-zero) when
+	 * this flag is set, and forbidden (must be zero) when not set.
 	 *
-	 * adopt_devx_uid is mandatory (must be non-zero) when this flag
-	 * is set, and forbidden (must be zero) when not set.
+	 * VESTIGIAL FOR v0 -- DO NOT SET FROM USERSPACE. The original
+	 * design premise was that LOAD_VHCA_STATE preserves the source
+	 * ucontext's FW registration (uid -> uctx_attrs) so the
+	 * destination could adopt the same uid and have all
+	 * source-allocated FW resources (PDs/CQs/QPs/MKEYs whose
+	 * owning_uid was that ucontext) remain usable. Empirical
+	 * matrix from
+	 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/test_pd_adopt.sh
+	 * (DEVX-source variant, FW 28.48.1000) falsifies this: LOAD
+	 * preserves the FW next_free_uctx counter but the
+	 * uctx-registration table itself is wiped, so the adopted uid
+	 * is unregistered post-LOAD and any subsequent
+	 * CREATE_MKEY(pdn, uid=adopted) rejects with a consistent
+	 * "unknown uid" syndrome. Re-issuing CREATE_UCTX on the dest
+	 * yields a different uid that still cannot bind to the source's
+	 * (pdn, owning_uid) FW records.
 	 *
-	 * Tear-down path is unchanged: FW DESTROY_UCTX still runs on
-	 * context destroy. The adopted uid is fully owned by the
-	 * destination ucontext after this alloc returns.
+	 * The v0 mitigation is to open the destination ucontext WITHOUT
+	 * this flag (and without MLX5_IB_ALLOC_UCTX_DEVX), leaving
+	 * context->devx_uid = 0. All adopted PD/MR/CQ/QP records then
+	 * live under uid=0 (host-privileged), which is the FW-ungated
+	 * lane proven by the P_zero/N_zero cells of the matrix.
+	 * Restored processes lose DEVX features (mlx5dv_*,
+	 * devx_obj_create, ...); basic verbs work.
+	 *
+	 * The flag, the adopt_devx_uid field, and the kernel-side
+	 * handler stay in tree as forward-compat for a future FW
+	 * capability that preserves the uctx registry across
+	 * LOAD_VHCA_STATE. Until then this path is reachable only via
+	 * a future probe binary that sets the bit explicitly.
+	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §9.1
+	 * S3b "DEVX-adoption blind spot" for the full empirical chain.
 	 */
 	MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID	= 1 << 2,
 };
