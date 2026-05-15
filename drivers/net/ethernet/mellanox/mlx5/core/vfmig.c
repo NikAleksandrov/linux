@@ -1201,6 +1201,139 @@ out_unlock:
 	return err;
 }
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_MKEY handler -- experimental, §S4b empirical.
+ *
+ * Issues a single QUERY_MKEY(mkey_index) on the bound VF mdev's
+ * cmdif and -- on FW accept -- reads back the mkc pd / qpn / len /
+ * start_addr fields. The whole point is to answer the §S4b
+ * existence question: "Does the source's user-mode MKEY at index N
+ * survive LOAD_VHCA_STATE intact, with the same pd/length/iova the
+ * source had at SAVE time?" If yes, Model A for mlx5_ib_restore_mr
+ * is sound: a destination kernel-side mlx5_ib_mr can wrap the
+ * adopted (mkey_index, pdn) pair without first issuing a fresh
+ * CREATE_MKEY against the destination VHCA.
+ *
+ * Locking: same shape as vfmig_ioc_probe_pd / vfmig_ioc_probe_uid.
+ * Resolve the VF pci_dev from PF + vf_id, take device_lock to pin
+ * ->driver and drvdata, match driver by KBUILD_MODNAME, require
+ * MLX5_INTERFACE_STATE_UP. QUERY_MKEY runs on the VF mdev's cmdif
+ * with cmdif-uid=0 (host-privileged). mlx5_ifc_query_mkey_in has
+ * no uid field of its own, so the question of "can a uid=N
+ * ucontext use this mkey?" is not addressed here -- see PROBE_MKEY
+ * UAPI doc.
+ *
+ * Memory layout: query_mkey_out is large (translations_octword
+ * payload tail) but we only use the mkc header at offset 0x80
+ * (start of memory_key_mkey_entry). Reading the entire blob is
+ * fine; this is a debug-only path with no perf concerns.
+ */
+static long vfmig_ioc_probe_mkey(struct mlx5_vfmig_pf *vfmig,
+				 void __user *uarg)
+{
+	u32 in[MLX5_ST_SZ_DW(query_mkey_in)] = {};
+	int outlen = MLX5_ST_SZ_BYTES(query_mkey_out);
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_mkey arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	void *out, *mkc;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (memchr_inv(arg.reserved_in, 0, sizeof(arg.reserved_in)))
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.mkey_index & 0xff000000)	/* mkey_index is 24 bits */
+		return -EINVAL;
+
+	out = kzalloc(outlen, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev) {
+		err = -ENODEV;
+		goto out_free;
+	}
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_mkey: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_mkey: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	MLX5_SET(query_mkey_in, in, opcode, MLX5_CMD_OP_QUERY_MKEY);
+	MLX5_SET(query_mkey_in, in, mkey_index, arg.mkey_index);
+
+	err = mlx5_cmd_exec(vf_mdev, in, sizeof(in), out, outlen);
+	if (err) {
+		/*
+		 * mlx5_cmd_exec converts FW syndromes to negative errnos
+		 * but stamps the original 32-bit syndrome onto the output
+		 * blob. Surface it to userspace so the test matrix can
+		 * distinguish "invalid mkey" (FW gone) from transport
+		 * errors. Fields stay zero in the reject lane, matching
+		 * the UAPI contract.
+		 */
+		arg.fw_syndrome = MLX5_GET(query_mkey_out, out, syndrome);
+		arg.fw_pd = 0;
+		arg.fw_qpn = 0;
+		arg.fw_start_addr = 0;
+		arg.fw_length = 0;
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: probe_mkey: vf %u mkey_index 0x%x QUERY_MKEY err %d syndrome 0x%x\n",
+			      arg.vf_id, arg.mkey_index, err,
+			      arg.fw_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+
+	arg.fw_syndrome = 0;
+	mkc = MLX5_ADDR_OF(query_mkey_out, out, memory_key_mkey_entry);
+	arg.fw_pd = MLX5_GET(mkc, mkc, pd);
+	arg.fw_qpn = MLX5_GET(mkc, mkc, qpn);
+	arg.fw_start_addr = MLX5_GET64(mkc, mkc, start_addr);
+	arg.fw_length = MLX5_GET64(mkc, mkc, len);
+
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: probe_mkey: vf %u mkey_index 0x%x ok pd=0x%x qpn=0x%x len=0x%llx start=0x%llx\n",
+		      arg.vf_id, arg.mkey_index, arg.fw_pd, arg.fw_qpn,
+		      arg.fw_length, arg.fw_start_addr);
+
+out_copy:
+	memset(arg.reserved_out0, 0, sizeof(arg.reserved_out0));
+	memset(arg.reserved_out1, 0, sizeof(arg.reserved_out1));
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+out_free:
+	kfree(out);
+	return err;
+}
+
 static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 				    void __user *uarg)
 {
@@ -3521,6 +3654,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_PROBE_PD:
 		ret = vfmig_ioc_probe_pd(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_PROBE_MKEY:
+		ret = vfmig_ioc_probe_mkey(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

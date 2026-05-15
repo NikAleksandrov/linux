@@ -527,4 +527,92 @@ struct mlx5_vfmig_probe_pd {
 #define MLX5_VFMIG_IOC_PROBE_PD \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0a, struct mlx5_vfmig_probe_pd)
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_MKEY:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_PD / PROBE_UID /
+ *       QUERY_QP, NOT part of the M2/M3 contract. ***
+ *
+ *   Drives the §S4b empirical question: "After LOAD_VHCA_STATE the
+ *   firmware should still have the source's user-mode MKEY at index
+ *   N alive on the destination VF -- is it actually still there, and
+ *   does its mkc context match what the source had at SAVE time
+ *   (pd, length, start_addr)?"
+ *
+ *   This is the MR analogue of PROBE_PD but uses a different FW
+ *   primitive. PROBE_PD issues a *transient* CREATE_MKEY to test
+ *   whether a (pdn, uid) pair is FW-bound. PROBE_MKEY issues a pure
+ *   QUERY_MKEY(mkey_index) (no side effects, no uid scoping at the
+ *   command layer because mlx5_ifc_query_mkey_in has no uid field)
+ *   and reads back the mkey context if the entry exists.
+ *
+ *   The "can a destination ucontext at uid=0 actually USE this
+ *   adopted mkey?" question -- the analogue of PROBE_PD's uid_hint
+ *   gating test -- is NOT covered by this ioctl. That part is
+ *   tested empirically by the end-to-end S4b probe
+ *   (mr_restore_probe_mlx5_vfmig + a uid=0 destination ucontext
+ *   that issues a wire-visible op against the adopted mkey). The
+ *   split mirrors PROBE_PD vs. mlx5_ib_restore_pd: the PF cdev
+ *   ioctl tests FW-side existence; the userspace probe tests
+ *   destination-ucontext-side usability.
+ *
+ *   Use:
+ *     - On dst, AFTER LOAD_VHCA_STATE has been applied (typically
+ *       AFTER MLX5_VFMIG_IOC_MARK_RESTORED but BEFORE any user
+ *       ucontext binds to the restored VF):
+ *         ioctl(PROBE_MKEY, dst_vf, mkey_index=src_mkey_index)
+ *       Expected: 0 (and @fw_syndrome == 0). The output @fw_pd /
+ *       @fw_length / @fw_start_addr should match the source's
+ *       per-MR snapshot CRIU captured via the extended QUERY_MR
+ *       (lkey >> 8 maps to mkey_index; iova / length map to
+ *       start_addr / len). A mismatch is a kernel bug, not a FW
+ *       bug -- the source's mkc was not byte-preserved by
+ *       SAVE/LOAD.
+ *     - Negative control: same call with a bogus mkey_index
+ *       (e.g. 0x00ffffff). Expected: non-zero @fw_syndrome with
+ *       the FW's "invalid mkey" code; @fw_pd / @fw_length /
+ *       @fw_start_addr zeroed.
+ *
+ *   The VF must currently be bound to mlx5_core and its mdev must
+ *   be MLX5_INTERFACE_STATE_UP, same constraint as PROBE_UID and
+ *   PROBE_PD. The command is issued on the VF mdev's cmdif.
+ *
+ *   Errors: -EFAULT on copy_{from,to}_user; -EINVAL if @mkey_index
+ *   exceeds its 24-bit range, or any reserved field is non-zero;
+ *   -ENODEV if the VF is unbound or its mdev interface is down;
+ *   any negative kernel/FW err code on cmdif transport failure.
+ */
+struct mlx5_vfmig_probe_mkey {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 mkey_index;		/* in:  FW mkey index to query
+					 *      (24 bits significant)
+					 */
+	__u8  reserved_in[8];		/* in:  must be 0 */
+
+	__u32 fw_syndrome;		/* out: 0 on FW accept, else
+					 *      the firmware syndrome
+					 *      returned by QUERY_MKEY
+					 *      (a 32-bit FW error code).
+					 */
+	__u32 fw_pd;			/* out: mkc.pd (24 bits)
+					 *      0 on reject.
+					 */
+	__u32 fw_qpn;			/* out: mkc.qpn (24 bits;
+					 *      0xffffff means "any qp")
+					 *      0 on reject.
+					 */
+	__u8  reserved_out0[4];		/* out: zeroed */
+	__u64 fw_start_addr;		/* out: mkc.start_addr -- 0 on
+					 *      reject. Compare with the
+					 *      source iova captured at
+					 *      dump.
+					 */
+	__u64 fw_length;		/* out: mkc.len -- 0 on reject.
+					 *      Compare with the source
+					 *      length captured at dump.
+					 */
+	__u8  reserved_out1[8];		/* out: zeroed */
+};
+#define MLX5_VFMIG_IOC_PROBE_MKEY \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0b, struct mlx5_vfmig_probe_mkey)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
