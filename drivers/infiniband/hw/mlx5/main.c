@@ -2691,6 +2691,18 @@ static int mlx5_ib_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 		}
 	}
 
+	/*
+	 * vfmig_pd_dbg: TEMPORARY. Emits the FW pdn returned by
+	 * MLX5_CMD_OP_ALLOC_PD against the destination VF, the uid scope
+	 * the alloc ran under, and the udata? bit (user path vs kernel
+	 * internal). Cross-reference with rdma res show pd link <ibdev>
+	 * to see what restrack id was assigned to this same PD; NLDEV
+	 * emits restrack id (res->id) as RDMA_NLDEV_ATTR_RES_PDN -- the
+	 * two are unrelated. Drop with the rest of vfmig_pd_dbg once the
+	 * NLDEV-vs-FW-pdn pipeline confusion is fixed.
+	 */
+	pr_info("vfmig_pd_dbg: alloc_pd ibdev=%s fw_pdn=0x%x uid=%u udata=%d\n",
+		dev_name(&ibdev->dev), pd->pdn, uid, udata ? 1 : 0);
 	return 0;
 }
 
@@ -2699,6 +2711,8 @@ static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 	struct mlx5_ib_dev *mdev = to_mdev(pd->device);
 	struct mlx5_ib_pd *mpd = to_mpd(pd);
 
+	pr_info("vfmig_pd_dbg: dealloc_pd ibdev=%s fw_pdn=0x%x uid=%u restrack_id=0x%x\n",
+		dev_name(&pd->device->dev), mpd->pdn, mpd->uid, pd->res.id);
 	return mlx5_cmd_dealloc_pd(mdev->mdev, mpd->pdn, mpd->uid);
 }
 
@@ -2745,9 +2759,70 @@ static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
  * Our job is to populate mpd->pdn / mpd->uid; everything else is
  * already in place.
  */
+/*
+ * Defense-in-depth FW probe for mlx5_ib_restore_pd's Model A
+ * adoption. Issues a transient CREATE_MKEY{mkc.pd=pdn, mkc.uid=uid}
+ * followed by DESTROY_MKEY on the bound VF's cmdif. If FW rejects
+ * the create, the (pdn, uid) pair is not adoptable -- either the
+ * pdn is stale (never allocated on this VHCA, or torn down by an
+ * intervening tear-down cascade), or the uid mismatches the FW's
+ * record of who owns pdn (a sign that the caller skipped the
+ * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE_ADOPT_DEVX_UID handshake and is
+ * trying to adopt a PD that was created under a different ucontext's
+ * devx_uid).
+ *
+ * Mirrors vfmig_ioc_probe_pd() in mlx5_core/vfmig.c -- same minimal
+ * PA-mode mkey shape, just issued from the in-tree mlx5_ib code path
+ * instead of through the PF cdev.
+ *
+ * Returns 0 on success (FW accepted (pdn, uid), test mkey already
+ * destroyed); a negative errno mirroring mlx5_cmd_exec's status-to-
+ * errno mapping on failure.
+ */
+static int mlx5_ib_restore_pd_fw_probe(struct mlx5_ib_dev *dev, u32 pdn,
+				       u16 uid)
+{
+	u32 in[MLX5_ST_SZ_DW(create_mkey_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(create_mkey_out)] = {};
+	u32 dmk_in[MLX5_ST_SZ_DW(destroy_mkey_in)] = {};
+	u32 dmk_out[MLX5_ST_SZ_DW(destroy_mkey_out)] = {};
+	u32 mkey_index;
+	void *mkc;
+	int err;
+
+	MLX5_SET(create_mkey_in, in, opcode, MLX5_CMD_OP_CREATE_MKEY);
+	MLX5_SET(create_mkey_in, in, uid, uid);
+	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
+	MLX5_SET(mkc, mkc, access_mode_1_0, MLX5_MKC_ACCESS_MODE_PA);
+	MLX5_SET(mkc, mkc, lr, 1);
+	MLX5_SET(mkc, mkc, pd, pdn);
+	MLX5_SET(mkc, mkc, length64, 1);
+	MLX5_SET(mkc, mkc, qpn, 0xffffff);
+
+	err = mlx5_cmd_exec(dev->mdev, in, sizeof(in), out, sizeof(out));
+	if (err)
+		return err;
+
+	mkey_index = MLX5_GET(create_mkey_out, out, mkey_index);
+
+	/*
+	 * Destroy is best-effort: if it fails we leak a 64-byte mkey on
+	 * the VHCA until DESTROY_UCTX cascades clean it up at context
+	 * tear-down. Far better than failing the restore on a successful
+	 * create+probe.
+	 */
+	MLX5_SET(destroy_mkey_in, dmk_in, opcode, MLX5_CMD_OP_DESTROY_MKEY);
+	MLX5_SET(destroy_mkey_in, dmk_in, uid, uid);
+	MLX5_SET(destroy_mkey_in, dmk_in, mkey_index, mkey_index);
+	mlx5_cmd_exec(dev->mdev, dmk_in, sizeof(dmk_in), dmk_out,
+		      sizeof(dmk_out));
+	return 0;
+}
+
 static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 			      struct ib_udata *udata)
 {
+	struct mlx5_ib_dev *dev = to_mdev(ibpd->device);
 	struct mlx5_ib_pd *pd = to_mpd(ibpd);
 	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
 		udata, struct mlx5_ib_ucontext, ibucontext);
@@ -2778,6 +2853,40 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 		return -EINVAL;
 
 	(void)target_handle; /* ufile-handle slot is the dispatcher's job */
+
+	/*
+	 * vfmig_pd_dbg: TEMPORARY. Echoes what CRIU asked the kernel to
+	 * adopt + the destination ucontext's devx_uid scope. Drop with
+	 * the rest of vfmig_pd_dbg once we have an end-to-end clean run.
+	 */
+	pr_info("vfmig_pd_dbg: restore_pd ibdev=%s req_pdn=0x%x target_handle=0x%x devx_uid=%u vfmig_restore_mode=%d\n",
+		dev_name(&ibpd->device->dev), req.pdn, target_handle,
+		context->devx_uid, context->vfmig_restore_mode);
+
+	/*
+	 * Hard-fail Model A's silent-adoption blind spot: confirm FW
+	 * actually has a PD numbered req.pdn under context->devx_uid
+	 * before we set mpd. The CREATE_MKEY probe catches both
+	 * stale-pdn (caller passed the source's restrack id instead of
+	 * its FW pdn) and uid-mismatch (caller passed a real FW pdn but
+	 * the destination ucontext didn't adopt the source's devx_uid)
+	 * cases, which present at later FW ops as opaque
+	 * CREATE_QP/CREATE_MKEY BAD_PARAM. -ENOENT here surfaces the
+	 * problem at the precise restore step that caused it.
+	 *
+	 * The probe is weak for non-DEVX adoption (uid=0) -- FW empirically
+	 * ungated on (pdn, uid=0) for CREATE_MKEY -- but is the strongest
+	 * gate we can apply without round-tripping ALLOC_PD (which we
+	 * specifically don't want in Model A). For DEVX adoption it's a
+	 * hard gate.
+	 */
+	err = mlx5_ib_restore_pd_fw_probe(dev, req.pdn, context->devx_uid);
+	if (err) {
+		mlx5_ib_warn(dev,
+			     "restore_pd: FW probe rejected (pdn=0x%x, uid=%u): %d -- caller passed a stale pdn or the destination ucontext did not adopt the source's devx_uid\n",
+			     req.pdn, context->devx_uid, err);
+		return -ENOENT;
+	}
 
 	pd->pdn = req.pdn;
 	pd->uid = context->devx_uid;
