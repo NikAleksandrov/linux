@@ -133,6 +133,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_DM_MR_REG)(
 	mr->type    = IB_MR_TYPE_DM;
 	mr->dm      = dm;
 	mr->uobject = uobj;
+	mr->access_flags = attr.access_flags;
+	/* DM MRs have no user VA -- mr->user_addr stays 0. */
 	atomic_inc(&pd->usecnt);
 	atomic_inc(&dm->usecnt);
 
