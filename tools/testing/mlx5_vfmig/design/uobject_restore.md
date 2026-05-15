@@ -538,10 +538,19 @@ the handler attempts to bind to that identity (e.g. via vfmig's
   restore-mode support). CRIU surfaces as "this driver doesn't support
   R3 restore yet".
 
-For software providers (rxe), identity hints are honoured by extending the
-allocator with "prefer this id" semantics. Trivial change: rxe already uses
-`xa_alloc` for QPN/MKEY; we add an `xa_insert(prefer_id)` fallback path
-behind a flag.
+For software providers (rxe), identity hints are honoured by extending
+the allocator with "install at this index" semantics. Landed for MR via
+`__rxe_add_to_pool_at_index` in `drivers/infiniband/sw/rxe/rxe_pool.c`:
+the new pool primitive does an `xa_insert(index)` instead of the cyclic
+`xa_alloc_cyclic`, returns `-EBUSY` on collision (the per-verb shape
+CRIU expects), and co-exists transparently with fresh-alloc callers
+because `xa_alloc_cyclic` skips taken slots. The 8-bit per-MR nonce
+inside the lkey/rkey is overwritten from the hint's low byte after
+`rxe_mr_init` runs. Net result: `rxe_restore_mr` lands an MR whose
+wire-visible `lkey`/`rkey` is byte-identical to the source's, so
+post-restore work requests that embed the source `lkey` keep
+functioning. The same pattern (`__rxe_add_to_pool_at_index`) extends
+trivially to QP / CQ / SRQ when those land in S5..S7.
 
 ## 5. Per-uobject-class details
 
@@ -606,11 +615,15 @@ plugin contribution.
 
 ### 5.4 MR
 
-* **Discovery**: NLDEV `RES_MR_GET`, ctxn derived via PDN-join (one-hop
-  after K1). Yields MRLEN, RKEY/LKEY (with CAP_NET_ADMIN). Other fields
-  (virt_addr,
-  access_flags, iova) recoverable via uverbs query path. Plugin adds FW
-  mkey context via `MLX5_IB_METHOD_VFMIG_QUERY_MR(handle)`.
+* **Discovery**: NLDEV `RES_MR_GET` gives the per-MR ufile handle
+  (K8a `RDMA_NLDEV_ATTR_RES_HANDLE`) plus mrlen and (with
+  CAP_NET_ADMIN) rkey/lkey/iova; ctxn derived via PDN-join (one-hop
+  after K1). The wire-restore-relevant attrs not on NLDEV --
+  `user_addr` (the user VA the MR was registered against) and
+  `access_flags` -- come from the extended
+  `UVERBS_METHOD_QUERY_MR` on `UVERBS_OBJECT_MR` (see §7.7 for
+  the rationale). Plugin adds FW mkey context via
+  `MLX5_IB_METHOD_VFMIG_QUERY_MR(handle)`.
 * **Xref**: PD (XR_PARENT_PD).
 * **Restore order**: after PD.
 * **Kernel verb**: `UVERBS_METHOD_RESTORE_MR(target_handle, virt_addr,
@@ -1283,6 +1296,61 @@ per ibdev would need a per-context (not per-device) ops dispatcher;
 explicitly out of scope. Doc records the invariant so future work doesn't
 silently break it.
 
+### 7.7 Extending QUERY_MR for CRIU dump-side discovery
+
+CRIU's dump phase needs the MR's `user_addr` (the user VA the MR was
+registered against) and `access_flags` so the restore-side can
+re-feed them to `UVERBS_METHOD_RESTORE_MR`. Neither field is on the
+core `struct ib_mr` historically, and neither is on NLDEV today.
+
+**Why uverbs ioctl, not NLDEV.** NLDEV currently emits MR metadata
+(lkey/rkey/iova/mrlen) behind a `CAP_NET_ADMIN` gate. We considered
+extending NLDEV with `user_addr` + `access_flags` TLVs but that
+scopes the leak too widely: any process with `CAP_NET_ADMIN` would
+see every MR's user VA across every other process and netns, which
+is more attack surface than CRIU needs. CRIU is the only known
+consumer and CRIU already has the holder's `uverbsfd` open at dump
+time (it `dup`s it from the seized victim, same path as the
+`INFO_HANDLES`-based K2 discovery). The natural security boundary
+is therefore "if you can see the MR's ucontext, you can read its
+metadata" -- which is exactly what a uverbs ioctl gives us through
+the standard `UVERBS_IDR_ANY_OBJECT` lookup.
+
+**Landed shape.** The pre-existing `UVERBS_METHOD_QUERY_MR` (on
+`UVERBS_OBJECT_MR`) is extended with two new UA_OPTIONAL out
+attrs in `include/uapi/rdma/ib_user_ioctl_cmds.h`:
+
+```c
+enum uverbs_attrs_query_mr_cmd_attr_ids {
+    UVERBS_ATTR_QUERY_MR_HANDLE,
+    UVERBS_ATTR_QUERY_MR_RESP_LKEY,
+    UVERBS_ATTR_QUERY_MR_RESP_RKEY,
+    UVERBS_ATTR_QUERY_MR_RESP_LENGTH,
+    UVERBS_ATTR_QUERY_MR_RESP_IOVA,
+    UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR,    /* new, UA_OPTIONAL */
+    UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS, /* new, UA_OPTIONAL */
+};
+```
+
+The matching kernel storage lives on `struct ib_mr` itself (two
+new fields, `user_addr` and `access_flags`) so the handler stays
+core-only and no driver hook is needed. The fields are set by the
+existing core MR-creating paths (`REG_MR`, `REG_DMABUF_MR`, legacy
+write `IB_USER_VERBS_CMD_REG_MR`, `REREG_MR`) and the
+`RESTORE_MR` dispatcher. For non-user MRs (DMABUF, DM, FR) where
+no user VA exists, `user_addr` stays 0; userspace MUST read
+`RESP_USER_ADDR == 0` as "MR has no user VA" rather than
+"registered at NULL".
+
+**Caller compat.** The two new attrs are `UA_OPTIONAL` so existing
+QUERY_MR callers that only ask for the four legacy outs stay
+byte-compatible.
+
+**CRIU dump-side use.** Per MR found via `INFO_HANDLES(MR)`:
+issue `QUERY_MR(handle)` on the same `uverbsfd`, capture the six
+outs, store them in `rdma-uobj.img`. Restore-side feeds the same
+six fields back into `UVERBS_METHOD_RESTORE_MR`'s IN attrs.
+
 ## 8. Cross-host caveats
 
 ### 8.1 GID / PKey port-level state
@@ -1558,12 +1626,25 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   `test_pd_adopt.sh` and adds Phases F-I. Source FW state
   preservation is validated independently by
   `test_fw_id_continuity.sh K6_POST_RECV_WRS=N`.
-* **S4: MR restore (rxe + mlx5_vfmig together).** Implement
-  `RESTORE_MR` + both drivers. Couples with `user_mr_dma.md`
-  stage 3 (rkey continuity at the IOMMU layer); the kernel verb and
-  the user_mr_dma IOMMU-layer binding land together as a coherent
-  per-MR restore. With PD + MR working, the `rdma_test_agent` send
-  buffer is restorable end-to-end.
+* **S4a: MR restore on rxe (landed).** Generic
+  `UVERBS_METHOD_RESTORE_MR` dispatcher + `rxe_restore_mr` landed
+  in the kernel core + rxe driver. rxe **honours** the
+  `lkey_hint`/`rkey_hint` identity hint via a new
+  `__rxe_add_to_pool_at_index` primitive (xa_insert at a specific
+  pool index, returns -EBUSY on collision) plus a post-init
+  overwrite of the 8-bit per-MR nonce from the hint's low byte.
+  Net result: a CRIU-restored rxe MR is wire-compatible with the
+  source -- WRs embedding the source's `lkey`/`rkey` keep
+  functioning post-restore, which makes rxe a real validation
+  surface for the verb contract (not just plumbing). Empirically
+  validated by `mr_restore_probe_rxe` (see §9.5).
+* **S4b: MR restore on mlx5_vfmig.** Pending. Implement
+  `mlx5_ib_restore_mr` adopting the source's FW mkey into a fresh
+  kernel-side `mlx5_ib_mr` wrapper. Couples with `user_mr_dma.md`
+  stage 3 (rkey continuity at the IOMMU layer); the kernel verb
+  and the user_mr_dma IOMMU-layer binding land together as a
+  coherent per-MR restore. With PD + MR working, the
+  `rdma_test_agent` send buffer is restorable end-to-end.
 * **S5: CQ restore + comp channel (rxe + mlx5_vfmig together).** With
   PD + MR + CQ working, the send/recv completion path is back.
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
@@ -1658,6 +1739,53 @@ Failure modes the probe explicitly distinguishes:
   wrong.
 * Success on a NON-restore-mode ucontext => predicate isn't being
   consulted (security regression).
+
+### 9.5 mr_restore_probe_rxe -- empirical S4a validation
+
+Lives at
+`tools/testing/mlx5_vfmig/uobject_restore/mr_restore/mr_restore_probe_rxe.c`.
+Mirrors `pd_restore_probe_rxe`'s shape but exercises the full
+`RESTORE_MR` contract: the dispatcher choreography (per-driver
+gate, atomic ufile-handle reservation, IDR PD lookup, attribute
+parsing), the rxe identity-hint honouring landed in S4a, the
+cross-uobj refcount edge (`atomic_inc(&pd->usecnt)`), and the
+post-restore destroy path.
+
+Eight subtests against `rxe0`:
+
+1. **Gate (negative).** Ucontext WITHOUT
+   `RXE_ALLOC_UCTX_RESTORE_MODE` cannot invoke `RESTORE_MR`;
+   expect `-EPERM`.
+2. **lkey != rkey rejection.** Hint pair with `lkey != rkey`
+   must `-EINVAL` before any pool install. Mirrors rxe's
+   invariant that `ibmr.lkey == ibmr.rkey` on first install.
+3. **Happy path.** `RESTORE_MR(target=0x4242, hint key=0x00424200)`
+   under a fresh PD. Assert response `lkey`/`rkey` are
+   byte-identical to the hint (S4a identity contract) and that
+   the MR handle shows up in `INFO_HANDLES(MR)`.
+4. **Collision (ufile handle).** Second
+   `RESTORE_MR(target=0x4242)` returns `-EBUSY` from the
+   dispatcher's `rdma_alloc_begin_uobject_at_handle`.
+5. **Collision (pool index).** `RESTORE_MR` with a fresh target
+   handle but the same key hint returns `-EBUSY` from
+   `__rxe_add_to_pool_at_index`. Distinct collision shape from
+   (4); CRIU surfaces both as the same errno.
+6. **Bogus parent PD.** `RESTORE_MR` with an unknown `pd_handle`
+   returns `-ENOENT` from the IDR attr machinery.
+7. **Cross-uobj refcount.** While the restored MR is alive,
+   `DEALLOC_PD` on its parent returns `-EBUSY` -- proves the
+   `atomic_inc(&pd->usecnt)` installed by the dispatcher is the
+   right edge.
+8. **Dereg round-trip.** `DEREG_MR` clears the MR; `INFO_HANDLES`
+   no longer reports it; the parent PD's `DEALLOC_PD` now
+   succeeds.
+
+The S4a identity check in subtest 3 is the load-bearing new
+property over the §9.4 PD shape: any future rxe-side change that
+silently dropped the hint-honouring (e.g. a refactor of
+`__rxe_add_to_pool_at_index` or the post-init key overwrite in
+`rxe_restore_mr`) would surface as a `lkey != hint` mismatch
+that this subtest catches.
 
 ## 10. Open questions
 

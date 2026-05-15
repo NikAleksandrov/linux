@@ -10,26 +10,38 @@
  *      RXE_ALLOC_UCTX_RESTORE_MODE cannot invoke RESTORE_MR;
  *      the dispatcher must return -EPERM via the per-driver
  *      ib_device_ops.ucontext_is_restore_mode predicate.
- *   2. Happy path. A ucontext opened WITH the flag can mint an
+ *   2. lkey != rkey rejection. The hint pair (lkey != rkey) must
+ *      come back as -EINVAL from rxe_restore_mr before any pool
+ *      install happens. Mirrors rxe_mr_init's invariant that
+ *      ibmr.lkey == ibmr.rkey on first install.
+ *   3. Happy path. A ucontext opened WITH the flag can mint an
  *      MR uobject at the caller-chosen ufile handle TARGET_HANDLE
  *      under a freshly-allocated parent PD, pinning a small
- *      mmap'd buffer. We additionally assert that the response
- *      lkey/rkey *differ* from the caller-supplied hints: rxe
- *      cannot honour hints (key bits are tied to the rxe_pool
- *      slot allocator), so the dispatcher echoes the *actual*
- *      installed lkey/rkey back, not the bounced-back hint.
- *      Cross-check via UVERBS_METHOD_INFO_HANDLES that the
- *      MR handle shows up in the MR list.
- *   3. Collision. A second RESTORE_MR(TARGET_HANDLE) on the same
- *      ucontext returns -EBUSY (xa_insert collision inside
- *      rdma_alloc_begin_uobject_at_handle).
- *   4. Parent PD missing. RESTORE_MR with a bogus pd_handle
+ *      mmap'd buffer. We assert that the response lkey/rkey are
+ *      *byte-identical* to the caller-supplied hints: rxe's pool
+ *      install lands at index = (lkey_hint >> 8) via the
+ *      __rxe_add_to_pool_at_index primitive, then the verb
+ *      overwrites mr->lkey/rkey from the hint. This is the
+ *      property CRIU relies on so source-side WRs (which embed
+ *      the source lkey) keep working post-restore.
+ *      Cross-check via UVERBS_METHOD_INFO_HANDLES that the MR
+ *      handle shows up in the MR list.
+ *   4. Collision (ufile handle). A second RESTORE_MR(TARGET_HANDLE)
+ *      on the same ucontext returns -EBUSY (xa_insert collision
+ *      inside rdma_alloc_begin_uobject_at_handle).
+ *   5. Collision (pool index). RESTORE_MR with a FRESH target
+ *      handle but the SAME (lkey_hint, rkey_hint) as subtest 3
+ *      returns -EBUSY -- the dispatcher reserves the new ufile
+ *      slot, then __rxe_add_to_pool_at_index fails because the
+ *      pool slot is already occupied. Distinct collision shape
+ *      from subtest 4; CRIU surfaces both as the same -EBUSY.
+ *   6. Parent PD missing. RESTORE_MR with a bogus pd_handle
  *      returns -ENOENT (IDR attr machinery's lookup miss).
- *   5. Cross-uobj refcount. While the restored MR is alive,
+ *   7. Cross-uobj refcount. While the restored MR is alive,
  *      DEALLOC_PD on its parent PD returns -EBUSY -- proves the
  *      atomic_inc(&pd->usecnt) the dispatcher installs is the
  *      right edge.
- *   6. Dereg round-trip. IB_USER_VERBS_CMD_DEREG_MR clears the
+ *   8. Dereg round-trip. IB_USER_VERBS_CMD_DEREG_MR clears the
  *      MR handle; INFO_HANDLES no longer reports it; the parent
  *      PD's DEALLOC_PD now succeeds (cross-uobj edge released).
  *
@@ -144,11 +156,28 @@ enum {
 #define RDMA_DRIVER_RXE_LOCAL			14
 
 #define TARGET_HANDLE				0x4242u
+#define TARGET_HANDLE_2				0x4243u
 #define BOGUS_PD_HANDLE				0xDEAD0042u
 
-/* Synthetic identity hints rxe is expected to ignore. */
-#define LKEY_HINT				0xCAFE0042u
-#define RKEY_HINT				0xCAFE0043u
+/*
+ * Identity hints rxe is now expected to HONOUR.
+ *
+ *   bits 31:8  = rxe MR pool index. Must lie in
+ *                [RXE_MIN_MR_INDEX, RXE_MAX_MR_INDEX] = [1, 0x80000]
+ *                (see drivers/infiniband/sw/rxe/rxe_param.h). 0x4242
+ *                comfortably sits inside that range and is the same
+ *                value our other rxe probes use as a recognisable
+ *                stamp.
+ *   bits 7:0   = 8-bit per-MR nonce; any byte != 0x00 will do.
+ *
+ * lkey and rkey are intentionally equal (same key for both lookup
+ * sides; matches rxe_mr_init's invariant and the new
+ * rxe_restore_mr lkey_hint == rkey_hint precondition).
+ */
+#define MR_KEY					0x00424200u
+#define LKEY_HINT				MR_KEY
+#define RKEY_HINT				MR_KEY
+#define LKEY_HINT_MISMATCH			(MR_KEY + 1u)
 
 /* MR buffer size for the pinned umem. */
 #define MR_BUF_LEN				4096u
@@ -487,6 +516,31 @@ static int subtest_gate_negative(const char *cdev_path, uint32_t access_flags,
 	return fails;
 }
 
+static int subtest_lkey_rkey_mismatch(int fd, uint32_t pd_handle,
+				      uint32_t access_flags, void *buf)
+{
+	struct restore_mr_resp resp = {};
+	int ret;
+
+	printf("[2] lkey != rkey hint -> must -EINVAL (rxe contract: keys equal on install)\n");
+
+	ret = do_restore_mr(fd, TARGET_HANDLE, pd_handle,
+			    (uintptr_t)buf, MR_BUF_LEN, (uintptr_t)buf,
+			    access_flags, LKEY_HINT, LKEY_HINT_MISMATCH,
+			    &resp);
+	if (ret == -EINVAL) {
+		printf("  PASS RESTORE_MR(lkey=0x%x, rkey=0x%x) -> -EINVAL\n",
+		       LKEY_HINT, LKEY_HINT_MISMATCH);
+		return 0;
+	}
+	fprintf(stderr,
+		"  FAIL RESTORE_MR(lkey=0x%x, rkey=0x%x) -> %s (expected -EINVAL;\n"
+		"       rxe_restore_mr should reject the mismatch before any pool install)\n",
+		LKEY_HINT, LKEY_HINT_MISMATCH,
+		ret ? strerror(-ret) : "0 (success)");
+	return 1;
+}
+
 static int subtest_happy_path(int fd, uint32_t pd_handle, uint32_t access_flags,
 			      void *buf, struct restore_mr_resp *resp_out)
 {
@@ -494,8 +548,8 @@ static int subtest_happy_path(int fd, uint32_t pd_handle, uint32_t access_flags,
 	uint32_t total = 0;
 	int ret;
 
-	printf("[2] happy path: RESTORE_MR(target=0x%x, pd=%u, hints lkey=0x%x rkey=0x%x)\n",
-	       TARGET_HANDLE, pd_handle, LKEY_HINT, RKEY_HINT);
+	printf("[3] happy path: RESTORE_MR(target=0x%x, pd=%u, hint key=0x%x)\n",
+	       TARGET_HANDLE, pd_handle, LKEY_HINT);
 
 	ret = do_restore_mr(fd, TARGET_HANDLE, pd_handle,
 			    (uintptr_t)buf, MR_BUF_LEN, (uintptr_t)buf,
@@ -508,6 +562,8 @@ static int subtest_happy_path(int fd, uint32_t pd_handle, uint32_t access_flags,
 			? "  (rxe_restore_mr not registered in rxe_dev_ops?)"
 			: ret == -EPERM
 			? "  (rxe_ucontext_is_restore_mode not reporting true?)"
+			: ret == -EINVAL
+			? "  (key out of MR-pool range? or lkey_hint != rkey_hint?)"
 			: "");
 		return 1;
 	}
@@ -515,21 +571,21 @@ static int subtest_happy_path(int fd, uint32_t pd_handle, uint32_t access_flags,
 	       TARGET_HANDLE, resp_out->lkey, resp_out->rkey);
 
 	/*
-	 * Tighter check: rxe's lkey/rkey come from its internal pool
-	 * allocator + rxe_get_next_key(), so they CANNOT equal the
-	 * caller's hints. If they did, the dispatcher would be
-	 * bouncing the hint back instead of echoing the driver's
-	 * actual installed keys -- silent regression.
+	 * Identity contract: post-rxe-restore-hint-honouring, the
+	 * driver MUST install at pool index (LKEY_HINT >> 8) and the
+	 * verb MUST overwrite mr->lkey/rkey to LKEY_HINT/RKEY_HINT.
+	 * The wire-visible identity is preserved across the restore.
 	 */
-	if (resp_out->lkey == LKEY_HINT || resp_out->rkey == RKEY_HINT) {
+	if (resp_out->lkey != LKEY_HINT || resp_out->rkey != RKEY_HINT) {
 		fprintf(stderr,
-			"  FAIL response lkey/rkey equals the caller's hint\n"
-			"       (rxe cannot honour hints; dispatcher must echo\n"
-			"       the driver's actual installed keys)\n");
+			"  FAIL response lkey=0x%x rkey=0x%x != hint 0x%x\n"
+			"       (rxe must honour the identity hint; check\n"
+			"       __rxe_add_to_pool_at_index + post-init key\n"
+			"       overwrite in rxe_restore_mr)\n",
+			resp_out->lkey, resp_out->rkey, LKEY_HINT);
 		return 1;
 	}
-	printf("  PASS resp keys differ from hints (rxe correctly ignored hints,\n"
-	       "       dispatcher echoed driver-assigned keys)\n");
+	printf("  PASS resp keys are byte-identical to hints (wire-visible identity preserved)\n");
 
 	ret = do_info_handles(fd, UVERBS_OBJECT_MR, list, 16, &total);
 	if (ret) {
@@ -548,13 +604,13 @@ static int subtest_happy_path(int fd, uint32_t pd_handle, uint32_t access_flags,
 	return 0;
 }
 
-static int subtest_collision(int fd, uint32_t pd_handle, uint32_t access_flags,
-			     void *buf)
+static int subtest_collision_handle(int fd, uint32_t pd_handle,
+				    uint32_t access_flags, void *buf)
 {
 	struct restore_mr_resp resp = {};
 	int ret;
 
-	printf("[3] collision: second RESTORE_MR(target=0x%x) must -EBUSY\n",
+	printf("[4] ufile collision: second RESTORE_MR(target=0x%x) must -EBUSY\n",
 	       TARGET_HANDLE);
 
 	ret = do_restore_mr(fd, TARGET_HANDLE, pd_handle,
@@ -571,15 +627,41 @@ static int subtest_collision(int fd, uint32_t pd_handle, uint32_t access_flags,
 	return 1;
 }
 
+static int subtest_collision_pool(int fd, uint32_t pd_handle,
+				  uint32_t access_flags, void *buf)
+{
+	struct restore_mr_resp resp = {};
+	int ret;
+
+	printf("[5] pool collision: RESTORE_MR(target=0x%x, key=0x%x) on a fresh ufile\n"
+	       "    slot but a taken MR-pool index must -EBUSY\n",
+	       TARGET_HANDLE_2, LKEY_HINT);
+
+	ret = do_restore_mr(fd, TARGET_HANDLE_2, pd_handle,
+			    (uintptr_t)buf, MR_BUF_LEN, (uintptr_t)buf,
+			    access_flags, LKEY_HINT, RKEY_HINT, &resp);
+	if (ret == -EBUSY) {
+		printf("  PASS RESTORE_MR(target=0x%x, key=0x%x) -> -EBUSY\n",
+		       TARGET_HANDLE_2, LKEY_HINT);
+		return 0;
+	}
+	fprintf(stderr,
+		"  FAIL RESTORE_MR(target=0x%x, key=0x%x) -> %s (expected -EBUSY;\n"
+		"       __rxe_add_to_pool_at_index should fail when the slot is taken)\n",
+		TARGET_HANDLE_2, LKEY_HINT,
+		ret ? strerror(-ret) : "0 (success)");
+	return 1;
+}
+
 static int subtest_bogus_pd(int fd, uint32_t access_flags, void *buf)
 {
 	struct restore_mr_resp resp = {};
 	int ret;
 
-	printf("[4] bogus parent: RESTORE_MR(pd=0x%x) must -ENOENT\n",
+	printf("[6] bogus parent: RESTORE_MR(pd=0x%x) must -ENOENT\n",
 	       BOGUS_PD_HANDLE);
 
-	ret = do_restore_mr(fd, TARGET_HANDLE + 1, BOGUS_PD_HANDLE,
+	ret = do_restore_mr(fd, TARGET_HANDLE_2 + 1, BOGUS_PD_HANDLE,
 			    (uintptr_t)buf, MR_BUF_LEN, (uintptr_t)buf,
 			    access_flags, LKEY_HINT, RKEY_HINT, &resp);
 	if (ret == -ENOENT) {
@@ -597,7 +679,7 @@ static int subtest_pd_dealloc_busy_with_live_mr(int fd, uint32_t pd_handle)
 {
 	int ret;
 
-	printf("[5] cross-uobj refcount: DEALLOC_PD(%u) with live MR must -EBUSY\n",
+	printf("[7] cross-uobj refcount: DEALLOC_PD(%u) with live MR must -EBUSY\n",
 	       pd_handle);
 
 	ret = do_dealloc_pd(fd, pd_handle);
@@ -620,7 +702,7 @@ static int subtest_dereg_round_trip(int fd, uint32_t pd_handle)
 	uint32_t total = 0;
 	int ret;
 
-	printf("[6] dereg round-trip: DEREG_MR(0x%x) + handle gone + DEALLOC_PD succeeds\n",
+	printf("[8] dereg round-trip: DEREG_MR(0x%x) + handle gone + DEALLOC_PD succeeds\n",
 	       TARGET_HANDLE);
 
 	ret = do_dereg_mr(fd, TARGET_HANDLE);
@@ -718,9 +800,14 @@ int main(int argc, char **argv)
 	}
 	printf("parent PD: handle=%u\n", pd_handle);
 
+	fails += subtest_lkey_rkey_mismatch(fd_restore, pd_handle, access_flags,
+					    buf);
 	fails += subtest_happy_path(fd_restore, pd_handle, access_flags, buf,
 				    &mr_resp);
-	fails += subtest_collision(fd_restore, pd_handle, access_flags, buf);
+	fails += subtest_collision_handle(fd_restore, pd_handle, access_flags,
+					  buf);
+	fails += subtest_collision_pool(fd_restore, pd_handle, access_flags,
+					buf);
 	fails += subtest_bogus_pd(fd_restore, access_flags, buf);
 	fails += subtest_pd_dealloc_busy_with_live_mr(fd_restore, pd_handle);
 	fails += subtest_dereg_round_trip(fd_restore, pd_handle);
