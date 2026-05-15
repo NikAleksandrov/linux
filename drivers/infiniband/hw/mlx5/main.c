@@ -3037,6 +3037,168 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 	return 0;
 }
 
+/*
+ * mlx5_ib_restore_mr: CRIU-managed MR restore, Model A (FW mkey
+ * adoption). The destination VHCA inherits the source's user-mode
+ * mkey table across LOAD_VHCA_STATE; this handler builds a fresh
+ * kernel-side mlx5_ib_mr that wraps the adopted (mkey_index, pdn)
+ * pair without re-issuing FW CREATE_MKEY.
+ *
+ * Empirical justification of mkey adoption is the chain
+ *   K6 (uobject_restore/fw_id_continuity/) -- mkey allocator
+ *      high-water survives LOAD_VHCA_STATE.
+ *   S4b probe (uobject_restore/mr_adopt/) -- QUERY_MKEY confirms
+ *      the source's mkey_index is still alive in destination FW
+ *      with mkc.{pd, start_addr, len} byte-equal to the source's
+ *      pre-SAVE view, host-priv QUERY_MKEY rejects bogus indices
+ *      with FW syndrome (gating works).
+ * Both empirically PASS on FW 28.48.1000; see
+ * tools/testing/mlx5_vfmig/design/uobject_restore.md §S4b.
+ *
+ * The dispatcher in uverbs_std_types_restore.c has already:
+ *   - gated on mlx5_ib_ucontext_is_restore_mode
+ *     (context->vfmig_restore_mode is true);
+ *   - reserved target_handle in the ufile idr via
+ *     rdma_alloc_begin_uobject_at_handle();
+ *   - validated PD belongs to this device (ibpd is the restored
+ *     destination PD, with mpd->pdn == src_pdn after S3b adoption
+ *     and mpd->uid == context->devx_uid == 0 for v0).
+ * After we return, the dispatcher will populate mr->ibmr.iova /
+ * .length / .user_addr / .access_flags / .device / .pd / .type /
+ * .uobject and set up restrack. Our job is the mlx5-private state.
+ *
+ * Wire-visible identity (lkey/rkey) MUST come from the caller.
+ * The mlx5 invariant is lkey == rkey == (mkey_index << 8) |
+ * variant_byte, where the 8-bit variant is part of the FW key and
+ * is preserved across LOAD_VHCA_STATE (the mkey table snapshot
+ * carries it). We cross-check that the core attrs and the UHW
+ * mkey_index are mutually consistent and reject otherwise.
+ *
+ * v0 simplifications:
+ *   - mr->umem = NULL. The user-pages side of the MR (IOMMU
+ *     mappings, DMA setup) is owned by user_mr_dma stage 3 of
+ *     the SR-IOV migration / CRIU integration -- not by mlx5_ib.
+ *     This is consistent with mr->mmkey.cache_ent = NULL and
+ *     mr->mmkey.cacheable = 0: dereg goes straight to FW
+ *     DESTROY_MKEY without UMR cache return.
+ *   - mr->mmkey.cache_ent = NULL, cacheable = 0, ndescs = 0,
+ *     usecount = 0. Adopted MRs never enter the mkey cache and
+ *     never participate in ODP/UMR fast paths (orthogonal v0
+ *     restrictions to be lifted in user_mr_dma stage 3).
+ *   - No UMR resource init (mlx5r_umr_resource_init); we never
+ *     run UMR on this mr. If a future REREG_MR replay needs UMR
+ *     it can be lazily initialised then.
+ *
+ * v0 dealloc-ordering invariant (parallel to S3b's orphan-PD
+ * invariant): if userspace tries to DEREG_MR before all
+ * dependents (QPs, SRQs, RQs that hold mkey references in their
+ * WQ context) have been restored or torn down, FW DESTROY_MKEY
+ * returns BAD_RES_STATE which propagates as -EINVAL. This is
+ * working as intended; the mr stays parked at target_handle
+ * until restore is complete or the ucontext is destroyed.
+ *
+ * Returns the &mr->ibmr ready for the dispatcher to commit, or
+ * an ERR_PTR() on validation failure.
+ */
+static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
+					u64 addr, u64 length, u64 iova,
+					int access, u32 lkey_hint,
+					u32 rkey_hint, struct ib_udata *udata)
+{
+	struct mlx5_ib_dev *dev = to_mdev(ibpd->device);
+	struct mlx5_ib_pd *mpd = to_mpd(ibpd);
+	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
+		udata, struct mlx5_ib_ucontext, ibucontext);
+	struct mlx5_ib_restore_mr_req req = {};
+	struct mlx5_ib_mr *mr;
+	int err;
+
+	if (!context)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * Belt & suspenders: the generic dispatcher already gated on
+	 * mlx5_ib_ucontext_is_restore_mode, but a driver-direct caller
+	 * (devx fast path, future test harnesses) cannot bypass the
+	 * per-ucontext sticky bool here.
+	 */
+	if (!context->vfmig_restore_mode)
+		return ERR_PTR(-EPERM);
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return ERR_PTR(-EINVAL);
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return ERR_PTR(err);
+	if (req.reserved || req.reserved2)
+		return ERR_PTR(-EINVAL);
+	/* FW mkey_index is a 24-bit field (PRM "create_mkey_out"). */
+	if (req.mkey_index & ~0xffffffU || req.mkey_index == 0)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * mlx5 user-MR invariant: lkey == rkey, and both fold the FW
+	 * mkey_index in the upper 24 bits with an 8-bit variant nonce
+	 * in the low byte. Cross-check that what CRIU shipped via the
+	 * core attrs (lkey/rkey hint) matches what it shipped via UHW
+	 * (mkey_index). If not, the caller is mixing up the source's
+	 * restrack id with its FW key -- the same class of bug
+	 * mlx5_ib_restore_pd's defense-in-depth probe catches for PDs.
+	 */
+	if (lkey_hint != rkey_hint)
+		return ERR_PTR(-EINVAL);
+	if ((lkey_hint >> 8) != req.mkey_index)
+		return ERR_PTR(-EINVAL);
+
+	(void)addr; (void)length; (void)iova; (void)access;
+	(void)target_handle;	/* dispatcher's job */
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (!mr)
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * Adopt the FW mkey state. We do not issue any FW command
+	 * here -- the mkey was alive in destination FW post-LOAD per
+	 * the S4b empirical chain. mr->mmkey.key is the full
+	 * (mkey_index << 8 | variant) key the wire sees.
+	 */
+	mr->mmkey.key = lkey_hint;
+	mr->mmkey.type = MLX5_MKEY_MR;
+	mr->mmkey.ndescs = 0;
+	init_waitqueue_head(&mr->mmkey.wait);
+	refcount_set(&mr->mmkey.usecount, 0);
+	mr->mmkey.cache_ent = NULL;
+	mr->mmkey.cacheable = 0;
+
+	/*
+	 * v0: no kernel-side umem. user_mr_dma stage 3 owns the IOMMU
+	 * side; we don't double-pin pages. With umem == NULL +
+	 * cache_ent == NULL the dereg path collapses to FW
+	 * DESTROY_MKEY + kfree(mr).
+	 */
+	mr->umem = NULL;
+	mr->access_flags = access;	/* mlx5-private (user-MR branch) */
+	mr->page_shift = PAGE_SHIFT;	/* unused while umem == NULL */
+
+	/*
+	 * Wire-visible identity. The dispatcher echoes these back to
+	 * userspace via RESP_LKEY / RESP_RKEY so CRIU can verify the
+	 * driver honoured the hint (mlx5 always does; rxe doesn't,
+	 * which is the documented behavioural difference between the
+	 * two backends).
+	 */
+	mr->ibmr.lkey = lkey_hint;
+	mr->ibmr.rkey = rkey_hint;
+
+	mlx5_ib_dbg(dev,
+		    "vfmig_mr_dbg: restore_mr ibdev=%s mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x\n",
+		    dev_name(&ibpd->device->dev), req.mkey_index, lkey_hint,
+		    mpd->pdn, mpd->uid, target_handle);
+
+	return &mr->ibmr;
+}
+
 static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
@@ -4875,6 +5037,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.req_notify_cq = mlx5_ib_arm_cq,
 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
 	.resize_cq = mlx5_ib_resize_cq,
+	.restore_mr = mlx5_ib_restore_mr,
 	.restore_pd = mlx5_ib_restore_pd,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
