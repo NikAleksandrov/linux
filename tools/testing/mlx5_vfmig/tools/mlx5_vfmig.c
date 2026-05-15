@@ -167,6 +167,53 @@ static int do_probe_pd(int fd, unsigned int vf_id, unsigned int pdn,
 	return 0;
 }
 
+/*
+ * EXPERIMENTAL: §S4b empirical -- "is the source's FW mkey at index
+ * N still alive on the destination after LOAD_VHCA_STATE, and does
+ * its (pd, len, start_addr) match the source's pre-SAVE view?".
+ * See include/uapi/linux/mlx5_vfmig.h's MLX5_VFMIG_IOC_PROBE_MKEY
+ * block for the full methodology.
+ *
+ * Output is one key=value per line so the shell harness can
+ * capture it into named variables (mirror of probe_pd).
+ */
+static int do_probe_mkey(int fd, unsigned int vf_id,
+			 unsigned int mkey_index)
+{
+	struct mlx5_vfmig_probe_mkey arg = {
+		.vf_id      = vf_id,
+		.mkey_index = mkey_index,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_MKEY, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(PROBE_MKEY requires the VF mdev to be "
+				"interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"PROBE_MKEY: invalid arg "
+				"(vf_id=%u mkey_index=0x%x). "
+				"mkey_index must fit in 24 bits.\n",
+				vf_id, mkey_index);
+		else
+			perror("PROBE_MKEY");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("mkey_index=0x%06x\n", mkey_index);
+	printf("fw_syndrome=0x%08x\n", arg.fw_syndrome);
+	printf("fw_accept=%u\n", arg.fw_syndrome == 0 ? 1 : 0);
+	printf("fw_pd=0x%06x\n", arg.fw_pd);
+	printf("fw_qpn=0x%06x\n", arg.fw_qpn);
+	printf("fw_start_addr=0x%016llx\n",
+	       (unsigned long long)arg.fw_start_addr);
+	printf("fw_length=0x%016llx\n",
+	       (unsigned long long)arg.fw_length);
+	return 0;
+}
+
 static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
 {
 	struct mlx5_vfmig_set_tracked arg = {
@@ -496,6 +543,7 @@ static void usage(const char *argv0)
 		"  probe_uid         <vf_id>     (experimental)\n"
 		"  query_qp          <vf_id> <qpn>  (experimental)\n"
 		"  probe_pd          <vf_id> <pdn> [<uid_hint=0>]  (experimental)\n"
+		"  probe_mkey        <vf_id> <mkey_index>  (experimental)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
 }
@@ -586,6 +634,11 @@ int main(int argc, char **argv)
 			uid_hint = strtoul(argv[5], NULL, 0);
 		ret = do_probe_pd(fd, strtoul(argv[3], NULL, 0),
 				  strtoul(argv[4], NULL, 0), uid_hint);
+	} else if (verb_eq(verb, "probe_mkey")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_probe_mkey(fd, strtoul(argv[3], NULL, 0),
+				    strtoul(argv[4], NULL, 0));
 	} else {
 		fprintf(stderr, "unknown verb: %s\n", verb);
 		ret = 2;

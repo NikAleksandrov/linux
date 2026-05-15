@@ -335,6 +335,15 @@ int main(int argc, char **argv)
 	printf("lkey=0x%08x\n", lkey);
 	printf("rkey=0x%08x\n", rkey);
 	printf("mkey_index=%u\n", lkey >> 8);
+	/*
+	 * iova (mlx5 sets mr->iova == mr_buf for non-zero-based MRs)
+	 * and length, used by test_mr_adopt.sh to byte-compare against
+	 * PROBE_MKEY's fw_start_addr / fw_length output on the
+	 * destination. ibv_reg_mr's IOVA equals the user VA when
+	 * IBV_ACCESS_ZERO_BASED is not set, which is the default.
+	 */
+	printf("mr_addr=0x%016llx\n", (unsigned long long)(uintptr_t)mr_buf);
+	printf("mr_length=0x%016zx\n", mr_len);
 	if (srq)
 		printf("srqn=%u\n", srqn);
 	else
