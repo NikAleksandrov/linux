@@ -99,6 +99,35 @@ enum mlx5_ib_alloc_uctx_v2_flags {
 	 * See tools/testing/mlx5_vfmig/design/uar_restore.md.
 	 */
 	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE	= 1 << 1,
+	/*
+	 * Bound to the SR-IOV-VFMIG CRIU restore pipeline: the destination
+	 * VF's firmware already carries the source ucontext's devx_uid
+	 * (FW CREATE_UCTX state was imported by LOAD_VHCA_STATE) so the
+	 * usual fresh CREATE_UCTX in mlx5_ib_devx_create() would either
+	 * collide with the imported uid or, when the alloc happens to
+	 * return a different uid, leave the dest ucontext owning a
+	 * different uid than the one source-side PDs/CQs/QPs/MKEYs were
+	 * created under -- producing FW BAD_PARAM on any later op that
+	 * cross-checks (pdn, uid) ownership (CREATE_QP/MKEY/...).
+	 *
+	 * When this flag is set together with MLX5_IB_ALLOC_UCTX_DEVX
+	 * and MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE, the kernel skips
+	 * mlx5_ib_devx_create() and assigns
+	 *   context->devx_uid = mlx5_ib_alloc_ucontext_req_v2::adopt_devx_uid
+	 * directly. The subsequent mlx5_ib_alloc_transport_domain()
+	 * issues FW ALLOC_TRANSPORT_DOMAIN under that uid -- which
+	 * doubles as a FW-side liveness probe, so a stale adopt_devx_uid
+	 * surfaces at the ucontext alloc step rather than at the first
+	 * downstream PD/QP op.
+	 *
+	 * adopt_devx_uid is mandatory (must be non-zero) when this flag
+	 * is set, and forbidden (must be zero) when not set.
+	 *
+	 * Tear-down path is unchanged: FW DESTROY_UCTX still runs on
+	 * context destroy. The adopted uid is fully owned by the
+	 * destination ucontext after this alloc returns.
+	 */
+	MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID	= 1 << 2,
 };
 struct mlx5_ib_alloc_ucontext_req_v2 {
 	__u32	total_num_bfregs;
@@ -110,6 +139,22 @@ struct mlx5_ib_alloc_ucontext_req_v2 {
 	__u16	reserved1;
 	__u32	reserved2;
 	__aligned_u64 lib_caps;
+	/*
+	 * SR-IOV-VFMIG CRIU restore: the source ucontext's devx_uid to
+	 * adopt on the destination ucontext. Only honoured when both
+	 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID and
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE and MLX5_IB_ALLOC_UCTX_DEVX
+	 * are set in @flags. Must be zero otherwise. See the
+	 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID flag comment for semantics.
+	 *
+	 * Backward compat: this field is appended after lib_caps, so an
+	 * older userspace that sends the pre-extension v2 struct
+	 * (ending at lib_caps) is unaffected -- the kernel's
+	 * ib_copy_from_udata sees udata->inlen < sizeof(req) and zeros
+	 * the tail, leaving adopt_devx_uid implicitly 0.
+	 */
+	__u32	adopt_devx_uid;
+	__u32	reserved3;
 };
 
 enum mlx5_ib_alloc_ucontext_resp_mask {

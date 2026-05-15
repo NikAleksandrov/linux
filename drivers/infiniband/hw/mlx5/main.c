@@ -2103,11 +2103,48 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 		return err;
 
 	if (req.flags & ~(MLX5_IB_ALLOC_UCTX_DEVX |
-			  MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE))
+			  MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE |
+			  MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID))
 		return -EOPNOTSUPP;
 
-	if (req.comp_mask || req.reserved0 || req.reserved1 || req.reserved2)
+	if (req.comp_mask || req.reserved0 || req.reserved1 || req.reserved2 ||
+	    req.reserved3)
 		return -EOPNOTSUPP;
+
+	/*
+	 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID is meaningful only on a
+	 * VFMIG-restore-mode + DEVX ucontext (the SR-IOV-VFMIG CRIU
+	 * restore pipeline -- see uapi/rdma/mlx5-abi.h). Reject any
+	 * inconsistent caller shape so the failure mode is obvious at
+	 * the alloc site rather than at the first downstream FW op.
+	 *
+	 *   - ADOPT_DEVX_UID without VFMIG_RESTORE: the source-side
+	 *     devx_uid only makes sense on a freshly-loaded VHCA whose
+	 *     FW state was imported by LOAD_VHCA_STATE; on a brand-new
+	 *     ucontext there is nothing to adopt.
+	 *   - ADOPT_DEVX_UID without DEVX: the only consumer of
+	 *     context->devx_uid is the DEVX path; without DEVX, an
+	 *     adopted uid would never be set on the FW commands the
+	 *     ucontext later issues.
+	 *   - ADOPT_DEVX_UID with adopt_devx_uid == 0: zero is reserved
+	 *     for "no devx uid" (the non-DEVX semantic); if the source
+	 *     ucontext had devx_uid == 0 the dest should not set the
+	 *     ADOPT flag at all.
+	 *   - !ADOPT_DEVX_UID with adopt_devx_uid != 0: stale field
+	 *     left in the request -- reject so userspace can't paper
+	 *     over a bug by silently dropping the field.
+	 *   - adopt_devx_uid out of range (uid is a 16-bit FW field).
+	 */
+	if (req.flags & MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID) {
+		if (!(req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE))
+			return -EINVAL;
+		if (!(req.flags & MLX5_IB_ALLOC_UCTX_DEVX))
+			return -EINVAL;
+		if (!req.adopt_devx_uid || req.adopt_devx_uid > U16_MAX)
+			return -EINVAL;
+	} else if (req.adopt_devx_uid) {
+		return -EINVAL;
+	}
 
 	req.total_num_bfregs = ALIGN(req.total_num_bfregs,
 				    MLX5_NON_FP_BFREGS_PER_UAR);
@@ -2134,16 +2171,46 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 	}
 
 	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX) {
-		err = mlx5_ib_devx_create(dev, true, uctx->enabled_caps);
-		if (err < 0)
-			goto out_ctx;
-		context->devx_uid = err;
+		if (req.flags & MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID) {
+			/*
+			 * SR-IOV-VFMIG CRIU restore: the dest VF's FW already
+			 * has the source ucontext's devx_uid imported by
+			 * LOAD_VHCA_STATE. Skip the fresh FW CREATE_UCTX and
+			 * take ownership of the imported uid. Liveness is
+			 * verified one step below by
+			 * mlx5_ib_alloc_transport_domain -- FW
+			 * ALLOC_TRANSPORT_DOMAIN under an unknown uid fails
+			 * with BAD_PARAM / BAD_RESOURCE, which we propagate
+			 * up the alloc-ucontext error path so the caller
+			 * sees the mistake at the precise step that produced
+			 * it.
+			 *
+			 * Privileged-uid tracking is intentionally not
+			 * re-installed here for v0 -- the SR-IOV-VFMIG path
+			 * targets non-privileged libmlx5 dyn-UAR ucontexts.
+			 * If/when a privileged restore use case surfaces the
+			 * source-side enabled_caps will need to ride along
+			 * in the UAPI too; for now reject the combination so
+			 * a future caller can't silently get a degraded
+			 * privilege scope.
+			 */
+			if (uctx_rdma_ctrl_is_enabled(uctx->enabled_caps)) {
+				err = -EOPNOTSUPP;
+				goto out_ctx;
+			}
+			context->devx_uid = req.adopt_devx_uid;
+		} else {
+			err = mlx5_ib_devx_create(dev, true, uctx->enabled_caps);
+			if (err < 0)
+				goto out_ctx;
+			context->devx_uid = err;
 
-		if (uctx_rdma_ctrl_is_enabled(uctx->enabled_caps)) {
-			err = mlx5_cmd_add_privileged_uid(dev->mdev,
-							  context->devx_uid);
-			if (err)
-				goto out_devx;
+			if (uctx_rdma_ctrl_is_enabled(uctx->enabled_caps)) {
+				err = mlx5_cmd_add_privileged_uid(dev->mdev,
+								  context->devx_uid);
+				if (err)
+					goto out_devx;
+			}
 		}
 	}
 
