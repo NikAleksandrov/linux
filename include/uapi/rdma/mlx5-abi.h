@@ -270,6 +270,52 @@ struct mlx5_ib_restore_pd_req {
 				  * future DEVX-uid / flags. */
 };
 
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_MR on
+ * mlx5. CRIU-managed restore passes the source's FW mkey_index
+ * here so mlx5_ib_restore_mr can adopt the existing destination-
+ * side mkey (preserved across LOAD_VHCA_STATE) into a fresh
+ * kernel-side mlx5_ib_mr without re-issuing FW CREATE_MKEY.
+ *
+ * The wire-visible identity of the MR is carried by the core
+ * UVERBS_ATTR_RESTORE_MR_LKEY_HINT / _RKEY_HINT attributes on
+ * the verb (mlx5 invariant: lkey == rkey == mkey_index << 8 |
+ * variant_byte). mkey_index in this UHW must match
+ * (lkey_hint >> 8) == (rkey_hint >> 8); the handler enforces.
+ * Carrying mkey_index explicitly here -- even though the driver
+ * could derive it from the core attrs -- is defense-in-depth:
+ * a CRIU bug that ships the source's restrack id instead of the
+ * FW mkey_index will be caught at the handler boundary, exactly
+ * where the parallel (pdn vs restrack id) bug is caught for
+ * RESTORE_PD.
+ *
+ * The adopted mkey_index must come from the source's pre-SAVE
+ * state and is expected to still be reserved in firmware on the
+ * destination VF after LOAD_VHCA_STATE. The empirical chain is:
+ *   - tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/
+ *     (K6 -- mkey allocator high-water survives LOAD);
+ *   - tools/testing/mlx5_vfmig/uobject_restore/mr_adopt/
+ *     (S4b -- QUERY_MKEY confirms src_mkey_index alive on dest
+ *     post-LOAD with mkc.{pd, start_addr, len} byte-equal to the
+ *     source pre-SAVE view).
+ *
+ * NOTE on size (>8 bytes): same inline-UHW dodge as
+ * mlx5_ib_restore_pd_req. Two u64-equivalent payload + reserved
+ * bytes ensure the dispatcher always takes the userspace-pointer
+ * path; ib_copy_from_udata() then works as expected on x86_64
+ * with masked-user-access support. The extra reserved bytes
+ * also reserve room for future per-MR DEVX-uid hints and other
+ * forward-compat flags without growing the struct.
+ */
+struct mlx5_ib_restore_mr_req {
+	__u32	mkey_index;	/* FW mkey index to adopt
+				 * (24 bits significant). */
+	__u32	reserved;	/* must be 0 */
+	__aligned_u64 reserved2; /* must be 0; pads above inline-UHW
+				  * threshold and reserves room for
+				  * future DEVX-uid / flags. */
+};
+
 struct mlx5_ib_tso_caps {
 	__u32 max_tso; /* Maximum tso payload size in bytes */
 
