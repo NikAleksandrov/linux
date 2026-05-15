@@ -1446,11 +1446,81 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
     adopted `pdn` succeed without any FW gate to satisfy.
     Combined: no FW round-trip is required.
 
-  **DEVX-aware ucontexts** (`mlx5dv_*`, `devx_obj_create`, ...)
-  remain unsupported in v0. Their downstream FW ops run under
-  `devx_uid != 0` where firmware gating *does* apply; they need
-  a `PROBE_UID`-delta-based probe variant before any DEVX-side
-  PD restore work.
+  **DEVX-adoption blind spot (2026-05-15).** The initial S3b
+  plan also covered DEVX-aware ucontexts via a
+  `MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID` flag plumbed through
+  `mlx5_ib_alloc_ucontext_req_v2::adopt_devx_uid` (kernel commit
+  `afb3b5614af3`). The premise was that `LOAD_VHCA_STATE`
+  preserves the source ucontext's FW registration so the
+  destination could re-claim the same `devx_uid` and run all
+  source-allocated resources under it. Empirical falsification
+  via the DEVX-source variant of `test_pd_adopt.sh` (matrix
+  data captured on FW 28.48.1000):
+
+  | uid lane                       | `src_pdn`            | `BOGUS_PDN`          |
+  |--------------------------------|----------------------|----------------------|
+  | `uid=0` (host-priv, ungated)   | accept `syn=0`       | accept `syn=0`       |
+  | `uid=src_devx_uid` (registered)| reject `syn=0x76555f`| reject `syn=0x76555f`|
+  | `uid=lo_unalloc` (never reg'd) | reject `syn=0x76555f`| reject `syn=0x76555f`|
+  | `uid=hi_unalloc` (host range)  | accept `syn=0`       | accept `syn=0`       |
+
+  Combined with `probe_uid` returning the *next* free uid past
+  the source's high-water mark on the destination, the model is:
+  **LOAD_VHCA_STATE preserves the FW `next_free_uctx` counter
+  but does NOT preserve the uctx-registration table** (the
+  `uid -> uctx_attrs` map). Every uid in the low/"user" range is
+  unregistered post-LOAD; FW rejects `CREATE_MKEY(pdn, uid)`
+  with a consistent "unknown uid" syndrome regardless of pdn.
+  The `0xfff_` high range is a separate host-privileged fallback
+  bucket that bypasses the registry check entirely, which is
+  why `uid=hi_unalloc` accepts -- it is not a usable mitigation
+  for adoption since it routes around `(pdn, uid)` ownership
+  too.
+
+  **v0 mitigation: don't propagate `devx_uid`.** The CRIU
+  plugin opens the destination ucontext WITHOUT
+  `MLX5_IB_ALLOC_UCTX_DEVX` /
+  `MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID`, leaving
+  `context->devx_uid = 0`. All adopted resources land in the
+  `uid=0` host-priv lane, which is the ungated row proven by
+  the matrix's `P_zero/N_zero` cells. The kernel-side
+  `MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID` handler and the
+  `adopt_devx_uid` UAPI field stay in tree as forward-compat
+  but are marked `VESTIGIAL FOR v0 -- DO NOT SET FROM USERSPACE`
+  in `include/uapi/rdma/mlx5-abi.h`. The
+  `mlx5_ib_restore_pd_fw_probe` defense-in-depth check stays
+  too: it now reads as "fail loudly the moment a future caller
+  flips the flag on without an FW capability that preserves the
+  uctx registry."
+
+  **Restored-process limitation.** Without DEVX on the dest,
+  `mlx5dv_*` / `devx_obj_create` / DEVX-rooted UAR allocations
+  are unavailable post-restore. Standard verbs (PD/MR/CQ/QP/SRQ
+  for RC/UD/UC) work. The vast majority of CRIU's actual
+  restore targets (HPC pingpong, `ib_write_bw`-class workloads,
+  storage front-ends) live in the standard-verbs lane and are
+  unaffected. DEVX-using workloads (Spectrum-X-controller-class,
+  some collectives backends) are explicitly out of scope for v0
+  and need future-FW work; see "future-FW options" below.
+
+  **Future-FW options** for true DEVX adoption:
+
+  1. **FW preserves the uctx registry across `LOAD_VHCA_STATE`**
+     -- the right answer, gated on a new FW capability bit + a
+     `LOAD_VHCA_STATE` variant that includes the uctx table.
+     Multi-release-cycle item.
+  2. **Per-resource uid rebind**. On the destination, allocate
+     a fresh `uid_dst` via `CREATE_UCTX`, then `MODIFY_*_UID`
+     every adopted FW resource from `owning_uid_src` to
+     `uid_dst`. Requires a FW op family (`MODIFY_PD_UID`,
+     `MODIFY_MKEY_UID`, `MODIFY_QP_UID`, ...) that does not
+     currently exist on this FW.
+  3. **Source-side `uid=0` negotiation**. CRIU + the application
+     cooperate so the source process never opens a DEVX
+     ucontext for resources we want to restore. Less invasive,
+     pushes work onto every app.
+
+  Until one of these lands, the v0 mitigation is the path.
 
   **v0 dealloc-ordering invariant.** Because v0 only restores
   PDs into the kernel ufile (S3b), the source's pdn-rooted
@@ -1602,6 +1672,20 @@ Failure modes the probe explicitly distinguishes:
    A, "no destination FW round-trip"); no FW patch required.
    `mlx5_ib_restore_pd` landed in S3b (C3+C4). See
    `test_fw_id_continuity.sh` and `test_pd_adopt.sh`.
+
+   **Addendum (2026-05-15) -- DEVX adoption empirically
+   ruled out for v0.** The DEVX-source variant of `test_pd_adopt.sh`
+   shows that `LOAD_VHCA_STATE` preserves the FW `next_free_uctx`
+   *counter* but not the uctx-registration *table*; every
+   user-range uid (registered on source or not) rejects
+   `CREATE_MKEY` post-LOAD with a consistent "unknown uid"
+   syndrome (`0x76555f` on FW 28.48.1000). The
+   `MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID` UAPI flag and the
+   `adopt_devx_uid` field stay in tree but are vestigial; the
+   v0 plugin mitigation is to NOT propagate the source's
+   `devx_uid` and run every adopted resource under `uid=0`.
+   Full empirical chain + future-FW options live in §9.1 S3b
+   "DEVX-adoption blind spot".
 2. **Pending RQ/SQ WR preservation across `LOAD_VHCA_STATE`**:
    **Answered (2026-05-13)**: structural PASS -- the FW QPC
    round-trips byte-equal across LOAD_VHCA_STATE for all 13 fields we
