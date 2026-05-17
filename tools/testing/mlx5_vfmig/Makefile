@@ -17,7 +17,8 @@ PROBE_BINARIES :=						\
 	uobject_restore/nldev_res_handle/nldev_res_handle_probe	\
 	uobject_restore/pd_restore/pd_restore_probe_rxe		\
 	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig	\
-	uobject_restore/mr_restore/mr_restore_probe_rxe
+	uobject_restore/mr_restore/mr_restore_probe_rxe	\
+	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
 # because it pulls in <linux/iommufd.h> + <linux/vfio.h> which require
@@ -93,6 +94,17 @@ uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig: \
 # lags the in-tree kernel for the new RESTORE_MR attrs).
 uobject_restore/mr_restore/mr_restore_probe_rxe: \
 		uobject_restore/mr_restore/mr_restore_probe_rxe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# RESTORE_MR + mlx5_ib_restore_mr S4b end-to-end probe
+# (design/uobject_restore.md §9.1 S4b). Mirrors
+# pd_restore_probe_mlx5_vfmig structurally: libibverbs only for
+# ibdev->uverbs cdev mapping, then raw write/ioctl on the cdev so we
+# can drive MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE in GET_CONTEXT udata and
+# pass struct mlx5_ib_restore_mr_req as the RESTORE_MR UHW blob.
+# Both are inlined in the probe; libmlx5 has no plumbing for either.
+uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig: \
+		uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 tools/vfio_stop_copy_save: tools/vfio_stop_copy_save.c
