@@ -4621,6 +4621,44 @@ int mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_qp);
 
 /*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib user
+ * SRQ creation path. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * SRQ user creates (BASIC, XRC, TM variants) all go through
+ * create_srq_user() -> mlx5_cmd_create_srq, with @srqn set on the
+ * mlx5_core_srq's msrq.srqn field by the time the create returns.
+ * The user-mode umem (srq->umem) was DMA-mapped earlier in
+ * create_srq_user, so its KIND_NONE entries are already in the
+ * registry awaiting promotion to VFMIG_HUOBJ_KEY(KIND_SRQ, srqn).
+ *
+ * Same cmd.vfmig_iova_dom fast path and -ENOENT-to-0 error mapping
+ * as the MR / CQ / QP helpers.
+ */
+int mlx5_vfmig_retag_user_srq(struct mlx5_core_dev *vf_dev, u32 srqn,
+			      dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_SRQ, srqn);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_srq);
+
+/*
  * Detach the per-VF vfmig_iova_domain from this VF's PCI device.
  * Called from mlx5_core remove_one() for VFs so the iommu attachment
  * is gone before pci_disable_sriov() fires device_del. See the comment

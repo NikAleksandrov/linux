@@ -291,6 +291,45 @@ int mlx5_ib_create_srq(struct ib_srq *ib_srq,
 		goto err_usr_kern_srq;
 	}
 
+	/*
+	 * Stage-2 source-side retag for vfmig-tracked VFs (user_mr_dma.md §6).
+	 *
+	 * All three SRQ types (BASIC / XRC / TM) take create_srq_user()
+	 * when udata != NULL and end up here with srq->umem populated by
+	 * ib_umem_get and srq->msrq.srqn populated by mlx5_cmd_create_srq.
+	 * Kernel-mode SRQ creates go through create_srq_kernel() which
+	 * uses in.pas (a kernel scratch PAS list) and never populates
+	 * srq->umem -- the udata && srq->umem gate handles that.
+	 *
+	 * Same three-gate callsite as the CQ retag (cmd.vfmig_iova_dom O(1)
+	 * fast path + umem present + not dmabuf). Non-fatal on retag
+	 * failure -- the SRQ remains usable for data path, just not
+	 * CRIU-restorable.
+	 *
+	 * Doorbell coverage: srq's doorbell page is retagged by
+	 * mlx5_ib_db_map_user (C7) via the call earlier in
+	 * create_srq_user; typically dedups with CQ/QP DBRs in the same
+	 * ucontext.
+	 */
+	if (udata && srq->umem && dev->mdev->cmd.vfmig_iova_dom &&
+	    !srq->umem->is_dmabuf) {
+		struct sg_table *sgt = &srq->umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length =
+			ALIGN(ib_umem_offset(srq->umem) + srq->umem->length,
+			      PAGE_SIZE);
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_srq(dev->mdev,
+						     srq->msrq.srqn,
+						     iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				"vfmig: source-side retag for SRQ failed: srqn=0x%x iova_base=0x%llx length=0x%zx err=%d -- SRQ usable but not CRIU-restorable\n",
+				srq->msrq.srqn, (u64)iova_base, retag_length,
+				retag_err);
+	}
+
 	mlx5_ib_dbg(dev, "create SRQ with srqn 0x%x\n", srq->msrq.srqn);
 
 	srq->msrq.event = mlx5_ib_srq_event;

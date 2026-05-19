@@ -1493,6 +1493,33 @@ mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
 }
 #endif
 
+/*
+ * Source-side retag for a freshly-registered user SRQ's IOVA range
+ * inside the per-VF vfmig deterministic IOVA domain.
+ *
+ * Same contract as the CQ / QP helpers modulo the kind: @srqn is
+ * the FW-allocated srqn (== mlx5_ib_srq->msrq.srqn). Called by
+ * mlx5_ib_create_srq() right after mlx5_cmd_create_srq returns,
+ * where srqn is first populated and srq->umem is still valid.
+ * Covers BASIC / XRC / TM SRQ types -- they share create_srq_user()
+ * and msrq.srqn is always populated by the time the create returns.
+ *
+ * Same fast-path / error semantics as the MR / CQ / QP helpers.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_srq(struct mlx5_core_dev *vf_dev, u32 srqn,
+			      dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_srq(struct mlx5_core_dev *vf_dev, u32 srqn,
+			  dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {
