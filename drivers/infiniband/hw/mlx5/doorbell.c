@@ -49,6 +49,7 @@ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
 			struct mlx5_db *db)
 {
 	struct mlx5_ib_user_db_page *page;
+	struct mlx5_ib_dev *dev = to_mdev(context->ibucontext.device);
 	int err = 0;
 
 	mutex_lock(&context->db_page_mutex);
@@ -77,6 +78,45 @@ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
 	page->mm = current->mm;
 
 	list_add(&page->list, &context->db_page_list);
+
+	/*
+	 * Stage-2 source-side retag for vfmig-tracked VFs (user_mr_dma.md
+	 * §6 + §A.E). Only the miss branch needs to retag: ib_umem_get
+	 * above is the only path that hands a fresh PAGE_SIZE umem to
+	 * vfmig_dma_ops.map_sg, and that's where the KIND_NONE registry
+	 * entry was just planted. The 'found' branch just bumps a refcount
+	 * on a page we already retagged at its first install.
+	 *
+	 * Same callsite gate as create_real_mr's MR retag: a single
+	 * lock-free load on dev->mdev->cmd.vfmig_iova_dom decides whether
+	 * the underlying ucontext lives on a vfmig-tracked VF. NULL on
+	 * PFs and on non-vfmig VFs, so non-vfmig deployments skip the
+	 * iova_base compute and the helper call entirely -- no PF
+	 * intf_state_mutex contention on user_db_page allocation.
+	 *
+	 * fw_id encoding is the userspace VA of the page (mlx5_ib_db_map's
+	 * own dedup key), not a FW identifier -- DBR pages have no FW
+	 * identity. See the docstring on mlx5_vfmig_retag_user_dbr in
+	 * include/linux/mlx5/driver.h for the design rationale.
+	 *
+	 * Non-zero return is non-fatal: the CQ/QP/SRQ create that triggered
+	 * this map continues; the resource is fully usable on the data
+	 * path, just not CRIU-restorable. We log a single warning with
+	 * the offending user_virt + IOVA range.
+	 */
+	if (dev->mdev->cmd.vfmig_iova_dom) {
+		struct sg_table *sgt = &page->umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_dbr(dev->mdev,
+						     page->user_virt,
+						     iova_base, PAGE_SIZE);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				"vfmig: source-side retag for DBR page failed: user_virt=0x%lx iova_base=0x%llx err=%d -- DBR page usable but not CRIU-restorable\n",
+				page->user_virt, (u64)iova_base, retag_err);
+	}
 
 found:
 	db->dma = sg_dma_address(page->umem->sgt_append.sgt.sgl) +

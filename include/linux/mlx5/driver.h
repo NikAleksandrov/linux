@@ -1376,6 +1376,63 @@ mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 }
 #endif
 
+/*
+ * Source-side retag for a freshly-allocated user doorbell page inside
+ * the per-VF vfmig deterministic IOVA domain.
+ *
+ * Called by mlx5_ib_db_map_user()'s miss branch -- the only place the
+ * mlx5_ib user doorbell allocator hands a fresh PAGE_SIZE umem to
+ * ib_umem_get (and thus to vfmig_dma_ops.map_sg). The hit branch just
+ * bumps a refcount on the cached page and does not need to retag,
+ * because the page was retagged on its first install.
+ *
+ * Unlike the MR helper, the second tuple component is a userspace
+ * virtual address (page-aligned), not a FW identifier. DBR pages have
+ * no FW identity -- the FW only knows individual 8-byte doorbell
+ * records' DMA addresses, not "the page". The destination's Stage-3
+ * bind path needs a stable key across the SAVE -> LOAD boundary, and
+ * mlx5_ib_db_map_user already dedups on (mm, user_virt & PAGE_MASK),
+ * so we lean on that key.
+ *
+ * @vf_dev:     this ucontext's underlying mlx5_core_dev
+ *              (mlx5_ib_dev->mdev). Same fast-path semantics as the
+ *              MR helper: O(1) NULL load, no locks; no PF
+ *              intf_state_mutex hit on non-vfmig deployments.
+ * @user_virt:  page-aligned source-side userspace virtual address of
+ *              the doorbell page (== mlx5_ib_user_db_page.user_virt).
+ *              The helper masks this with PAGE_MASK internally so
+ *              callers don't have to.
+ * @iova_base:  PAGE_SIZE-aligned DMA address of the doorbell page
+ *              (sg_dma_address(umem->sgt_append.sgt.sgl) rounded down
+ *              to PAGE_SIZE).
+ * @length:     PAGE_SIZE -- one doorbell page is one registry entry.
+ *
+ * Returns 0 on success or graceful no-op (VF not tracked, no domain,
+ * or the umem was registered via a non-vfmig DMA path so the
+ * registry has no matching range). Returns a negative errno on hard
+ * failures (e.g. -EEXIST if @user_virt collides with a prior retag
+ * inside the same VF domain, -EINVAL on misaligned arguments).
+ * Callers should warn on non-zero returns but should NOT fail the
+ * underlying CQ / QP / SRQ create -- the resource remains fully
+ * usable for data path, just not CRIU-restorable.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6
+ * (Stage 2 source-side retag) and §A.E (DBR walkthrough).
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
+			      unsigned long user_virt,
+			      dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
+			  unsigned long user_virt,
+			  dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {

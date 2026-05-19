@@ -4480,6 +4480,70 @@ int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_mr);
 
 /*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib user
+ * doorbell-page allocation path. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * Differs from mlx5_vfmig_retag_user_mr in two ways that justify a
+ * dedicated entry point rather than a generic "retag for any kind"
+ * helper:
+ *
+ *   - The instance_key for DBR is VFMIG_HUOBJ_KEY(KIND_DBR, user_virt
+ *     & PAGE_MASK). DBR is the only kind whose fw_id is a userspace
+ *     virtual address rather than a FW-allocated identifier (no FW
+ *     resource owns "the doorbell page" -- the FW only ever sees the
+ *     DMA address of individual 8-byte doorbell records inside it).
+ *     The destination's Stage-3 bind path needs a stable key that
+ *     spans the SAVE -> LOAD boundary; mlx5_ib_db_map_user already
+ *     dedups on (mm, user_virt & PAGE_MASK), so we lean on that key.
+ *     user_mr_dma.md §6.3 + §A.E.
+ *
+ *   - The shape is always one PAGE_SIZE entry per doorbell page (the
+ *     allocator only ever maps single pages via ib_umem_get(..,
+ *     PAGE_SIZE, 0)). Many uobjects in the same ucontext typically
+ *     share one DBR page -- libibverbs's mlx5dv allocator hands out
+ *     8-byte slots from a single page, so 1 CQ + 1 QP + 1 SRQ
+ *     normally land on a single page and produce a single registry
+ *     entry. The retag fires once -- in the miss branch of
+ *     mlx5_ib_db_map_user, where ib_umem_get actually allocates the
+ *     umem -- not on the hit-with-refcount-bump branch.
+ *
+ * The cmd.vfmig_iova_dom fast path is identical to the MR helper:
+ * O(1) lock-free NULL load, fast no-op on PFs / non-vfmig VFs.
+ *
+ * Error mapping is also identical: -ENOENT collapses to 0 (we expect
+ * the registry to have a matching range every time vfmig_dma_ops is
+ * the active DMA path, which is precisely the condition cmd.vfmig_iova_dom
+ * indicates -- but be defensive in case a future doorbell allocator
+ * variant routes around the shim). -EEXIST and -EINVAL propagate so
+ * the caller can warn.
+ */
+int mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
+			      unsigned long user_virt,
+			      dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_DBR,
+				       user_virt & PAGE_MASK);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_dbr);
+
+/*
  * Detach the per-VF vfmig_iova_domain from this VF's PCI device.
  * Called from mlx5_core remove_one() for VFs so the iommu attachment
  * is gone before pci_disable_sriov() fires device_del. See the comment
