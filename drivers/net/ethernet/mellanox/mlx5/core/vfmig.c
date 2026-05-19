@@ -119,14 +119,29 @@ struct vfmig_wire_header {
  *     the trigger to reset the destination IOVA cursor before the
  *     FW_DATA record is staged.
  *
+ *   - The number of HOST_USER_PAGE records that follow (always
+ *     emitted AFTER all HOST_PAGE records). Always 0 on a kernel
+ *     without user_mr_dma stage-2 source-side retag callsites
+ *     (C6..C10 of the stage-2 series), so old SAVE blobs and fresh
+ *     SAVE blobs from a tracked VF with no MR/CQ/QP/SRQ activity
+ *     remain byte-equal to the pre-stage-2 format. Lives in the
+ *     low 4 bytes of what used to be @reserved; the upper bytes
+ *     stay zero for forward compatibility (older LOAD parsers
+ *     don't validate them either way).
+ *
  *   - A 32-bit CRC of the (slot, instance_key, iova, len) tuples
- *     of every HOST_PAGE record, in the order they appear on the
- *     wire (which is IOVA-ascending). This is a transport-integrity
- *     check at the HOST_PAGE-identity level only; per-page contents
- *     are not in the CRC because the FW_DATA record's MKEY-based
- *     read covers any DMA-payload corruption. A mismatch is
- *     -EPROTO, not -EIO -- the host pages got somewhere
- *     mismatched in transit.
+ *     of every HOST_PAGE record followed by the (flags, reserved,
+ *     instance_key, iova, len) tuples of every HOST_USER_PAGE
+ *     record, in the order they appear on the wire. This is a
+ *     transport-integrity check at the identity level only;
+ *     per-page contents are not in the CRC because the FW_DATA
+ *     record's MKEY-based read covers any DMA-payload corruption.
+ *     HOST_USER_PAGE records carry no contents at all -- only
+ *     identity. A mismatch is -EPROTO, not -EIO -- some record's
+ *     identity tuple got mangled in transit. With zero
+ *     HOST_USER_PAGE records the fold is byte-equal to the
+ *     pre-stage-2 CRC, so old and new blobs are wire-compatible
+ *     for the no-user-records case.
  *
  * Tag value 0x4853 is "HS" (host-stream). Chosen well clear of the
  * VFIO mlx5 {0, 1} tag range. NOT marked OPTIONAL.
@@ -168,11 +183,58 @@ struct vfmig_wire_header {
  * even reach the IOVA-window range check. 16 MiB is far above any
  * single registry entry the layered restore plan emits today
  * (PAGE_SIZE for cmd ring / FW pages / DMA coherent allocations).
+ *
+ * VFMIG_WIRE_TAG_HOST_USER_PAGE
+ * -----------------------------
+ * vfmig-private. Carries the identity of a single external
+ * (USER_PAGE-slot) registry entry from the source VF's
+ * vfmig_iova_domain into the destination's vfmig_iova_domain via
+ * vfmig_iova_replay_external(). Identity-only: no page contents.
+ * The destination installs an @awaiting_bind = true placeholder
+ * (no iommu_map, no phys page) which user_mr_dma stage 3 binds in
+ * place when the user-mode RESTORE_x verb fires on the destination.
+ *
+ * One record per external entry whose @instance_key has a non-zero
+ * VFMIG_HUOBJ_KIND() byte -- i.e. per uobject (MR / DBR / CQ / QP /
+ * SRQ) that had a source-side retag callsite fire. Auto-numbered
+ * entries (kind == VFMIG_HUOBJ_KIND_NONE) are skipped because they
+ * have no stable identity for the destination to bind to -- the
+ * source's vfmig_dma_ops.map_sg installed them as part of stage 1
+ * but no retag callsite has claimed them yet. On a kernel without
+ * stage-2 retag callsites the SAVE walk skips every external entry
+ * and the blob stays byte-equal to pre-stage-2 format.
+ *
+ * Tag value 0x4855 is "HU" (host-user). NOT marked OPTIONAL: a
+ * blob bearing HOST_USER_PAGE records fed to a parser that does
+ * not understand the tag must fail loudly with -EOPNOTSUPP --
+ * silently dropping them would leave the destination with a FW
+ * state that references user buffers the IOMMU does not know
+ * about, exactly the failure mode user_mr_dma exists to prevent.
+ *
+ * Per-record layout:
+ *   [16 B] vfmig_wire_header   { record_size = 32, flags=0,
+ *                                tag=HOST_USER_PAGE }
+ *   [32 B] vfmig_host_user_page_record { flags=0, reserved=0,
+ *                                        instance_key, iova, len }
+ *
+ * Slot is implicit (always VFMIG_SLOT_USER_PAGE) -- HOST_USER_PAGE
+ * is reserved for that slot. @instance_key is the source's
+ * VFMIG_HUOBJ_KEY(kind, fw_id) blob. @iova is the source's
+ * deterministic USER_PAGE IOVA for the umem range; the destination
+ * replays at the SAME iova (the vfmig_iova_domain is symmetric
+ * across LOAD because the per-VF window is FW-allocated and
+ * preserved by LOAD_VHCA_STATE). @len is the umem range's PAGE_SIZE-
+ * aligned byte length; the placeholder install path validates
+ * @iova + @len fits within the USER_PAGE window of the destination.
+ *
+ * @flags is reserved-must-be-zero (future per-record metadata
+ * gating); @reserved completes 8-byte alignment of @instance_key.
  */
 #define VFMIG_WIRE_MAGIC		0x564D4947 /* "VMIG" little-endian */
 #define VFMIG_STREAM_VERSION		1
 #define VFMIG_WIRE_TAG_STREAM_HEADER	0x4853
 #define VFMIG_WIRE_TAG_HOST_PAGE	0x4842
+#define VFMIG_WIRE_TAG_HOST_USER_PAGE	0x4855
 #define VFMIG_HOST_PAGE_MAX_LEN		(16ULL << 20)
 
 struct vfmig_stream_header {
@@ -180,12 +242,20 @@ struct vfmig_stream_header {
 	__le32 version;
 	__le64 num_pages;
 	__le32 manifest_crc32;
-	__le32 reserved;
+	__le32 num_user_pages;
 };
 
 struct vfmig_host_page_record {
 	__le32 slot_id;
 	__le32 flags;
+	__le64 instance_key;
+	__le64 iova;
+	__le64 len;
+};
+
+struct vfmig_host_user_page_record {
+	__le32 flags;
+	__le32 reserved;
 	__le64 instance_key;
 	__le64 iova;
 	__le64 len;
@@ -2931,29 +3001,34 @@ struct mlx5_vfmig_save_ctx {
 	u64 image_size;
 
 	/*
-	 * Wire-prefix buffer (STREAM_HEADER + HOST_PAGE records). Built
-	 * once at SAVE-ioctl time by snapshotting the source VF's
-	 * vfmig_iova_domain registry into a contiguous kvmalloc'd
-	 * buffer of fully-formed wire records, so the read() path in
-	 * vfmig_save_drain() can stream it out alongside the FW_DATA
-	 * payload without a second registry walk under DMA-coherent
-	 * pressure. NULL if the source VF was untracked at SAVE time;
-	 * @host_pages_size is then 0 and the wire stream contains only
-	 * the FW_DATA record (no STREAM_HEADER / HOST_PAGE records).
+	 * Wire-prefix buffer (STREAM_HEADER + HOST_PAGE + HOST_USER_PAGE
+	 * records). Built once at SAVE-ioctl time by snapshotting the
+	 * source VF's vfmig_iova_domain registry into a contiguous
+	 * kvmalloc'd buffer of fully-formed wire records, so the read()
+	 * path in vfmig_save_drain() can stream it out alongside the
+	 * FW_DATA payload without a second registry walk under
+	 * DMA-coherent pressure. NULL if the source VF was untracked at
+	 * SAVE time; @host_pages_size is then 0 and the wire stream
+	 * contains only the FW_DATA record (no STREAM_HEADER / HOST_PAGE /
+	 * HOST_USER_PAGE records).
 	 *
 	 * Layout when non-NULL:
 	 *   [16 B vfmig_wire_header   tag=STREAM_HEADER]
 	 *   [24 B vfmig_stream_header magic, version, num_pages,
-	 *                             manifest_crc32, reserved=0]
+	 *                             manifest_crc32, num_user_pages]
 	 *   N x [16 B vfmig_wire_header tag=HOST_PAGE +
 	 *        40 B vfmig_host_page_record (slot, flags, key,
 	 *                                     iova, len) +
 	 *        len B contents]
+	 *   M x [16 B vfmig_wire_header tag=HOST_USER_PAGE +
+	 *        32 B vfmig_host_user_page_record (flags, reserved,
+	 *                                          key, iova, len)]
 	 *
 	 * Captured eagerly (rather than streamed lazily during
 	 * read()) because (a) it's small -- Layer 1 produces ~4 KiB
-	 * total, Layer 2 maybe ~MB -- and (b) it lets vfmig_save_drain
-	 * remain a simple byte-cursor walk instead of a state machine.
+	 * total, Layer 2 maybe ~MB, stage-2 user records are ~48 B
+	 * per uobject -- and (b) it lets vfmig_save_drain remain a
+	 * simple byte-cursor walk instead of a state machine.
 	 */
 	void *host_pages_buf;
 	u64 host_pages_size;
@@ -2961,7 +3036,8 @@ struct mlx5_vfmig_save_ctx {
 	/*
 	 * Read cursor in bytes covering the concatenation:
 	 *   [0..host_pages_size)
-	 *       STREAM_HEADER + HOST_PAGE records, if any
+	 *       STREAM_HEADER + HOST_PAGE + HOST_USER_PAGE records,
+	 *       if any
 	 *   [host_pages_size..host_pages_size + 16)
 	 *       FW_DATA wire header
 	 *   [host_pages_size + 16..host_pages_size + 16 + image_size)
@@ -3089,15 +3165,122 @@ static int vfmig_save_hp_emit_cb(enum vfmig_iova_slot slot, u64 instance_key,
 }
 
 /*
+ * Pass-1 callback for vfmig_iova_for_each_external: sum each
+ * external entry's on-wire footprint and count entries into @ctx
+ * so vfmig_save_build_host_pages_buf can grow the kvmalloc by the
+ * HOST_USER_PAGE footprint and stash the num_user_pages count for
+ * the STREAM_HEADER.
+ *
+ * Skip entries with VFMIG_HUOBJ_KIND_NONE: those are stage-1
+ * auto-numbered placeholders installed by vfmig_dma_ops.map_sg
+ * before any source-side retag callsite has claimed them. They
+ * have no stable identity for the destination to bind to, so
+ * emitting them would just create awaiting_bind entries the
+ * destination can never consume. On a kernel WITHOUT any of
+ * C6..C10 of stage 2 landed, every external entry is KIND_NONE,
+ * the count comes out 0, and the blob stays byte-equal to the
+ * pre-stage-2 wire format.
+ */
+struct vfmig_save_hup_size_ctx {
+	u64 total;
+	u64 count;
+};
+
+static int vfmig_save_hup_count_cb(u8 kind, u64 fw_id,
+				   dma_addr_t iova, size_t len,
+				   bool awaiting_bind, void *ctx)
+{
+	struct vfmig_save_hup_size_ctx *sc = ctx;
+
+	(void)fw_id;
+	(void)iova;
+	(void)len;
+	(void)awaiting_bind;
+	if (kind == VFMIG_HUOBJ_KIND_NONE)
+		return 0;
+	sc->total += sizeof(struct vfmig_wire_header) +
+		     sizeof(struct vfmig_host_user_page_record);
+	sc->count++;
+	return 0;
+}
+
+/*
+ * Pass-2 callback: serialize one HOST_USER_PAGE record into the
+ * buffer pointed to by @ctx->cursor, fold the record's identity
+ * tuple into the running manifest CRC (which has already absorbed
+ * the HOST_PAGE identities), and advance the cursor. Identity-only
+ * record -- no contents tail. Skip KIND_NONE entries for the same
+ * reason the count pass does.
+ */
+struct vfmig_save_hup_emit_ctx {
+	u8 *buf;
+	u64 capacity;
+	u64 cursor;
+	u32 crc;
+};
+
+static int vfmig_save_hup_emit_cb(u8 kind, u64 fw_id,
+				  dma_addr_t iova, size_t len,
+				  bool awaiting_bind, void *ctx)
+{
+	struct vfmig_save_hup_emit_ctx *ec = ctx;
+	struct vfmig_wire_header hdr;
+	struct vfmig_host_user_page_record sub;
+	u64 record_size = sizeof(sub);
+	u64 need = sizeof(hdr) + record_size;
+
+	(void)awaiting_bind;
+	if (kind == VFMIG_HUOBJ_KIND_NONE)
+		return 0;
+
+	if (ec->cursor + need > ec->capacity)
+		return -EOVERFLOW;
+
+	hdr.record_size = cpu_to_le64(record_size);
+	hdr.flags	= 0;
+	hdr.tag		= cpu_to_le32(VFMIG_WIRE_TAG_HOST_USER_PAGE);
+	memcpy(ec->buf + ec->cursor, &hdr, sizeof(hdr));
+	ec->cursor += sizeof(hdr);
+
+	sub.flags	 = 0;
+	sub.reserved	 = 0;
+	sub.instance_key = cpu_to_le64(VFMIG_HUOBJ_KEY(kind, fw_id));
+	sub.iova	 = cpu_to_le64(iova);
+	sub.len		 = cpu_to_le64(len);
+	memcpy(ec->buf + ec->cursor, &sub, sizeof(sub));
+	ec->cursor += sizeof(sub);
+
+	/*
+	 * Continue the running manifest CRC (initialized by the
+	 * HOST_PAGE emit pass). Field-by-field for the same reason as
+	 * vfmig_save_hp_emit_cb -- the destination's view of the
+	 * record's identity bytes must be exactly what's CRC'd here.
+	 */
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.flags,
+			   sizeof(sub.flags));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.reserved,
+			   sizeof(sub.reserved));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.instance_key,
+			   sizeof(sub.instance_key));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.iova,
+			   sizeof(sub.iova));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.len,
+			   sizeof(sub.len));
+	return 0;
+}
+
+/*
  * Snapshot the source VF's vfmig_iova_domain registry into a
  * contiguous wire-format buffer prefix of:
  *
  *   [16 B] vfmig_wire_header   { record_size = sizeof(hdr_payload),
  *                                flags=0, tag=STREAM_HEADER }
  *   [24 B] vfmig_stream_header { magic, version, num_pages,
- *                                manifest_crc32, reserved=0 }
+ *                                manifest_crc32, num_user_pages }
  *   N x [16 B vfmig_wire_header + 40 B vfmig_host_page_record + len B
  *        contents]
+ *   M x [16 B vfmig_wire_header + 32 B vfmig_host_user_page_record]
+ *       (HOST_USER_PAGE records are identity-only, no contents)
  *
  * The result is owned by @ctx->host_pages_buf and sized by
  * @ctx->host_pages_size. The whole prefix is always emitted -- even
@@ -3106,17 +3289,20 @@ static int vfmig_save_hp_emit_cb(enum vfmig_iova_slot slot, u64 instance_key,
  * first record. NULL @dom (untracked source) leaves both fields zero
  * and the wire stream is just a single FW_DATA record.
  *
- * Two-pass: size, then fill. This is racier than walking once with
- * a growable buffer, but vfmig_iova_for_each takes the domain mutex
- * each call which would have to release-and-reacquire to grow under
- * GFP_KERNEL anyway. The cost is two registry walks at a moment
- * when the source VF is SUSPEND_VHCA'd (so no concurrent allocs).
+ * Four-pass: HP-size, HUP-size, HP-emit, HUP-emit. Each pass takes
+ * dom->lock independently; this is safe because the source VF is
+ * SUSPEND_VHCA'd at SAVE time, so no concurrent registry mutations
+ * race against the count/emit pairs. The growable-buffer alternative
+ * would have to release-and-reacquire the lock under GFP_KERNEL
+ * pressure anyway.
  */
 static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 					   struct vfmig_iova_domain *dom)
 {
 	struct vfmig_save_hp_size_ctx sc = {};
+	struct vfmig_save_hup_size_ctx sc_hup = {};
 	struct vfmig_save_hp_emit_ctx ec;
+	struct vfmig_save_hup_emit_ctx ec_hup;
 	struct vfmig_wire_header sh_hdr;
 	struct vfmig_stream_header sh_payload;
 	const u64 sh_total = sizeof(sh_hdr) + sizeof(sh_payload);
@@ -3130,15 +3316,22 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	if (err)
 		return err;
 
-	buf_total = sh_total + sc.total;
+	err = vfmig_iova_for_each_external(dom, vfmig_save_hup_count_cb,
+					   &sc_hup);
+	if (err)
+		return err;
+
+	buf_total = sh_total + sc.total + sc_hup.total;
 	ctx->host_pages_buf = kvmalloc(buf_total, GFP_KERNEL);
 	if (!ctx->host_pages_buf)
 		return -ENOMEM;
 
 	/*
 	 * Emit HOST_PAGE records first into the tail of the buffer so
-	 * we have the manifest CRC before we serialize the
-	 * STREAM_HEADER that has to advertise it.
+	 * we have the manifest CRC running. HOST_USER_PAGE records
+	 * follow immediately after and continue the same CRC fold.
+	 * The STREAM_HEADER is serialized last because it has to
+	 * advertise the final CRC.
 	 */
 	ec.buf	    = (u8 *)ctx->host_pages_buf + sh_total;
 	ec.capacity = sc.total;
@@ -3152,6 +3345,19 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 		goto err_free;
 	}
 
+	ec_hup.buf	= (u8 *)ctx->host_pages_buf + sh_total + sc.total;
+	ec_hup.capacity = sc_hup.total;
+	ec_hup.cursor	= 0;
+	ec_hup.crc	= ec.crc;
+	err = vfmig_iova_for_each_external(dom, vfmig_save_hup_emit_cb,
+					   &ec_hup);
+	if (err)
+		goto err_free;
+	if (WARN_ON(ec_hup.cursor != sc_hup.total)) {
+		err = -EIO;
+		goto err_free;
+	}
+
 	sh_hdr.record_size = cpu_to_le64(sizeof(sh_payload));
 	sh_hdr.flags	   = 0;
 	sh_hdr.tag	   = cpu_to_le32(VFMIG_WIRE_TAG_STREAM_HEADER);
@@ -3160,8 +3366,8 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	sh_payload.magic	  = cpu_to_le32(VFMIG_WIRE_MAGIC);
 	sh_payload.version	  = cpu_to_le32(VFMIG_STREAM_VERSION);
 	sh_payload.num_pages	  = cpu_to_le64(sc.count);
-	sh_payload.manifest_crc32 = cpu_to_le32(ec.crc);
-	sh_payload.reserved	  = 0;
+	sh_payload.manifest_crc32 = cpu_to_le32(ec_hup.crc);
+	sh_payload.num_user_pages = cpu_to_le32((u32)sc_hup.count);
 	memcpy((u8 *)ctx->host_pages_buf + sizeof(sh_hdr),
 	       &sh_payload, sizeof(sh_payload));
 
@@ -3178,9 +3384,9 @@ err_free:
  * Drain into @ubuf for one read(). Wire layout is the concatenation:
  *
  *   [0..host_pages_size)
- *       STREAM_HEADER + HOST_PAGE records, snapshotted at SAVE-
- *       ioctl time from the source VF's vfmig_iova_domain. Empty
- *       if the source was untracked.
+ *       STREAM_HEADER + HOST_PAGE + HOST_USER_PAGE records,
+ *       snapshotted at SAVE-ioctl time from the source VF's
+ *       vfmig_iova_domain. Empty if the source was untracked.
  *   [host_pages_size..host_pages_size + 16)
  *       16-byte FW_DATA wire header.
  *   [host_pages_size + 16..host_pages_size + 16 + image_size)
