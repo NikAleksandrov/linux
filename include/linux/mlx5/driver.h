@@ -1433,6 +1433,34 @@ mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
 }
 #endif
 
+/*
+ * Source-side retag for a freshly-registered user CQ's IOVA range
+ * inside the per-VF vfmig deterministic IOVA domain.
+ *
+ * Identical contract to mlx5_vfmig_retag_user_mr modulo the second
+ * tuple component: @cqn is the FW-allocated cqn (== cq->mcq.cqn),
+ * populated by mlx5_core_create_cq's response. Called by mlx5_ib's
+ * mlx5_ib_create_cq() right after FW create succeeds, where both
+ * cqn and cq->buf.umem are available. The retag promotes the
+ * KIND_NONE entries vfmig_dma_ops.map_sg planted during ib_umem_get
+ * (in create_cq_user) into VFMIG_HUOBJ_KEY(CQ, cqn)-keyed entries.
+ *
+ * Same fast-path / error semantics as the MR helper.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			     dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			 dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {

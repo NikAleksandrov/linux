@@ -1031,6 +1031,46 @@ int mlx5_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	if (err)
 		goto err_cqb;
 
+	/*
+	 * Stage-2 source-side retag for vfmig-tracked VFs (user_mr_dma.md §6).
+	 *
+	 * Callsite gates, mirroring create_real_mr:
+	 *   1) udata && cq->buf.umem -- kernel-mode CQ creates take the
+	 *      create_cq_kernel() path and never populate cq->buf.umem
+	 *      (they use cq->buf.frag_buf instead). Skip those.
+	 *   2) dev->mdev->cmd.vfmig_iova_dom -- O(1) lock-free fast path
+	 *      so non-vfmig deployments pay no MR-creation-style overhead.
+	 *   3) !cq->buf.umem->is_dmabuf -- dmabuf umems don't go through
+	 *      vfmig_dma_ops.map_sg, so the registry has nothing matching.
+	 *
+	 * The retag must run after mlx5_core_create_cq -- the FW response
+	 * populates cq->mcq.cqn, which is the second tuple component for
+	 * VFMIG_HUOBJ_KEY(CQ, cqn). The CQE-buffer umem was DMA-mapped
+	 * earlier in create_cq_user, so its KIND_NONE entries are already
+	 * in the registry awaiting promotion.
+	 *
+	 * Doorbell page is retagged separately by mlx5_ib_db_map_user
+	 * (KIND_DBR, user_virt) -- typically shared with QPs/SRQs in the
+	 * same ucontext via the db_page_list dedup.
+	 */
+	if (udata && cq->buf.umem && dev->mdev->cmd.vfmig_iova_dom &&
+	    !cq->buf.umem->is_dmabuf) {
+		struct sg_table *sgt = &cq->buf.umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length =
+			ALIGN(ib_umem_offset(cq->buf.umem) +
+			      cq->buf.umem->length, PAGE_SIZE);
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_cq(dev->mdev, cq->mcq.cqn,
+						    iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				"vfmig: source-side retag for CQ failed: cqn=0x%x iova_base=0x%llx length=0x%zx err=%d -- CQ usable but not CRIU-restorable\n",
+				cq->mcq.cqn, (u64)iova_base, retag_length,
+				retag_err);
+	}
+
 	mlx5_ib_dbg(dev, "cqn 0x%x\n", cq->mcq.cqn);
 	cq->mcq.event = mlx5_ib_cq_event;
 

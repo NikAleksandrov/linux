@@ -4544,6 +4544,46 @@ int mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_dbr);
 
 /*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib user
+ * CQ creation path. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * Identical shape to mlx5_vfmig_retag_user_mr modulo the kind enum:
+ * a single user umem covers the CQE ring buffer, FW assigns @cqn at
+ * mlx5_core_create_cq time, and we promote the registry entries
+ * vfmig_dma_ops.map_sg planted at ib_umem_get to
+ * VFMIG_HUOBJ_KEY(KIND_CQ, cqn). The CQ's doorbell page is retagged
+ * separately by mlx5_vfmig_retag_user_dbr when mlx5_ib_db_map_user
+ * fires from create_cq_user (same ucontext db_page_list shared with
+ * QPs/SRQs, may dedup).
+ *
+ * Same cmd.vfmig_iova_dom O(1) fast path and -ENOENT-to-0 error
+ * mapping as the MR helper.
+ */
+int mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			     dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_CQ, cqn);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_cq);
+
+/*
  * Detach the per-VF vfmig_iova_domain from this VF's PCI device.
  * Called from mlx5_core remove_one() for VFs so the iommu attachment
  * is gone before pci_disable_sriov() fires device_del. See the comment
