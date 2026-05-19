@@ -10,3 +10,4 @@ uobject_restore/pd_restore/pd_restore_probe_rxe
 uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig
 uobject_restore/mr_restore/mr_restore_probe_rxe
 uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig
+save_load/user_object_replay/user_object_replay_probe

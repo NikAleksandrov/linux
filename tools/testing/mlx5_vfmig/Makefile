@@ -18,7 +18,8 @@ PROBE_BINARIES :=						\
 	uobject_restore/pd_restore/pd_restore_probe_rxe		\
 	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig	\
 	uobject_restore/mr_restore/mr_restore_probe_rxe	\
-	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig
+	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig		\
+	save_load/user_object_replay/user_object_replay_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
 # because it pulls in <linux/iommufd.h> + <linux/vfio.h> which require
@@ -106,6 +107,18 @@ uobject_restore/mr_restore/mr_restore_probe_rxe: \
 uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig: \
 		uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# user_mr_dma stage-2 success-criterion probe
+# (design/user_mr_dma.md section 6.4). Allocates a configurable set of
+# user-mode uobjects (PD, N MRs, CQ, QP, SRQ best-effort) whose backing
+# buffers flow through vfmig_dma_ops on a tracked VF, then holds them
+# across SAVE via stdin "quit" handshake. The accompanying shell
+# harness (test_user_object_replay.sh) drives SAVE, dest LOAD, and
+# the MLX5_VFMIG_IOC_QUERY_AWAITING_BIND ioctl, then asserts the
+# placeholder count matches the source-side registration tally.
+save_load/user_object_replay/user_object_replay_probe: \
+		save_load/user_object_replay/user_object_replay_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
 
 tools/vfio_stop_copy_save: tools/vfio_stop_copy_save.c
 	$(CC) $(CFLAGS) $(if $(UAPI_INCLUDE),-I$(UAPI_INCLUDE),) -o $@ $<
