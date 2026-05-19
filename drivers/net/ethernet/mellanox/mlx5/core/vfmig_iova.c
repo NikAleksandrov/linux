@@ -1336,16 +1336,18 @@ int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 	}
 	if (slot == VFMIG_SLOT_USER_PAGE) {
 		/*
-		 * Stage 1 does not transport HOST_USER_PAGE records on
-		 * the wire. Stage 2 will replay them through a separate
-		 * vfmig_iova_replay_external_locked path that creates
-		 * @awaiting_bind entries (no contents copy, no
-		 * alloc_pages); routing them through this kernel-slot
-		 * replay would alloc_pages() at the wrong layer and
-		 * leak phys-vs-iova determinism.
+		 * USER_PAGE records take a different replay path:
+		 * HOST_USER_PAGE wire records carry only identity
+		 * (kind, fw_id, iova, len), not contents, and replay
+		 * as awaiting_bind=true placeholders that stage 3
+		 * binds when the user-mode RESTORE_x verb fires. The
+		 * vfmig.c LOAD parser routes those records through
+		 * vfmig_iova_replay_external() instead of this
+		 * function; HOST_PAGE records (which DO carry
+		 * contents) must never target the USER_PAGE slot.
 		 */
 		dev_warn(&dom->vf_pdev->dev,
-			 "vfmig_iova: vf %u replay: USER_PAGE replay not supported in stage 1\n",
+			 "vfmig_iova: vf %u replay_page: USER_PAGE slot is HOST_USER_PAGE-only (use replay_external)\n",
 			 dom->vf_id);
 		return -EOPNOTSUPP;
 	}
