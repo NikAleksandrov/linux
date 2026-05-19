@@ -19,33 +19,31 @@
 #                awaiting_bind=true placeholder per record.
 #                MLX5_VFMIG_IOC_QUERY_AWAITING_BIND counts them.
 #
-# Verdict: observed (from ioctl) == expected (from probe-emitted source
-# tally), per uobject kind and aggregate. EXPECT_* env vars let the
-# harness baseline against the current state of the kernel-side stage-2
-# chain:
+# Verdict: observed (from ioctl) == expected, where the expected
+# tally is the probe's view of what it actually created. The probe
+# emits expected_mr / expected_cq / expected_qp / expected_srq /
+# expected_dbr_min lines as part of its READY-time manifest, derived
+# at runtime from whether each create succeeded -- so srq_ok=1 yields
+# expected_srq=1 while srq_ok=0 yields expected_srq=0, and the harness
+# self-calibrates against either outcome with no caller intervention.
 #
-#     EXPECT_MR_COUNT     = NUM_MRS      (after C6 lands)   default 0
-#     EXPECT_CQ_COUNT     = 1            (after C8 lands)   default 0
-#     EXPECT_QP_COUNT     = 1            (after C9 lands)   default 0
-#     EXPECT_SRQ_COUNT    = 0 or 1       (after C10 lands)  default 0
-#     EXPECT_DBR_COUNT    = >= 1         (after C7 lands)   default 0
+# EXPECT_*_COUNT env vars still override on the command line for
+# negative-control / regression runs (e.g. asserting everything stays
+# at 0 on a kernel that hasn't landed C6..C10). On a current kernel
+# the typical invocation is just:
 #
-# At C3 land time (this commit) all defaults are 0 because no
-# source-side retag callsites exist yet -- SAVE walks no entries,
-# LOAD installs no placeholders, ioctl reports total = 0. Subsequent
-# commits in this series will (1) extend the kernel to emit + replay
-# records and (2) be tested by bumping EXPECT_* before re-running
-# this harness.
-#
-# Usage:
 #   sudo PF=0000:08:00.0 ./test_user_object_replay.sh
-#   sudo PF=...  EXPECT_MR_COUNT=4 ./test_user_object_replay.sh   (post-C6)
+#
+# and the harness expects total = N_MR + N_CQ + N_QP + N_SRQ + N_DBR
+# matching what the probe reports.
 #
 # Optional knobs:
 #   BLOB       SAVE blob path (default /tmp/user_object_replay.blob).
 #   NUM_MRS    How many MRs the probe registers (default 4).
 #   TOOL       mlx5_vfmig CLI (default $ROOT_DIR/tools/mlx5_vfmig).
 #   PROBE      user_object_replay_probe (default $SCRIPT_DIR/...).
+#   EXPECT_*_COUNT  Override the auto-calibrated value for any of MR,
+#                   CQ, QP, SRQ, DBR. Useful for negative controls.
 #   EXPECT_TOTAL  If set, overrides the sum of the per-kind expectations.
 
 set -euo pipefail
@@ -59,11 +57,16 @@ PROBE=${PROBE:-$SCRIPT_DIR/user_object_replay_probe}
 BLOB=${BLOB:-/tmp/user_object_replay.blob}
 NUM_MRS=${NUM_MRS:-4}
 
-EXPECT_MR_COUNT=${EXPECT_MR_COUNT:-0}
-EXPECT_CQ_COUNT=${EXPECT_CQ_COUNT:-0}
-EXPECT_QP_COUNT=${EXPECT_QP_COUNT:-0}
-EXPECT_SRQ_COUNT=${EXPECT_SRQ_COUNT:-0}
-EXPECT_DBR_COUNT=${EXPECT_DBR_COUNT:-0}
+# EXPECT_*_COUNT defaults are deferred to after Phase B captures the
+# probe's manifest, so they pick up the probe-emitted expected_*
+# values automatically. Env vars provided here on the command line
+# still win via the standard ${VAR:-default} expansion below. The
+# expected_* counts the probe emits reflect what it actually created
+# in the current run -- e.g. srq_ok=1 yields expected_srq=1, srq_ok=0
+# yields expected_srq=0 -- so the harness self-calibrates against the
+# wire+ioctl reality on every invocation. Hard-coded baselines in env
+# vars are only needed for negative-control runs (e.g. assert
+# everything stays at 0 on a kernel that hasn't landed C6..C10 yet).
 
 CDEV="/dev/mlx5_vfmig/$PF"
 [ -x "$TOOL" ]  || { echo "build $TOOL first: make -C $ROOT_DIR";  exit 1; }
@@ -206,6 +209,16 @@ echo "  src_expected_mr = ${src_expected_mr:-?}"
 echo "  src_expected_cq = ${src_expected_cq:-?}"
 echo "  src_expected_qp = ${src_expected_qp:-?}"
 echo "  src_expected_srq= ${src_expected_srq:-?}"
+
+# Self-calibrate expectations against the probe-emitted manifest.
+# Env-var overrides on the harness command line still win (the inner
+# ${EXPECT_X:-...} expansion preserves any value already set in the
+# environment); only unset variables default to the probe's view.
+EXPECT_MR_COUNT=${EXPECT_MR_COUNT:-${src_expected_mr:-0}}
+EXPECT_CQ_COUNT=${EXPECT_CQ_COUNT:-${src_expected_cq:-0}}
+EXPECT_QP_COUNT=${EXPECT_QP_COUNT:-${src_expected_qp:-0}}
+EXPECT_SRQ_COUNT=${EXPECT_SRQ_COUNT:-${src_expected_srq:-0}}
+EXPECT_DBR_COUNT=${EXPECT_DBR_COUNT:-${src_expected_dbr_min:-0}}
 
 # --- Phase C: SAVE --------------------------------------------------
 
