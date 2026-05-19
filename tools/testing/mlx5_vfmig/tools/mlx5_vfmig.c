@@ -214,6 +214,55 @@ static int do_probe_mkey(int fd, unsigned int vf_id,
 	return 0;
 }
 
+/*
+ * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND CLI wrapper. user_mr_dma
+ * stage-2 success-criterion accessor: post-LOAD, asks the PF how
+ * many awaiting_bind placeholders landed in the VF's
+ * vfmig_iova_domain via HOST_USER_PAGE replay, plus the per-kind
+ * breakdown. Used by test_user_object_replay.sh to assert
+ * source-emit == dest-install on every uobject kind.
+ *
+ * Output format: one key=value per line for shell ingestion.
+ * "by_kind_N=K" lines are emitted for N in 0..NR_KINDS-1; the
+ * meaning of each index follows enum vfmig_huobj_kind
+ * (0=NONE, 1=MR, 2=CQ, 3=QP, 4=SRQ, 5=DBR; 6/7 reserved).
+ */
+static int do_query_awaiting_bind(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_query_awaiting_bind arg = { .vf_id = vf_id };
+	unsigned int k;
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_QUERY_AWAITING_BIND, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not tracked (call set_tracked %u 1 first)\n",
+				vf_id, vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"QUERY_AWAITING_BIND: invalid arg (vf_id=%u)\n",
+				vf_id);
+		else
+			perror("QUERY_AWAITING_BIND");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("total=%llu\n", (unsigned long long)arg.total);
+	for (k = 0; k < MLX5_VFMIG_QUERY_AWAITING_BIND_NR_KINDS; k++)
+		printf("by_kind_%u=%llu\n", k,
+		       (unsigned long long)arg.count_by_kind[k]);
+	printf("by_kind_MR=%llu\n",
+	       (unsigned long long)arg.count_by_kind[1]);
+	printf("by_kind_CQ=%llu\n",
+	       (unsigned long long)arg.count_by_kind[2]);
+	printf("by_kind_QP=%llu\n",
+	       (unsigned long long)arg.count_by_kind[3]);
+	printf("by_kind_SRQ=%llu\n",
+	       (unsigned long long)arg.count_by_kind[4]);
+	printf("by_kind_DBR=%llu\n",
+	       (unsigned long long)arg.count_by_kind[5]);
+	return 0;
+}
+
 static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
 {
 	struct mlx5_vfmig_set_tracked arg = {
@@ -544,6 +593,7 @@ static void usage(const char *argv0)
 		"  query_qp          <vf_id> <qpn>  (experimental)\n"
 		"  probe_pd          <vf_id> <pdn> [<uid_hint=0>]  (experimental)\n"
 		"  probe_mkey        <vf_id> <mkey_index>  (experimental)\n"
+		"  query_awaiting_bind <vf_id>  (user_mr_dma stage-2)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
 }
@@ -639,6 +689,10 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_probe_mkey(fd, strtoul(argv[3], NULL, 0),
 				    strtoul(argv[4], NULL, 0));
+	} else if (verb_eq(verb, "query_awaiting_bind")) {
+		if (argc != 4)
+			goto badargs;
+		ret = do_query_awaiting_bind(fd, strtoul(argv[3], NULL, 0));
 	} else {
 		fprintf(stderr, "unknown verb: %s\n", verb);
 		ret = 2;

@@ -1334,6 +1334,84 @@ out_free:
 	return err;
 }
 
+/*
+ * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND handler -- user_mr_dma stage-2
+ * success-criterion accessor.
+ *
+ * Counts the destination-side replay placeholders that landed in
+ * the per-VF vfmig_iova_domain via VFMIG_WIRE_TAG_HOST_USER_PAGE
+ * records during LOAD but have not yet been consumed by stage-3's
+ * hint-aware vfmig_dma_ops.map_sg binder. The total + per-kind
+ * breakdown lets the test_user_object_replay.sh harness assert
+ * "source emitted N records of kind k -> destination installed N
+ * placeholders of kind k".
+ *
+ * Locking: vfmig->lock held (read) by the ioctl dispatcher. The
+ * SET_TRACKED handler installs/clears @vfmig_iova_dom under the
+ * same lock taken for writing, so the pointer is stable for the
+ * duration of this call. vfmig_iova_count_awaiting_bind() takes
+ * the per-domain mutex internally to iterate the page registry.
+ *
+ * Unlike PROBE_PD / PROBE_MKEY / PROBE_UID this ioctl does NOT
+ * require the VF to be bound to mlx5_core: the registry lives on
+ * the PF (under the SET_TRACKED-allocated unmanaged iommu_domain),
+ * so the canonical use case is post-LOAD, pre-bind validation by
+ * the harness.
+ */
+static long vfmig_ioc_query_awaiting_bind(struct mlx5_vfmig_pf *vfmig,
+					  void __user *uarg)
+{
+	struct mlx5_vfmig_query_awaiting_bind arg;
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov = &pf_mdev->priv.sriov;
+	struct vfmig_iova_domain *dom;
+	u64 total = 0;
+	u64 by_kind[VFMIG_HUOBJ_KIND_NR] = {};
+	unsigned int k;
+	int err;
+
+	BUILD_BUG_ON(VFMIG_HUOBJ_KIND_NR >
+		     MLX5_VFMIG_QUERY_AWAITING_BIND_NR_KINDS);
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved_in)
+		return -EINVAL;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	dom = sriov->vfs_ctx[arg.vf_id].vfmig_iova_dom;
+	if (!dom) {
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: query_awaiting_bind: vf %u not tracked\n",
+			      arg.vf_id);
+		return -ENODEV;
+	}
+
+	err = vfmig_iova_count_awaiting_bind(dom, &total, by_kind);
+	if (err)
+		return err;
+
+	arg.total = total;
+	memset(arg.count_by_kind, 0, sizeof(arg.count_by_kind));
+	for (k = 0; k < VFMIG_HUOBJ_KIND_NR; k++)
+		arg.count_by_kind[k] = by_kind[k];
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: query_awaiting_bind: vf %u total=%llu (MR=%llu CQ=%llu QP=%llu SRQ=%llu DBR=%llu)\n",
+		      arg.vf_id, total,
+		      by_kind[VFMIG_HUOBJ_KIND_MR],
+		      by_kind[VFMIG_HUOBJ_KIND_CQ],
+		      by_kind[VFMIG_HUOBJ_KIND_QP],
+		      by_kind[VFMIG_HUOBJ_KIND_SRQ],
+		      by_kind[VFMIG_HUOBJ_KIND_DBR]);
+
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+	return 0;
+}
+
 static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 				    void __user *uarg)
 {
@@ -3657,6 +3735,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_PROBE_MKEY:
 		ret = vfmig_ioc_probe_mkey(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_QUERY_AWAITING_BIND:
+		ret = vfmig_ioc_query_awaiting_bind(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

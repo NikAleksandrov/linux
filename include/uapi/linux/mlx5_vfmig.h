@@ -615,4 +615,70 @@ struct mlx5_vfmig_probe_mkey {
 #define MLX5_VFMIG_IOC_PROBE_MKEY \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0b, struct mlx5_vfmig_probe_mkey)
 
+/*
+ * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND:
+ *   user_mr_dma stage-2 success-criterion accessor (see
+ *   tools/testing/mlx5_vfmig/design/user_mr_dma.md section 6.4).
+ *
+ *   Walks the target VF's per-VF vfmig_iova_domain registry and
+ *   reports how many external (USER_PAGE / vfmig_dma_ops-backed)
+ *   entries are currently in the @awaiting_bind = true state --
+ *   i.e. pre-installed by VFMIG_WIRE_TAG_HOST_USER_PAGE replay
+ *   during LOAD but not yet bound to a concrete destination phys
+ *   page by stage-3's hint-aware vfmig_dma_ops.map_sg.
+ *
+ *   @count_by_kind[k] (k in enum vfmig_huobj_kind) splits the
+ *   count by uobject kind: MR, CQ, QP, SRQ, DBR. Untagged auto-
+ *   numbered placeholders are accounted under index
+ *   VFMIG_HUOBJ_KIND_NONE (= 0) but in practice never appear
+ *   because the wire-emit side only puts retagged entries on the
+ *   wire. The 8-slot array gives headroom for future kinds (ODP,
+ *   DEVX, dma-buf) without an ABI break -- userspace iterates up
+ *   to its compiled-in VFMIG_HUOBJ_KIND_NR.
+ *
+ *   Methodology (stage-2 PASS):
+ *     - Source: register N MRs / CQ / QP / SRQ on a tracked VF,
+ *       SAVE. Wire dumps NR_RECORDS = sum across kinds.
+ *     - Destination: bind dst VF, LOAD, ioctl(QUERY_AWAITING_BIND).
+ *       Expected: @total == NR_RECORDS, count_by_kind[k] matches
+ *       the source's per-kind tally.
+ *     - Negative control: query an untracked VF -> -ENODEV.
+ *     - Negative control: query a tracked VF that hasn't LOADed
+ *       any wire records yet -> @total == 0.
+ *
+ *   The VF does NOT need to be bound to mlx5_core to query --
+ *   the registry lives on the PF, and SET_TRACKED's "domain
+ *   survives unbind" property means we can read post-LOAD,
+ *   pre-bind. This is unlike PROBE_PD / PROBE_MKEY / PROBE_UID
+ *   which need a bound VF mdev to issue raw FW commands.
+ *
+ *   Errors:
+ *     -EFAULT  copy_{from,to}_user
+ *     -EINVAL  vf_id out of range, or @reserved_in non-zero
+ *     -ENODEV  VF is not tracked (no per-VF vfmig_iova_domain),
+ *              or PF is gone
+ */
+#define MLX5_VFMIG_QUERY_AWAITING_BIND_NR_KINDS	8
+
+struct mlx5_vfmig_query_awaiting_bind {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 reserved_in;		/* in:  must be 0 */
+
+	__u64 total;			/* out: total awaiting_bind=true
+					 *      external entries across all
+					 *      kinds.
+					 */
+	__u64 count_by_kind		/* out: per-kind breakdown,
+					 *      indexed by enum
+					 *      vfmig_huobj_kind. Slots
+					 *      beyond the kernel's current
+					 *      KIND_NR read as 0.
+					 */
+		[MLX5_VFMIG_QUERY_AWAITING_BIND_NR_KINDS];
+
+	__u8  reserved_out[16];		/* out: zeroed */
+};
+#define MLX5_VFMIG_IOC_QUERY_AWAITING_BIND \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0c, struct mlx5_vfmig_query_awaiting_bind)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
