@@ -18,6 +18,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/rbtree.h>
 #include <linux/spinlock.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
@@ -49,6 +50,16 @@
  */
 struct vfmig_iova_page {
 	struct list_head node;	/* dom->pages, sorted by iova ascending */
+	/*
+	 * Stage-2 secondary index node, keyed by @instance_key. Only
+	 * populated when @external == true AND @instance_key has been
+	 * retagged with VFMIG_HUOBJ_KEY(kind, fw_id) (kind byte != 0)
+	 * either by source-side vfmig_iova_retag_external_range() or
+	 * by LOAD-side vfmig_iova_replay_external(). RB_CLEAR_NODE'd
+	 * by every install path; rb_erase() short-circuited via
+	 * RB_EMPTY_NODE() check in destroy.
+	 */
+	struct rb_node	 user_index_node;
 	u64		 iova;
 	size_t		 len;
 	struct page	*page;
@@ -267,6 +278,26 @@ struct vfmig_iova_domain {
 
 	struct list_head     pages;	/* of vfmig_iova_page, sorted */
 	unsigned int	     n_pages;
+
+	/*
+	 * Stage-2 secondary index over external entries, keyed by
+	 * @instance_key (which encodes (kind, fw_id) per
+	 * VFMIG_HUOBJ_KEY()). Populated by:
+	 *   - vfmig_iova_retag_external_range() on the source side,
+	 *     after a creation callsite knows its FW-assigned id;
+	 *   - vfmig_iova_replay_external() on the destination side,
+	 *     replaying a HOST_USER_PAGE record.
+	 *
+	 * Used by Stage 3's hint-aware vfmig_dma_ops.map_sg lookup to
+	 * find the matching awaiting_bind entry at restore time.
+	 *
+	 * Protected by @lock (the same mutex that guards @pages).
+	 * Inserts happen only via the retag / replay paths; the
+	 * @awaiting_bind transition (true -> false) does NOT remove
+	 * the entry from this tree (Stage 3 still needs the lookup
+	 * for symmetric dereg).
+	 */
+	struct rb_root	     user_index;
 
 	struct vfmig_transient_arena transient;
 	struct vfmig_kcoherent_arena kcoherent;
@@ -531,6 +562,7 @@ vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
 	p->len		= len;
 	p->slot		= slot;
 	p->instance_key	= instance_key;
+	RB_CLEAR_NODE(&p->user_index_node);
 
 	err = iommu_map(dom->iommu_dom, iova, page_to_phys(p->page), len,
 			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp);
@@ -608,6 +640,7 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 	p->instance_key	= instance_key;
 	p->external	= true;
 	p->awaiting_bind = false;
+	RB_CLEAR_NODE(&p->user_index_node);
 
 	err = iommu_map(dom->iommu_dom, iova, phys, len,
 			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp);
@@ -640,6 +673,16 @@ static void
 vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
 			       struct vfmig_iova_page *p)
 {
+	/*
+	 * Drop the entry from the stage-2 secondary index. Untagged
+	 * (auto-numbered, kind == 0) external entries never get
+	 * inserted, hence the RB_EMPTY_NODE short-circuit. Internal
+	 * (non-external) entries always have RB_EMPTY_NODE because the
+	 * insert paths (retag_external_range / replay_external) only
+	 * touch external entries.
+	 */
+	if (!RB_EMPTY_NODE(&p->user_index_node))
+		rb_erase(&p->user_index_node, &dom->user_index);
 	if (!p->awaiting_bind)
 		(void)iommu_unmap(dom->iommu_dom, p->iova, p->len);
 	if (!p->external && p->page)
@@ -672,6 +715,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	mutex_init(&dom->lock);
 	INIT_LIST_HEAD(&dom->pages);
+	dom->user_index = RB_ROOT;
 	INIT_LIST_HEAD(&dom->transient.free);
 	INIT_LIST_HEAD(&dom->kcoherent.pages);
 	dom->vf_id  = vf_id;
@@ -1384,9 +1428,22 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 	}
 	/*
 	 * USER_PAGE: skip the kcoherent carve at the bottom of slot 7's
-	 * window. Mirrors the one-shot adjustment in domain_create.
+	 * window. Mirrors the one-shot adjustment in domain_create, but
+	 * only when the cursor would otherwise sit below the user-MR
+	 * sub-window's effective base. Stage-2 replay
+	 * (vfmig_iova_replay_external) bumps the cursor past every
+	 * placeholder it installs so subsequent fresh user_page_map_phys
+	 * calls don't collide; we must preserve that post-replay
+	 * high-water mark across reset_cursor() because, unlike kernel
+	 * slots, USER_PAGE doesn't use cursor-position-based HIT lookup
+	 * for replayed entries -- the (kind, fw_id) secondary index
+	 * does that, and the cursor's only role is to position fresh
+	 * post-restore allocations above source-side replayed entries.
 	 */
-	dom->cursor[VFMIG_SLOT_USER_PAGE] = vfmig_iova_user_page_start(dom);
+	if (dom->cursor[VFMIG_SLOT_USER_PAGE] <
+	    vfmig_iova_user_page_start(dom))
+		dom->cursor[VFMIG_SLOT_USER_PAGE] =
+			vfmig_iova_user_page_start(dom);
 	/*
 	 * The kcoherent arena is NOT reset on replay: it has no
 	 * SAVE-side records so there's nothing for replay to land in,
@@ -1409,14 +1466,13 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 	list_for_each_entry(p, &dom->pages, node) {
 		/*
 		 * External entries (USER_PAGE, vfmig_dma_ops-backed)
-		 * are skipped in stage 1: their backing pages are
-		 * umem-pinned and have no kernel-virtual handle
-		 * (p->vaddr is NULL), so the SAVE-side callback that
-		 * memcpys from @vaddr would dereference NULL. The wire
-		 * format does not yet emit HOST_USER_PAGE records;
-		 * stage 2 will introduce that wire record and a
-		 * separate iterator (or add an @external argument
-		 * here) to surface external entries to the SAVE path.
+		 * are skipped here: their backing pages are umem-pinned
+		 * with @vaddr == NULL, so the SAVE-side callbacks that
+		 * memcpy from @vaddr (HOST_PAGE record emission) would
+		 * dereference NULL. Stage 2 surfaces externals through
+		 * a sibling iterator (vfmig_iova_for_each_external)
+		 * that emits identity-only HOST_USER_PAGE records, no
+		 * contents.
 		 */
 		if (p->external)
 			continue;
@@ -1427,6 +1483,362 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 	}
 	mutex_unlock(&dom->lock);
 	return ret;
+}
+
+/*
+ * dom->lock held. Insert @new into the (kind, fw_id) secondary
+ * rb-tree index keyed by @new->instance_key. Returns 0 on success,
+ * -EEXIST if a different entry already lives at the same key.
+ *
+ * Pre-condition: VFMIG_HUOBJ_KIND(@new->instance_key) != KIND_NONE
+ * (auto-numbered entries don't go in the tree). Caller is
+ * responsible for ensuring @new is also linked in dom->pages.
+ */
+static int
+vfmig_iova_user_index_insert_locked(struct vfmig_iova_domain *dom,
+				    struct vfmig_iova_page *new)
+{
+	struct rb_node **link = &dom->user_index.rb_node;
+	struct rb_node *parent = NULL;
+	struct vfmig_iova_page *p;
+
+	while (*link) {
+		parent = *link;
+		p = rb_entry(parent, struct vfmig_iova_page,
+			     user_index_node);
+		if (new->instance_key < p->instance_key)
+			link = &parent->rb_left;
+		else if (new->instance_key > p->instance_key)
+			link = &parent->rb_right;
+		else
+			return -EEXIST;
+	}
+	rb_link_node(&new->user_index_node, parent, link);
+	rb_insert_color(&new->user_index_node, &dom->user_index);
+	return 0;
+}
+
+/*
+ * (A by-(kind, fw_id) lookup helper that walks @user_index lives
+ *  with Stage 3's hint-aware vfmig_dma_ops.map_sg consumer -- this
+ *  C1 foundation commit only needs the insert path because replay
+ *  detects duplicate-key collisions through
+ *  vfmig_iova_user_index_insert_locked()'s -EEXIST return.)
+ */
+
+/*
+ * dom->lock held. Install a LOAD-side placeholder external entry:
+ * external = true, awaiting_bind = true, page = NULL, vaddr = NULL.
+ * No iommu_map happens: the destination's physical page doesn't
+ * exist yet (CRIU restores the user process after LOAD). The
+ * iommu_map will happen later in Stage 3 when the hint-aware
+ * map_sg consumes the awaiting_bind flag and binds a freshly-pinned
+ * phys against the placeholder.
+ *
+ * If @instance_key has a non-zero kind byte (i.e. was source-side
+ * retagged before SAVE), the entry is also inserted into the
+ * (kind, fw_id) secondary index. A KIND_NONE instance_key is
+ * rejected with -EINVAL: replay records only get emitted for
+ * retagged entries.
+ *
+ * Same window/alignment validation as install_external_phys_locked:
+ *   -EINVAL  bad alignment / wrong slot / KIND_NONE key
+ *   -ERANGE  IOVA outside USER_PAGE sub-window
+ *   -EEXIST  duplicate IOVA or duplicate instance_key
+ *   -ENOMEM  kzalloc failure
+ */
+static int
+vfmig_iova_install_external_placeholder_locked(struct vfmig_iova_domain *dom,
+					       enum vfmig_iova_slot slot,
+					       u64 instance_key, u64 iova,
+					       size_t len, gfp_t gfp,
+					       struct vfmig_iova_page **out_p)
+{
+	struct vfmig_iova_page *p;
+	int err;
+
+	if (!IS_ALIGNED(iova, VFMIG_IOVA_GRANULE) ||
+	    !IS_ALIGNED(len, VFMIG_IOVA_GRANULE) ||
+	    len == 0)
+		return -EINVAL;
+	if (slot != VFMIG_SLOT_USER_PAGE)
+		return -EINVAL;
+	if (VFMIG_HUOBJ_KIND(instance_key) == VFMIG_HUOBJ_KIND_NONE)
+		return -EINVAL;
+	{
+		u64 lo = vfmig_iova_user_page_start(dom);
+
+		if (iova < lo ||
+		    iova + len > vfmig_iova_slot_end(dom, slot))
+			return -ERANGE;
+	}
+	if (vfmig_iova_find_locked(dom, iova))
+		return -EEXIST;
+
+	p = kzalloc(sizeof(*p), gfp);
+	if (!p)
+		return -ENOMEM;
+
+	p->page		= NULL;
+	p->vaddr	= NULL;
+	p->iova		= iova;
+	p->len		= len;
+	p->slot		= slot;
+	p->instance_key	= instance_key;
+	p->external	= true;
+	p->awaiting_bind = true;
+	RB_CLEAR_NODE(&p->user_index_node);
+
+	err = vfmig_iova_user_index_insert_locked(dom, p);
+	if (err) {
+		kfree(p);
+		return err;
+	}
+
+	vfmig_iova_insert_locked(dom, p);
+	*out_p = p;
+	return 0;
+}
+
+int vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
+			       enum vfmig_iova_slot slot,
+			       u64 instance_key, dma_addr_t iova,
+			       size_t length, gfp_t gfp)
+{
+	struct vfmig_iova_page *p;
+	u64 above;
+	int err;
+
+	if (!dom)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+
+	err = vfmig_iova_install_external_placeholder_locked(dom, slot,
+							     instance_key,
+							     (u64)iova,
+							     length, gfp, &p);
+	if (err)
+		goto out_unlock;
+
+	/*
+	 * Push the per-slot bump cursor above this placeholder so any
+	 * later post-restore user_page_map_phys() lands above the
+	 * source's high-water IOVA. See the docstring on reset_cursor
+	 * for why USER_PAGE's cursor is preserved across reset_cursor.
+	 */
+	above = (u64)iova + length;
+	if (above > dom->cursor[VFMIG_SLOT_USER_PAGE])
+		dom->cursor[VFMIG_SLOT_USER_PAGE] = above;
+
+	/*
+	 * Charge the replay to the slot's expected_count so the
+	 * drift-detection arming pass at the end of LOAD doesn't
+	 * conclude USER_PAGE saw zero replays and skip the
+	 * drift-armed code path. Mirrors what vfmig_iova_replay_page()
+	 * does for kernel slots.
+	 */
+	dom->expected_count[VFMIG_SLOT_USER_PAGE]++;
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+int vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
+				    dma_addr_t iova_base, size_t length,
+				    u64 new_instance_key)
+{
+	struct vfmig_iova_page *p;
+	u64 base = (u64)iova_base;
+	u64 limit;
+	u8 new_kind = VFMIG_HUOBJ_KIND(new_instance_key);
+	unsigned int retagged = 0;
+	int err = 0;
+
+	/*
+	 * Iteration order: dom->pages is sorted by IOVA, so a single
+	 * forward walk finds every entry that overlaps [base, limit).
+	 * If a mid-range secondary-index insert fails (-EEXIST means
+	 * the destination is asking to claim a (kind, fw_id) that's
+	 * already taken by another uobject), a rollback re-walks the
+	 * same range and reverts every entry we tagged with
+	 * @new_instance_key back to instance_key = 0 (the auto-
+	 * numbered values are not preserved -- v0 retag callsites
+	 * abandon the auto-numbered identity on success anyway).
+	 */
+
+	if (!dom || length == 0)
+		return -EINVAL;
+	limit = base + length;
+	if (!IS_ALIGNED(base, VFMIG_IOVA_GRANULE) ||
+	    !IS_ALIGNED(length, VFMIG_IOVA_GRANULE))
+		return -EINVAL;
+	if (new_kind == VFMIG_HUOBJ_KIND_NONE)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+
+	list_for_each_entry(p, &dom->pages, node) {
+		u64 p_end = p->iova + p->len;
+
+		if (p->iova >= limit)
+			break;	/* sorted: past the requested range */
+		if (p_end <= base)
+			continue;	/* before the range */
+		if (!p->external)
+			continue;	/* kernel slot; skip silently */
+
+		if (p->instance_key == new_instance_key) {
+			/*
+			 * Idempotent re-retag with the same key: no-op.
+			 * Already in the secondary index from the first
+			 * retag call.
+			 */
+			retagged++;
+			continue;
+		}
+		if (VFMIG_HUOBJ_KIND(p->instance_key) !=
+		    VFMIG_HUOBJ_KIND_NONE) {
+			/*
+			 * Already tagged with a different (kind, fw_id).
+			 * Caller is asking to re-key an entry that's
+			 * already been claimed by another uobject -- this
+			 * is a source-side bug (overlapping umem-sgt
+			 * ranges from two different MR/CQ/QP creations).
+			 */
+			err = -EEXIST;
+			break;
+		}
+		/*
+		 * Auto-numbered (kind == NONE) entry: overwrite the key
+		 * and insert into the secondary index. If the insert
+		 * conflicts with an entry already at this key, roll back
+		 * everything we did this call (see retagged_entries).
+		 */
+		p->instance_key = new_instance_key;
+		err = vfmig_iova_user_index_insert_locked(dom, p);
+		if (err) {
+			/* This one didn't make it into the tree; revert
+			 * the key write so the rollback walk below sees
+			 * a consistent (instance_key, index-membership)
+			 * pair on every entry.
+			 */
+			p->instance_key = 0;
+			break;
+		}
+		retagged++;
+	}
+
+	if (err) {
+		/*
+		 * Roll back: revert every entry we just retagged in this
+		 * call. They're the only entries in [base, limit) whose
+		 * current key equals @new_instance_key. (Idempotent-
+		 * re-retag entries we left alone get matched too, but
+		 * reverting them is harmless because they're already
+		 * properly indexed and we'd reinsert immediately.)
+		 *
+		 * The rollback walks the same range, finds entries with
+		 * key == new_instance_key AND kind != 0, removes them
+		 * from the rb-tree, and zeroes their instance_key.
+		 */
+		list_for_each_entry(p, &dom->pages, node) {
+			u64 p_end = p->iova + p->len;
+
+			if (p->iova >= limit)
+				break;
+			if (p_end <= base)
+				continue;
+			if (!p->external)
+				continue;
+			if (p->instance_key != new_instance_key)
+				continue;
+			if (!RB_EMPTY_NODE(&p->user_index_node)) {
+				rb_erase(&p->user_index_node,
+					 &dom->user_index);
+				RB_CLEAR_NODE(&p->user_index_node);
+			}
+			p->instance_key = 0;
+		}
+		goto out_unlock;
+	}
+
+	if (retagged == 0) {
+		/*
+		 * Caller asked to retag a range that has no external
+		 * entries on it. That means the source-side callsite is
+		 * misordered relative to the dma_map_sgtable (which
+		 * allocates the external entries): the retag must run
+		 * AFTER the umem has been mapped through vfmig_dma_ops.
+		 */
+		err = -ENOENT;
+	}
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+int vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
+				 vfmig_iova_for_each_external_fn cb,
+				 void *ctx)
+{
+	struct vfmig_iova_page *p;
+	int ret = 0;
+
+	if (!dom || !cb)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	list_for_each_entry(p, &dom->pages, node) {
+		if (!p->external)
+			continue;
+		ret = cb(VFMIG_HUOBJ_KIND(p->instance_key),
+			 VFMIG_HUOBJ_FWID(p->instance_key),
+			 p->iova, p->len, p->awaiting_bind, ctx);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&dom->lock);
+	return ret;
+}
+
+int vfmig_iova_count_awaiting_bind(struct vfmig_iova_domain *dom,
+				   u64 *total_out, u64 *count_by_kind)
+{
+	struct vfmig_iova_page *p;
+	u64 total = 0;
+	unsigned int k;
+
+	if (!dom)
+		return -EINVAL;
+
+	if (count_by_kind) {
+		for (k = 0; k < VFMIG_HUOBJ_KIND_NR; k++)
+			count_by_kind[k] = 0;
+	}
+
+	mutex_lock(&dom->lock);
+	list_for_each_entry(p, &dom->pages, node) {
+		u8 kind;
+
+		if (!p->external || !p->awaiting_bind)
+			continue;
+		total++;
+		if (!count_by_kind)
+			continue;
+		kind = VFMIG_HUOBJ_KIND(p->instance_key);
+		if (kind >= VFMIG_HUOBJ_KIND_NR)
+			kind = VFMIG_HUOBJ_KIND_NONE;	/* shouldn't happen */
+		count_by_kind[kind]++;
+	}
+	mutex_unlock(&dom->lock);
+
+	if (total_out)
+		*total_out = total;
+	return 0;
 }
 
 unsigned long vfmig_iova_awaiting_bind_hits(struct vfmig_iova_domain *dom)

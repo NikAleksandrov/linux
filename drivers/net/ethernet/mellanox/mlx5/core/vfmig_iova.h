@@ -213,6 +213,58 @@ enum vfmig_iova_slot {
 	VFMIG_SLOT_NR,	/* count, must stay <= VFMIG_IOVA_NR_SLOTS */
 };
 
+/*
+ * Stage-2 user-uobject kind enumeration. Carried in the high 8 bits of
+ * the registry entry's @instance_key when an external (USER_PAGE) entry
+ * has been retagged by a post-FW-create source-side callsite (see
+ * user_mr_dma.md sections 6 and A.B).
+ *
+ * Reserved range: 8-bit space. KIND_NONE (0) sentinels an auto-numbered
+ * (pre-retag) external entry. KIND_MR..KIND_DBR cover the user-side
+ * uobject kinds whose backing buffers flow through vfmig_dma_ops; future
+ * extensions (ODP, DEVX, dma-buf) get fresh values appended at NR.
+ *
+ * Wire stability: kind values are wire-visible (instance_key crosses
+ * SAVE/LOAD). Adding a new kind is wire-compatible; renumbering or
+ * removing an existing kind is NOT.
+ */
+enum vfmig_huobj_kind {
+	VFMIG_HUOBJ_KIND_NONE	= 0,	/* sentinel: auto-numbered / unretagged */
+	VFMIG_HUOBJ_KIND_MR	= 1,
+	VFMIG_HUOBJ_KIND_CQ	= 2,
+	VFMIG_HUOBJ_KIND_QP	= 3,
+	VFMIG_HUOBJ_KIND_SRQ	= 4,
+	VFMIG_HUOBJ_KIND_DBR	= 5,
+	VFMIG_HUOBJ_KIND_NR,		/* count; <= 256 */
+};
+
+/*
+ * Encode/decode a (kind, fw_id) pair into a 64-bit @instance_key.
+ *
+ * Encoding: kind in bits 63..56, fw_id in bits 55..0. The auto-numbered
+ * counter incremented by vfmig_iova_user_page_map_phys() stays in the
+ * low 56 bits with kind = KIND_NONE (= 0), so a value of zero in the
+ * high byte is the sentinel for "external entry that has not been
+ * source-side-retagged yet". A retag callsite (see
+ * vfmig_iova_retag_external_range) overwrites the auto-numbered key
+ * with VFMIG_HUOBJ_KEY(kind, fw_id), promoting the entry into the
+ * (kind, fw_id) secondary index.
+ *
+ * mlx5_core firmware-assigned identifiers (mkey_index, cqn, qpn, srqn)
+ * are all <= 24 bits in current hardware, far below the 56-bit budget;
+ * DBR identifiers carry a PAGE-aligned user VA which on x86_64 is
+ * effectively 48 bits (canonical). No overflow risk for v0.
+ */
+#define VFMIG_HUOBJ_FWID_BITS	56U
+#define VFMIG_HUOBJ_FWID_MASK	((1ULL << VFMIG_HUOBJ_FWID_BITS) - 1ULL)
+#define VFMIG_HUOBJ_KEY(kind, fw_id)				\
+	((((u64)(kind)) << VFMIG_HUOBJ_FWID_BITS) |		\
+	 ((u64)(fw_id) & VFMIG_HUOBJ_FWID_MASK))
+#define VFMIG_HUOBJ_KIND(key)					\
+	((u8)(((u64)(key)) >> VFMIG_HUOBJ_FWID_BITS))
+#define VFMIG_HUOBJ_FWID(key)					\
+	(((u64)(key)) & VFMIG_HUOBJ_FWID_MASK)
+
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 
 /*
@@ -886,6 +938,132 @@ typedef int (*vfmig_iova_for_each_fn)(enum vfmig_iova_slot slot,
 int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 			 vfmig_iova_for_each_fn cb, void *ctx);
 
+/*
+ * Iterate the registry's *external* entries (USER_PAGE,
+ * vfmig_dma_ops-backed) in IOVA-ascending order. Sibling of
+ * vfmig_iova_for_each(), which deliberately skips externals
+ * because their @vaddr is NULL and the SAVE-side memcpy callback
+ * would dereference it.
+ *
+ * The callback receives the per-entry identity decoded from
+ * @instance_key (kind in bits 63..56, fw_id in bits 55..0), the
+ * IOMMU mapping range, and the @awaiting_bind flag. SAVE-side
+ * emission of HOST_USER_PAGE wire records iterates with this
+ * function and emits one record per entry whose kind byte is
+ * non-zero (i.e. has been source-side-retagged by a creation
+ * callsite). Entries that are still auto-numbered (kind == 0) are
+ * not emitted: they correspond to internal allocations
+ * (transient cmd-mailbox-style, kcoherent fallback) that have no
+ * cross-host identity.
+ *
+ * @cb may not modify the registry. Returning a non-zero value
+ * stops iteration and is propagated as the return value.
+ */
+typedef int (*vfmig_iova_for_each_external_fn)(u8 kind, u64 fw_id,
+					       dma_addr_t iova,
+					       size_t len,
+					       bool awaiting_bind,
+					       void *ctx);
+int  vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
+				  vfmig_iova_for_each_external_fn cb,
+				  void *ctx);
+
+/*
+ * LOAD-side replay-as-placeholder for an external (USER_PAGE)
+ * registry entry. Allocates a vfmig_iova_page with
+ * @external = true, @awaiting_bind = true, @page = NULL, inserts
+ * it both in the primary IOVA list and in the secondary
+ * (kind, fw_id) rb-tree index. Does NOT call iommu_map -- the
+ * destination's phys pages don't exist yet (CRIU restores the
+ * user process after LOAD).
+ *
+ * The wire-emit path on the source side only puts retagged entries
+ * (kind != KIND_NONE) on the wire, so the replay path here mirrors
+ * that contract and rejects KIND_NONE keys with -EINVAL.
+ *
+ * Bumps the USER_PAGE slot cursor past @iova + @length so any
+ * subsequent fresh registration on the destination starts above
+ * the source's high-water IOVA.
+ *
+ * Pre-conditions:
+ *   - @slot == VFMIG_SLOT_USER_PAGE
+ *   - VFMIG_HUOBJ_KIND(@instance_key) != KIND_NONE
+ *   - @iova, @length PAGE-aligned, @length nonzero
+ *   - [@iova, @iova + @length) inside the USER_PAGE sub-window
+ *     (above the kcoherent carve, below the transient arena)
+ *   - No existing registry entry at @iova
+ *   - No existing rb-tree entry at @instance_key
+ *
+ * Returns:
+ *   0           on success
+ *   -EINVAL     bad arguments / wrong slot / KIND_NONE key
+ *   -ERANGE     @iova outside USER_PAGE sub-window
+ *   -EEXIST     @iova already in registry, or @instance_key
+ *               already in secondary index
+ *   -ENOMEM     allocation failure
+ */
+int  vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
+				enum vfmig_iova_slot slot,
+				u64 instance_key, dma_addr_t iova,
+				size_t length, gfp_t gfp);
+
+/*
+ * Overwrite the auto-numbered @instance_key on every external
+ * registry entry whose @iova falls in [@iova_base, @iova_base +
+ * @length) with @new_instance_key, and (if the new key has a
+ * non-zero kind byte) insert each retagged entry into the
+ * secondary (kind, fw_id) rb-tree index.
+ *
+ * Used by source-side post-FW-create callsites (see user_mr_dma.md
+ * appendix A.B) immediately after a SAVE-able uobject (MR / CQ /
+ * QP / SRQ / DBR) has its firmware-assigned id and the corresponding
+ * umem.sgt has already been mapped through vfmig_dma_ops's .map_sg
+ * (which allocated the registry entries with auto-numbered keys).
+ *
+ * Idempotency:
+ *   - If an entry's existing key already equals @new_instance_key,
+ *     it's left untouched (this is the multi-call retag-twice case).
+ *   - If an entry's existing key has a non-zero kind byte that
+ *     differs from @new_instance_key's kind byte, returns -EEXIST
+ *     and reverses retag operations made earlier in this call.
+ *   - If an entry's existing key has kind byte == 0 (auto-numbered),
+ *     the key is overwritten and the entry is inserted in the
+ *     secondary index (when the new key's kind byte is non-zero).
+ *
+ * Returns 0 on success, -EEXIST on conflicting prior retag,
+ * -ENOENT if the range covers no external entries (caller
+ * mis-sequenced retag against the umem's dma_map_sgtable), -EINVAL
+ * on bad arguments.
+ */
+int  vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
+				     dma_addr_t iova_base,
+				     size_t length,
+				     u64 new_instance_key);
+
+/*
+ * Stage-2 validation accessor: count @awaiting_bind = true external
+ * registry entries on @dom, with per-kind breakdown.
+ *
+ * @count_by_kind, if non-NULL, must point at an array of
+ * VFMIG_HUOBJ_KIND_NR u64s; on return, count_by_kind[k] holds the
+ * number of awaiting-bind entries with kind == k. Entries with
+ * kind == KIND_NONE (untagged) are counted into
+ * count_by_kind[KIND_NONE] and into the total.
+ *
+ * @total_out, if non-NULL, receives the total count across all
+ * kinds.
+ *
+ * Used by MLX5_VFMIG_IOC_QUERY_AWAITING_BIND (PF cdev ioctl) to
+ * implement the stage-2 success criterion: post-LOAD count match
+ * between source-emitted HOST_USER_PAGE records and destination-
+ * installed awaiting-bind entries.
+ *
+ * Returns 0 on success, -EINVAL on @dom == NULL.
+ */
+int  vfmig_iova_count_awaiting_bind(struct vfmig_iova_domain *dom,
+				    u64 *total_out,
+				    u64 *count_by_kind);
+
 #else /* !CONFIG_MLX5_VFMIG */
 
 /*
@@ -970,6 +1148,36 @@ vfmig_iova_kcoherent_fallback_hits(struct vfmig_iova_domain *dom) { return 0; }
 static inline void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom) { }
 static inline void
 vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom) { }
+typedef int (*vfmig_iova_for_each_external_fn)(u8 kind, u64 fw_id,
+					       dma_addr_t iova, size_t len,
+					       bool awaiting_bind, void *ctx);
+static inline int
+vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
+			     vfmig_iova_for_each_external_fn cb, void *ctx)
+{
+	return -EOPNOTSUPP;
+}
+static inline int vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
+					     enum vfmig_iova_slot slot,
+					     u64 instance_key,
+					     dma_addr_t iova, size_t length,
+					     gfp_t gfp)
+{
+	return -EOPNOTSUPP;
+}
+static inline int
+vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
+				dma_addr_t iova_base, size_t length,
+				u64 new_instance_key)
+{
+	return -EOPNOTSUPP;
+}
+static inline int
+vfmig_iova_count_awaiting_bind(struct vfmig_iova_domain *dom,
+			       u64 *total_out, u64 *count_by_kind)
+{
+	return -EOPNOTSUPP;
+}
 
 #endif /* CONFIG_MLX5_VFMIG */
 
