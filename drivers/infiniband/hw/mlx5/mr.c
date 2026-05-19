@@ -1511,6 +1511,70 @@ static struct ib_mr *create_real_mr(struct ib_pd *pd, struct ib_umem *umem,
 			return ERR_PTR(err);
 		}
 	}
+
+	/*
+	 * Stage-2 source-side retag for vfmig-tracked VFs (user_mr_dma.md §6).
+	 *
+	 * Two gates, both visible at the callsite below:
+	 *
+	 *   1) dev->mdev->cmd.vfmig_iova_dom -- non-NULL only when this
+	 *      mdev's cmd ring was plumbed through the per-VF vfmig
+	 *      deterministic IOVA allocator at bind (cmd.c sets it iff the
+	 *      VF was vfmig-tracked at probe). NULL on PFs, on non-vfmig
+	 *      VFs, and on unbound mdevs. The check is an O(1) lock-free
+	 *      load: non-vfmig deployments skip the iova_base/retag_length
+	 *      compute and the helper call entirely on every user-MR
+	 *      registration -- no PF intf_state_mutex contention on the
+	 *      MR creation hot path.
+	 *
+	 *   2) !umem->is_dmabuf -- dmabuf umems take a DMA mapping path
+	 *      that doesn't go through vfmig_dma_ops.map_sg, so the
+	 *      registry has nothing matching the dmabuf's IOVA range.
+	 *      Skipping here is cheaper and more self-documenting than
+	 *      relying on the helper's -ENOENT-to-0 mapping.
+	 *
+	 * The retag must run AFTER the FW mkey is fully wired -- in the
+	 * xlt_with_umr path that means after mlx5r_umr_update_mr_pas above;
+	 * in the reg_create slow path the FW state is already populated by
+	 * the time control reaches here, so the same call site covers both.
+	 * The retag promotes the auto-numbered (KIND_NONE) registry entries
+	 * that vfmig_dma_ops.map_sg planted during ib_umem_get's underlying
+	 * dma_map_sgtable into VFMIG_HUOBJ_KEY(MR, mkey_index)-keyed entries
+	 * so SAVE_VHCA_STATE emits one HOST_USER_PAGE wire record per
+	 * registry entry and LOAD on the destination re-installs them as
+	 * awaiting_bind=true placeholders the Stage-3 bind path consumes.
+	 *
+	 * iova_base / retag_length cover every PAGE_SIZE-aligned slot the
+	 * shim installed: vfmig_dma_ops.map_sg page-aligns its inputs (it
+	 * passes (phys & PAGE_MASK, PAGE_ALIGN(len + off)) to
+	 * vfmig_iova_user_page_map_phys), so the umem's footprint is
+	 *   [first_sg_dma_addr & PAGE_MASK,
+	 *    ALIGN(first_sg_dma_addr + offset + umem_length, PAGE_SIZE))
+	 * which simplifies (since the bump cursor allocates contiguously)
+	 * to a single (base, length) pair we hand the retag walker.
+	 *
+	 * Non-zero return is non-fatal: the MR is still usable for data
+	 * path, just not CRIU-restorable. We log a single warning with the
+	 * offending mkey_index + IOVA range so the operator can correlate
+	 * with the vfmig_iova: dev_warn the registry would emit on a real
+	 * collision (-EEXIST) or misalignment (-EINVAL).
+	 */
+	if (dev->mdev->cmd.vfmig_iova_dom && !umem->is_dmabuf) {
+		struct sg_table *sgt = &umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length = ALIGN(ib_umem_offset(umem) + umem->length,
+					    PAGE_SIZE);
+		u32 mkey_index = mr->mmkey.key >> 8;
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_mr(dev->mdev, mkey_index,
+						    iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				"vfmig: source-side retag for MR failed: mkey_index=0x%x iova_base=0x%llx length=0x%zx err=%d -- MR usable but not CRIU-restorable\n",
+				mkey_index, (u64)iova_base, retag_length,
+				retag_err);
+	}
 	return &mr->ibmr;
 }
 

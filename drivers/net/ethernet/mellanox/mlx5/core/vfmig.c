@@ -4414,6 +4414,72 @@ mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev)
 }
 
 /*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib MR
+ * creation path. Header docstring lives in include/linux/mlx5/driver.h
+ * (the public surface mlx5_ib calls through).
+ *
+ * Hot-path lookup contract:
+ *
+ *   - Read vf_dev->cmd.vfmig_iova_dom directly (set in cmd.c during
+ *     the cmd-ring allocation that runs at VF probe time, iff the VF
+ *     was vfmig-tracked when probe fired). This is an O(1) load with
+ *     no locking. NULL on:
+ *       (a) PFs (cmd-ring on PFs never uses the vfmig allocator);
+ *       (b) VFs that were not vfmig-tracked at bind time; and
+ *       (c) unbound mdevs (the field is cleared on cmd-ring free).
+ *
+ *   - The same NULL test is also performed at the callsite (see
+ *     mlx5_ib's create_real_mr) so that non-vfmig deployments skip
+ *     the iova_base/retag_length compute entirely. The check here is
+ *     defense-in-depth + the natural way to obtain the dom pointer
+ *     we operate on. Both reads avoid the alternative
+ *     mlx5_vf_is_vfmig_tracked() + mlx5_vf_get_vfmig_iova_domain()
+ *     dance, both of which would acquire pf_mdev->intf_state_mutex
+ *     via mlx5_vf_get_core_dev() on every user-MR registration.
+ *
+ *   - The pointer's lifetime is the VF's bound lifetime: cmd.c clears
+ *     it on cmd-ring free, and SET_TRACKED{enable=0} is itself
+ *     gated to unbound VFs (see the docstring on
+ *     mlx5_vf_get_vfmig_iova_domain), so once we've read non-NULL
+ *     here the dom struct cannot be freed underneath us for the
+ *     duration of this call.
+ *
+ * Error mapping:
+ *   - -ENOENT (no matching registry entries in the requested range)
+ *     converts to 0: the umem went through a DMA path other than
+ *     vfmig_dma_ops.map_sg (dmabuf, peer driver, ODP fault path) so
+ *     there's nothing to retag. Logging that case would be noise.
+ *   - -EEXIST (mkey_index collides with a prior retag) and -EINVAL
+ *     (misaligned arguments) propagate unchanged so the mlx5_ib
+ *     caller can log a single warning with the offending mkey_index +
+ *     iova range. The MR registration itself is not failed on this
+ *     path -- v0 treats such an MR as "not CRIU-restorable" but
+ *     still fully usable for data path.
+ */
+int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			     dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_MR, mkey_index);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_mr);
+
+/*
  * Detach the per-VF vfmig_iova_domain from this VF's PCI device.
  * Called from mlx5_core remove_one() for VFs so the iommu attachment
  * is gone before pci_disable_sriov() fires device_del. See the comment

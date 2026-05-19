@@ -1326,6 +1326,56 @@ static inline bool mlx5_vf_is_restored(const struct mlx5_core_dev *dev)
 	return dev->priv.vfmig_self_restored;
 }
 
+/*
+ * Source-side retag for a freshly-registered user MR's IOVA range inside
+ * the per-VF vfmig deterministic IOVA domain.
+ *
+ * Called by mlx5_ib's create_real_mr() chokepoint after the FW mkey is
+ * fully wired (post-mlx5r_umr_update_mr_pas in the xlt-with-umr path,
+ * or post-reg_create in the slow path). The retag walks the umem's
+ * DMA-mapped IOVA range -- which vfmig_dma_ops.map_sg populated with
+ * auto-numbered (KIND_NONE) entries at ib_umem_get time -- and rewrites
+ * their @instance_key to VFMIG_HUOBJ_KEY(MR, mkey_index), promoting
+ * them into the secondary (kind, fw_id) index. SAVE_VHCA_STATE later
+ * emits one HOST_USER_PAGE wire record per retagged entry, and LOAD on
+ * the destination re-installs them as awaiting_bind=true placeholders.
+ *
+ * @vf_dev:     this MR's underlying mlx5_core_dev (mlx5_ib_dev->mdev).
+ *              No-ops cheaply (O(1) NULL load, no locks) on PFs and on
+ *              VFs that aren't vfmig-tracked, so callers can invoke
+ *              unconditionally from the MR creation hot path without
+ *              imposing PF intf_state_mutex contention on existing
+ *              non-vfmig deployments.
+ * @mkey_index: the FW-allocated mkey_index, == mr->mmkey.key >> 8.
+ * @iova_base:  PAGE_SIZE-aligned lower bound of the umem's DMA IOVA
+ *              footprint (sg_dma_address(umem->sgt_append.sgt.sgl)
+ *              rounded down to PAGE_SIZE).
+ * @length:     PAGE_SIZE-aligned byte length that covers every page
+ *              backing the umem.
+ *
+ * Returns 0 on success or graceful no-op (VF not tracked, no domain,
+ * or umem registered via a non-vfmig DMA path so the registry has no
+ * matching range -- e.g. a dmabuf umem). Returns a negative errno on
+ * hard failures (e.g. -EEXIST if @mkey_index collides with a prior
+ * retag, -EINVAL on misaligned arguments). Callers should warn on
+ * non-zero returns but should NOT fail the MR registration -- the MR
+ * remains fully usable for data path, just not CRIU-restorable.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6
+ * (Stage 2 source-side retag).
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			     dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			 dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {
