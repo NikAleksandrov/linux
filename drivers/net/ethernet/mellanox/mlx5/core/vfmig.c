@@ -4584,6 +4584,43 @@ int mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_cq);
 
 /*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib user
+ * QP creation path. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * v0 scope: the regular QPC-managed QP types (RC, UC, UD) that share
+ * one umem covering both SQ and RQ work-queue buffers. RAW_PACKET /
+ * SOURCE_QPN QPs use create_raw_packet_qp() with split SQ/RQ umems
+ * and are not retagged by this entry point -- the caller is
+ * expected to skip those at the callsite.
+ *
+ * Same cmd.vfmig_iova_dom fast path and -ENOENT-to-0 error mapping
+ * as the MR/CQ helpers.
+ */
+int mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			     dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_QP, qpn);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_qp);
+
+/*
  * Detach the per-VF vfmig_iova_domain from this VF's PCI device.
  * Called from mlx5_core remove_one() for VFs so the iommu attachment
  * is gone before pci_disable_sriov() fires device_del. See the comment

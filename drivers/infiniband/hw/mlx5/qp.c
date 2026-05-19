@@ -2414,6 +2414,50 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 	if (err)
 		goto err_create;
 
+	/*
+	 * Stage-2 source-side retag for vfmig-tracked VFs (user_mr_dma.md §6).
+	 *
+	 * Scope: QPC-managed QPs (RC / UC / UD) only -- skipped on
+	 * RAW_PACKET / SOURCE_QPN, which went through create_raw_packet_qp()
+	 * above with split SQ/RQ umems. Those will need a separate retag
+	 * surface (qp->raw_packet_qp.sq.ubuffer.umem and
+	 * qp->raw_packet_qp.rq.base.ubuffer.umem); v0 doesn't cover them.
+	 *
+	 * For QPC QPs the user allocates a SINGLE umem covering both SQ
+	 * and RQ WQE buffers (RQ at offset 0, SQ at qp->sq.offset within
+	 * the same mapping) -- see _create_user_qp's ib_umem_get call.
+	 * One retag covers the whole footprint via the page-aligned
+	 * iova_base + retag_length pair.
+	 *
+	 * Same three-gate callsite as the CQ retag (cmd.vfmig_iova_dom O(1)
+	 * fast path + umem present + not dmabuf). Non-fatal on retag
+	 * failure -- the QP remains usable for data path, just not
+	 * CRIU-restorable.
+	 *
+	 * The QP's doorbell page is retagged by mlx5_ib_db_map_user (C7)
+	 * via the call at the bottom of _create_user_qp; typically dedups
+	 * with the CQ's DBR in the same ucontext.
+	 */
+	if (init_attr->qp_type != IB_QPT_RAW_PACKET &&
+	    !(qp->flags & IB_QP_CREATE_SOURCE_QPN) &&
+	    base->ubuffer.umem && dev->mdev->cmd.vfmig_iova_dom &&
+	    !base->ubuffer.umem->is_dmabuf) {
+		struct sg_table *sgt = &base->ubuffer.umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length =
+			ALIGN(ib_umem_offset(base->ubuffer.umem) +
+			      base->ubuffer.umem->length, PAGE_SIZE);
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_qp(dev->mdev, base->mqp.qpn,
+						    iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				"vfmig: source-side retag for QP failed: qpn=0x%x iova_base=0x%llx length=0x%zx err=%d -- QP usable but not CRIU-restorable\n",
+				base->mqp.qpn, (u64)iova_base, retag_length,
+				retag_err);
+	}
+
 	base->container_mibqp = qp;
 	base->mqp.event = mlx5_ib_qp_event;
 	if (MLX5_CAP_GEN(mdev, ece_support))

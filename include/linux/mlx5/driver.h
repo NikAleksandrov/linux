@@ -1461,6 +1461,38 @@ mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
 }
 #endif
 
+/*
+ * Source-side retag for a freshly-registered user QP's IOVA range
+ * inside the per-VF vfmig deterministic IOVA domain.
+ *
+ * Same contract as the CQ helper modulo the kind: @qpn is the
+ * FW-allocated qpn (== qp->trans_qp.base.mqp.qpn for QPC-managed
+ * QPs). Called by mlx5_ib's create_user_qp() right after
+ * mlx5_qpc_create_qp returns, where qpn is first populated and
+ * base->ubuffer.umem (one umem covering both SQ + RQ WQE buffers)
+ * is still valid.
+ *
+ * v0 scope is QPC-managed QP types (RC / UC / UD). RAW_PACKET and
+ * SOURCE_QPN QPs go through create_raw_packet_qp() with split
+ * SQ/RQ umems and aren't covered by this entry point -- the caller
+ * is expected to skip those at the callsite.
+ *
+ * Same fast-path / error semantics as the MR / CQ helpers.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			     dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			 dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {
