@@ -97,6 +97,7 @@
 
 struct mlx5_core_dev;
 struct pci_dev;
+struct sg_table;
 struct vfmig_iova_domain;
 
 /*
@@ -798,14 +799,14 @@ void vfmig_iova_kcoherent_unmap_phys(struct vfmig_iova_domain *dom,
 /*
  * Read the awaiting-bind hit counter for @dom.
  *
- * Stage 1 always returns 0 -- there is no LOAD-side replay path
- * for USER_PAGE entries yet, so no entry ever has @awaiting_bind
- * set, so .map_sg never takes the "bind a freshly-pinned page to
- * a pre-replayed registry entry" branch. The counter is wired in
- * stage 1 so the test plumbing (debugfs export, pingpong-side
- * read) is in place; stage 2's order-discipline replay will
- * populate awaiting-bind entries on LOAD and increment this
- * counter on each hit.
+ * Bumped exactly once per successful vfmig_iova_bind_user_object()
+ * call (Stage 3 D2). A non-zero return after RESTORE_X verbs run is
+ * the verb-side diagnostic that a placeholder installed on the
+ * destination by HOST_USER_PAGE replay was successfully bound to a
+ * freshly-pinned umem. Combined with vfmig_iova_count_awaiting_bind()
+ * (still-awaiting count) this gives userspace "how many placeholders
+ * were planted vs. how many have been claimed" without taking the
+ * domain lock.
  *
  * Read with READ_ONCE; writers use atomic_long_inc. Safe at any
  * time, no locking needed.
@@ -1051,6 +1052,63 @@ int  vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 				     u64 new_instance_key);
 
 /*
+ * Stage-3 D2: bind a freshly-pinned umem sg_table to the
+ * awaiting_bind=true placeholder previously installed by
+ * vfmig_iova_replay_external() at the same (kind, fw_id) key.
+ *
+ * Verb-driven entry point used by the destination RESTORE_X verbs
+ * (via the mlx5_ib_umem_restore wrapper):
+ *
+ *   mlx5_ib_restore_X
+ *     -> mlx5_ib_umem_restore
+ *          -> ib_umem_pin                       (drivers/infiniband/core/umem.c)
+ *          -> vfmig_iova_bind_user_object       (this function)
+ *
+ * Behaviour: looks up the placeholder by VFMIG_HUOBJ_KEY(kind, fw_id)
+ * in @dom's secondary (kind, fw_id) rb-tree index, validates the
+ * sgt summed length matches the placeholder's recorded length, then
+ * iommu_maps each sg's run of physically-contiguous pages at
+ * consecutive IOVAs starting at the placeholder's IOVA base. On
+ * success, every sg in @sgt has sg_dma_address / sg_dma_len
+ * populated to reference the placeholder's IOVA range, the
+ * placeholder transitions awaiting_bind=true -> false, and
+ * @dom->awaiting_bind_hits is incremented once.
+ *
+ * Pre-conditions:
+ *   - @dom non-NULL, @sgt non-NULL with @sgt->orig_nents > 0
+ *   - @kind is one of VFMIG_HUOBJ_KIND_MR / CQ / QP / SRQ / DBR
+ *     (VFMIG_HUOBJ_KIND_NONE is rejected -- placeholders are only
+ *     installed for retagged uobjects)
+ *   - each sg in @sgt: phys (= page_to_phys(sg_page) + sg->offset)
+ *     and length both PAGE_SIZE-aligned, length > 0
+ *
+ * Hard-fail policy (per user direction May 2026; no silent
+ * fallbacks):
+ *   -ENOENT  no placeholder at (kind, fw_id). CRIU plugin attempted
+ *            to bind a uobject the source never SAVE'd, or whose
+ *            fw_id doesn't match what stage 2 emitted.
+ *   -EBUSY   placeholder already bound (awaiting_bind == false).
+ *            Either a CRIU plugin issuing two RESTORE_X for the
+ *            same FW id, or a stage-3 internal bug.
+ *   -EINVAL  invalid arguments / sgt length mismatch against the
+ *            placeholder / non-page-aligned sg entry / KIND_NONE.
+ *   <0       iommu_map failure on one of the sg ranges. Mappings
+ *            already installed in this call are rolled back via
+ *            iommu_unmap; the placeholder stays awaiting_bind=true
+ *            so the caller may retry after diagnosing the IOMMU
+ *            error.
+ *
+ * Caller error-path obligation (design §A.H L2): on a non-zero
+ * return, callers MUST NOT consume sg_dma_address on any sg in
+ * @sgt -- partially-populated values are left in place so that
+ * vfmig_dma_ops.unmap_sg under ib_umem_release() can match
+ * still-installed-elsewhere ranges and skip zero entries safely.
+ */
+int  vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
+				 u8 kind, u64 fw_id,
+				 struct sg_table *sgt);
+
+/*
  * Stage-2 validation accessor: count @awaiting_bind = true external
  * registry entries on @dom, with per-kind breakdown.
  *
@@ -1180,6 +1238,12 @@ static inline int
 vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 				dma_addr_t iova_base, size_t length,
 				u64 new_instance_key)
+{
+	return -EOPNOTSUPP;
+}
+static inline int
+vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
+			    u8 kind, u64 fw_id, struct sg_table *sgt)
 {
 	return -EOPNOTSUPP;
 }

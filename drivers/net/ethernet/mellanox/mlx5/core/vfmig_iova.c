@@ -19,6 +19,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/rbtree.h>
+#include <linux/scatterlist.h>
 #include <linux/spinlock.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
@@ -347,12 +348,16 @@ struct vfmig_iova_domain {
 	u32		     alloc_count[VFMIG_IOVA_NR_SLOTS];
 
 	/*
-	 * Stage-2-facing diagnostic: count of times .map_sg has bound a
-	 * freshly-pinned umem page to a pre-replayed (awaiting_bind=true)
-	 * registry entry. Stage 1 never increments this; .map_sg always
-	 * takes the "fresh IOVA + new external entry" branch because the
-	 * LOAD path doesn't yet pre-install USER_PAGE entries. Read with
-	 * vfmig_iova_awaiting_bind_hits().
+	 * Cross-stage diagnostic: count of successful placeholder bind
+	 * events on this domain. Bumped exactly once per call to
+	 * vfmig_iova_bind_user_object() that consumes an awaiting_bind
+	 * placeholder (Stage 3 D2). The Stage-1 dma_ops shim's .map_sg
+	 * path was originally documented as the only writer; Stage 3
+	 * shifted bind responsibility to the explicit verb-driven
+	 * vfmig_iova_bind_user_object() primitive instead, so .map_sg
+	 * no longer increments this counter (it always installs fresh
+	 * external entries) and this field counts bind-from-placeholder
+	 * events strictly. Read with vfmig_iova_awaiting_bind_hits().
 	 */
 	atomic_long_t	     awaiting_bind_hits;
 
@@ -1530,12 +1535,35 @@ vfmig_iova_user_index_insert_locked(struct vfmig_iova_domain *dom,
 }
 
 /*
- * (A by-(kind, fw_id) lookup helper that walks @user_index lives
- *  with Stage 3's hint-aware vfmig_dma_ops.map_sg consumer -- this
- *  C1 foundation commit only needs the insert path because replay
- *  detects duplicate-key collisions through
- *  vfmig_iova_user_index_insert_locked()'s -EEXIST return.)
+ * dom->lock held. Look up the external registry entry whose
+ * @instance_key equals @key in the (kind, fw_id) secondary index, or
+ * return NULL if no entry exists at that key.
+ *
+ * The C1 foundation commit deferred this helper because no in-tree
+ * caller existed yet; Stage 3 D2's vfmig_iova_bind_user_object() is
+ * the first consumer. Stage 3 wires the verb-driven bind path
+ * (mlx5_ib_restore_X -> mlx5_ib_umem_restore -> vfmig_iova_bind_user_object)
+ * and uses this lookup to translate a verb-supplied (kind, fw_id)
+ * pair into the awaiting_bind=true placeholder installed earlier by
+ * vfmig_iova_replay_external().
  */
+static struct vfmig_iova_page *
+vfmig_iova_user_index_lookup_locked(struct vfmig_iova_domain *dom, u64 key)
+{
+	struct rb_node *n = dom->user_index.rb_node;
+	struct vfmig_iova_page *p;
+
+	while (n) {
+		p = rb_entry(n, struct vfmig_iova_page, user_index_node);
+		if (key < p->instance_key)
+			n = n->rb_left;
+		else if (key > p->instance_key)
+			n = n->rb_right;
+		else
+			return p;
+	}
+	return NULL;
+}
 
 /*
  * dom->lock held. Install a LOAD-side placeholder external entry:
@@ -1791,6 +1819,135 @@ out_unlock:
 	mutex_unlock(&dom->lock);
 	return err;
 }
+
+int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
+				u8 kind, u64 fw_id,
+				struct sg_table *sgt)
+{
+	struct vfmig_iova_page *entry;
+	struct scatterlist *sg;
+	u64 instance_key;
+	u64 iova_cur, iova_start;
+	size_t total = 0;
+	unsigned int i;
+	int err;
+
+	if (!dom || !sgt || sgt->orig_nents == 0)
+		return -EINVAL;
+	if (kind == VFMIG_HUOBJ_KIND_NONE || kind >= VFMIG_HUOBJ_KIND_NR)
+		return -EINVAL;
+
+	instance_key = VFMIG_HUOBJ_KEY(kind, fw_id);
+
+	mutex_lock(&dom->lock);
+
+	entry = vfmig_iova_user_index_lookup_locked(dom, instance_key);
+	if (!entry) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	/*
+	 * Defensive: secondary index is only populated for external
+	 * USER_PAGE entries (see install_external_placeholder_locked and
+	 * retag_external_range). A non-USER_PAGE hit here means the
+	 * index has been corrupted, which is a kernel bug rather than a
+	 * caller bug -- still return an errno (not BUG_ON) so the verb
+	 * surface can propagate it.
+	 */
+	if (!entry->external || entry->slot != VFMIG_SLOT_USER_PAGE) {
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u bind_user_object: kind=%u fw_id=0x%llx index hit non-USER_PAGE entry (slot=%u external=%d)\n",
+				    dom->vf_id, kind,
+				    (unsigned long long)fw_id, entry->slot,
+				    entry->external);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	if (!entry->awaiting_bind) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
+	/*
+	 * The placeholder's @len is the umem byte length the source
+	 * SAVE'd (carried by the HOST_USER_PAGE wire record and replayed
+	 * verbatim by vfmig_iova_replay_external). The destination's
+	 * ib_umem_pin produces an sg_table whose summed sg lengths equal
+	 * the same umem byte length, so a mismatch means the verb body
+	 * is binding the wrong umem (different addr/size from SAVE).
+	 */
+	for_each_sgtable_sg(sgt, sg, i)
+		total += sg->length;
+	if (total != entry->len) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u bind_user_object: kind=%u fw_id=0x%llx sgt total %zu != placeholder len %zu\n",
+				     dom->vf_id, kind,
+				     (unsigned long long)fw_id, total,
+				     entry->len);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+
+	/*
+	 * One iommu_map per sg, mapping the run of physically-contiguous
+	 * pages sg_alloc_append_table_from_pages built. sg->offset is 0
+	 * and sg->length is PAGE_SIZE-aligned for umem-pinned sg_tables;
+	 * we still validate per sg before each iommu_map so a future
+	 * caller with non-umem sgt shapes fails loudly rather than
+	 * tripping iommu_map's internal alignment WARN.
+	 */
+	iova_start = entry->iova;
+	iova_cur   = iova_start;
+	for_each_sgtable_sg(sgt, sg, i) {
+		phys_addr_t phys = page_to_phys(sg_page(sg)) + sg->offset;
+
+		if (!IS_ALIGNED(phys, VFMIG_IOVA_GRANULE) ||
+		    !IS_ALIGNED((size_t)sg->length, VFMIG_IOVA_GRANULE) ||
+		    sg->length == 0) {
+			dev_err_ratelimited(&dom->vf_pdev->dev,
+					    "vfmig_iova: vf %u bind_user_object: sg[%u] not page-aligned (phys 0x%llx len %u offset %u)\n",
+					    dom->vf_id, i,
+					    (unsigned long long)phys,
+					    sg->length, sg->offset);
+			err = -EINVAL;
+			goto out_rollback;
+		}
+		err = iommu_map(dom->iommu_dom, iova_cur, phys, sg->length,
+				IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+				GFP_KERNEL);
+		if (err)
+			goto out_rollback;
+
+		sg_dma_address(sg) = iova_cur;
+		sg_dma_len(sg)	   = sg->length;
+		iova_cur += sg->length;
+	}
+
+	entry->awaiting_bind = false;
+	atomic_long_inc(&dom->awaiting_bind_hits);
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+
+out_rollback:
+	/*
+	 * Undo the iommu_maps issued earlier in this call. sg_dma_address
+	 * / sg_dma_len on previously-bound sgs stay populated; per design
+	 * §A.H L2 the caller treats the umem as opaque on the error path
+	 * and uses ib_umem_release() to drop pins. vfmig_dma_ops.unmap_sg
+	 * skips sgs with sg_dma_address == 0, so partially-bound sgs that
+	 * we did *not* populate above (and the iommu range we just freed)
+	 * see no second unmap attempt. @entry remains awaiting_bind=true
+	 * so subsequent RESTORE_X retries on the same fw_id can try again.
+	 */
+	if (iova_cur > iova_start)
+		(void)iommu_unmap(dom->iommu_dom, iova_start,
+				  iova_cur - iova_start);
+	goto out_unlock;
+}
+EXPORT_SYMBOL(vfmig_iova_bind_user_object);
 
 int vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
 				 vfmig_iova_for_each_external_fn cb,
