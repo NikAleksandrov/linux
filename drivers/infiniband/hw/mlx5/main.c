@@ -3102,21 +3102,26 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
  * working as intended; the mr stays parked at target_handle
  * until restore is complete or the ucontext is destroyed.
  *
- * v0 abnormal-exit leak: when ufile teardown reaches the
- * RDMA_REMOVE_DRIVER_FAILURE pass (per rdma_core.c, gated on
- * ib_dev->ops.ucontext_is_restore_mode in beea656e494d) with an
- * adopted MR whose FW dependents are still alive, dereg_mr's
- * mlx5r_handle_mkey_cleanup() returns the BAD_RES_STATE errno
- * before __mlx5_ib_dereg_mr() reaches its ib_umem_release()
- * line, so the umem (and its pinned pages) leaks alongside the
- * mlx5_ib_mr struct. This widens an existing v0 leak (just the
- * mr struct under the umem == NULL design) by ib_umem_num_pages
- * pinned pages per orphan. Bounded to one ucontext lifetime;
- * the CRIU plugin coordinates SAVE-side cleanup ordering on the
- * happy path so this only triggers on abnormal process exit.
- * Lifting requires a driver-side cleanup hook that releases the
- * umem even when DESTROY_MKEY fails -- deferred to a v1
- * follow-up.
+ * v0 dealloc asymmetry vs S3b PD (empirically validated by
+ * mr_restore_probe_mlx5_vfmig.c subtest 8 + test_mr_adopt.sh):
+ * unlike PD where the FW resource graph refuses DEALLOC_PD
+ * while CQ/QP/MR/SRQ children are still alive, mkey is a *leaf*
+ * under PD -- QPs reference an mkey by (lkey/rkey) wire value
+ * rather than as a tracked FW resource dep, so FW DESTROY_MKEY
+ * on an adopted mkey succeeds even while the source's
+ * mkey-using QPs / SRQs are still alive in destination FW
+ * post-LOAD_VHCA_STATE. Concretely: __mlx5_ib_dereg_mr ->
+ * mlx5r_handle_mkey_cleanup -> FW DESTROY_MKEY returns 0, the
+ * subsequent "if (mr->umem) ib_umem_release(mr->umem)" arm
+ * always runs, and the pinned pages are released. The same
+ * holds on the abnormal-exit path (ufile teardown reaching the
+ * RDMA_REMOVE_DRIVER_FAILURE pass gated on
+ * ucontext_is_restore_mode per beea656e494d): destroy_hw_struct
+ * calls __mlx5_ib_dereg_mr which still releases the umem
+ * cleanly. The implication for CRIU is that v0 MR teardown
+ * ordering is plugin-policy only -- the kernel does not refuse
+ * a premature DEREG_MR. (See design/uobject_restore.md §S4b for
+ * the contrasted PD invariant.)
  *
  * Returns the &mr->ibmr ready for the dispatcher to commit, or
  * an ERR_PTR() on validation failure or umem-pin/bind failure.
