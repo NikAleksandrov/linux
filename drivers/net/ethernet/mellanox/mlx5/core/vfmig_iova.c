@@ -1425,10 +1425,31 @@ out_unlock:
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 {
 	unsigned int s;
+	u64 user_page_hwm;
 
 	if (!dom)
 		return;
 	mutex_lock(&dom->lock);
+	/*
+	 * Snapshot the USER_PAGE cursor BEFORE the per-slot reset.
+	 * Stage-2 replay (vfmig_iova_replay_external) bumps this
+	 * cursor monotonically to (highest_replayed_iova + length) so
+	 * fresh post-restore user_page_map_phys() calls land above
+	 * source-side replayed placeholders. The for-loop below would
+	 * otherwise clobber that high-water mark with slot_base, and
+	 * the post-loop adjustment only lifts up to user_page_start
+	 * -- which is exactly the bottom of the replay region, where
+	 * the lowest-IOVA placeholder lives. The first fresh
+	 * post-restore user_page allocation would then collide at
+	 * user_page_start with the replayed placeholder there and
+	 * return -EEXIST. Snapshot + max_t() with user_page_start
+	 * preserves the replayed high-water mark on LOAD probe arcs
+	 * AND still ratchets up to user_page_start on first-time /
+	 * non-replay probe arcs (where the pre-loop value is
+	 * slot_base, below user_page_start).
+	 */
+	user_page_hwm = dom->cursor[VFMIG_SLOT_USER_PAGE];
+
 	for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++) {
 		dom->cursor[s] = vfmig_iova_slot_base(dom,
 				(enum vfmig_iova_slot)s);
@@ -1444,22 +1465,22 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 	}
 	/*
 	 * USER_PAGE: skip the kcoherent carve at the bottom of slot 7's
-	 * window. Mirrors the one-shot adjustment in domain_create, but
-	 * only when the cursor would otherwise sit below the user-MR
-	 * sub-window's effective base. Stage-2 replay
-	 * (vfmig_iova_replay_external) bumps the cursor past every
-	 * placeholder it installs so subsequent fresh user_page_map_phys
-	 * calls don't collide; we must preserve that post-replay
-	 * high-water mark across reset_cursor() because, unlike kernel
-	 * slots, USER_PAGE doesn't use cursor-position-based HIT lookup
-	 * for replayed entries -- the (kind, fw_id) secondary index
-	 * does that, and the cursor's only role is to position fresh
-	 * post-restore allocations above source-side replayed entries.
+	 * window, but ALSO preserve the post-replay high-water mark
+	 * captured above. Without the max_t(), the for-loop reset
+	 * collapses cursor[USER_PAGE] to slot_base and a fresh
+	 * post-restore user_page_map_phys() collides with the
+	 * lowest-IOVA replayed placeholder at user_page_start.
+	 *
+	 * Discovered by the CRIU runner's post-restore acid test
+	 * (ibv_create_cq on the restored ucontext) which triggers
+	 * mlx5_ib_db_map_user -> vfmig_dma_ops.map_sg -> a fresh
+	 * user_page allocation at cursor[USER_PAGE]; the bug was
+	 * silent before that path was exercised because no prior
+	 * post-LOAD path allocates fresh user pages in slot 7.
 	 */
-	if (dom->cursor[VFMIG_SLOT_USER_PAGE] <
-	    vfmig_iova_user_page_start(dom))
-		dom->cursor[VFMIG_SLOT_USER_PAGE] =
-			vfmig_iova_user_page_start(dom);
+	dom->cursor[VFMIG_SLOT_USER_PAGE] =
+		max_t(u64, user_page_hwm,
+		      vfmig_iova_user_page_start(dom));
 	/*
 	 * The kcoherent arena is NOT reset on replay: it has no
 	 * SAVE-side records so there's nothing for replay to land in,
