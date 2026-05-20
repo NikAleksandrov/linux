@@ -3075,16 +3075,21 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
  * mkey_index are mutually consistent and reject otherwise.
  *
  * v0 simplifications:
- *   - mr->umem = NULL. The user-pages side of the MR (IOMMU
- *     mappings, DMA setup) is owned by user_mr_dma stage 3 of
- *     the SR-IOV migration / CRIU integration -- not by mlx5_ib.
- *     This is consistent with mr->mmkey.cache_ent = NULL and
- *     mr->mmkey.cacheable = 0: dereg goes straight to FW
- *     DESTROY_MKEY without UMR cache return.
+ *   - mr->umem is real, populated by mlx5_ib_umem_restore_mr()
+ *     which composes ib_umem_pin() (pins user pages, builds
+ *     sg_append_table without dma_map_sgtable) with
+ *     mlx5_vfmig_bind_user_mr() (iommu_maps each sg at the
+ *     Stage-2 placeholder's IOVA range and populates
+ *     sg_dma_address). This is the Stage-3 D3 destination-side
+ *     bind chain (user_mr_dma.md §A.C). The mkey adoption + page
+ *     binding together close the data-path gap: FW WQE issue
+ *     against this mkey reaches the same IOVAs the SAVE-side
+ *     Stage-2 retag installed, which now map to destination-side
+ *     pinned pages via the IOMMU.
  *   - mr->mmkey.cache_ent = NULL, cacheable = 0, ndescs = 0,
  *     usecount = 0. Adopted MRs never enter the mkey cache and
  *     never participate in ODP/UMR fast paths (orthogonal v0
- *     restrictions to be lifted in user_mr_dma stage 3).
+ *     restrictions; ODP/UMR are out of scope for v0 restore).
  *   - No UMR resource init (mlx5r_umr_resource_init); we never
  *     run UMR on this mr. If a future REREG_MR replay needs UMR
  *     it can be lazily initialised then.
@@ -3097,8 +3102,24 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
  * working as intended; the mr stays parked at target_handle
  * until restore is complete or the ucontext is destroyed.
  *
+ * v0 abnormal-exit leak: when ufile teardown reaches the
+ * RDMA_REMOVE_DRIVER_FAILURE pass (per rdma_core.c, gated on
+ * ib_dev->ops.ucontext_is_restore_mode in beea656e494d) with an
+ * adopted MR whose FW dependents are still alive, dereg_mr's
+ * mlx5r_handle_mkey_cleanup() returns the BAD_RES_STATE errno
+ * before __mlx5_ib_dereg_mr() reaches its ib_umem_release()
+ * line, so the umem (and its pinned pages) leaks alongside the
+ * mlx5_ib_mr struct. This widens an existing v0 leak (just the
+ * mr struct under the umem == NULL design) by ib_umem_num_pages
+ * pinned pages per orphan. Bounded to one ucontext lifetime;
+ * the CRIU plugin coordinates SAVE-side cleanup ordering on the
+ * happy path so this only triggers on abnormal process exit.
+ * Lifting requires a driver-side cleanup hook that releases the
+ * umem even when DESTROY_MKEY fails -- deferred to a v1
+ * follow-up.
+ *
  * Returns the &mr->ibmr ready for the dispatcher to commit, or
- * an ERR_PTR() on validation failure.
+ * an ERR_PTR() on validation failure or umem-pin/bind failure.
  */
 static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 					u64 addr, u64 length, u64 iova,
@@ -3111,6 +3132,7 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 		udata, struct mlx5_ib_ucontext, ibucontext);
 	struct mlx5_ib_restore_mr_req req = {};
 	struct mlx5_ib_mr *mr;
+	struct ib_umem *umem;
 	int err;
 
 	if (!context)
@@ -3150,12 +3172,33 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	if ((lkey_hint >> 8) != req.mkey_index)
 		return ERR_PTR(-EINVAL);
 
-	(void)addr; (void)length; (void)iova; (void)access;
-	(void)target_handle;	/* dispatcher's job */
+	(void)iova;		/* dispatcher populates mr->ibmr.iova */
+	(void)target_handle;	/* dispatcher reserved this in the ufile idr */
 
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * Stage-3 D3 destination-side umem bind. Pins user pages,
+	 * builds the sg_append_table, and iommu_maps each sg at the
+	 * placeholder IOVA range that LOAD_VHCA_STATE installed for
+	 * (KIND_MR, mkey_index). On failure the helper has already
+	 * unwound any pin + partial bind via ib_umem_release().
+	 *
+	 * Run before mmkey-state population so a bind failure doesn't
+	 * leave behind a half-initialised mr->mmkey. On success the
+	 * umem is owned by mr and will be released by
+	 * __mlx5_ib_dereg_mr's ib_umem_release(mr->umem) path
+	 * (modulo the v0 abnormal-exit leak documented above).
+	 */
+	umem = mlx5_ib_umem_restore_mr(dev, req.mkey_index, addr, length,
+				       access);
+	if (IS_ERR(umem)) {
+		err = PTR_ERR(umem);
+		kfree(mr);
+		return ERR_PTR(err);
+	}
 
 	/*
 	 * Adopt the FW mkey state. We do not issue any FW command
@@ -3171,15 +3214,20 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	mr->mmkey.cache_ent = NULL;
 	mr->mmkey.cacheable = 0;
 
-	/*
-	 * v0: no kernel-side umem. user_mr_dma stage 3 owns the IOMMU
-	 * side; we don't double-pin pages. With umem == NULL +
-	 * cache_ent == NULL the dereg path collapses to FW
-	 * DESTROY_MKEY + kfree(mr).
-	 */
-	mr->umem = NULL;
+	mr->umem = umem;
 	mr->access_flags = access;	/* mlx5-private (user-MR branch) */
-	mr->page_shift = PAGE_SHIFT;	/* unused while umem == NULL */
+	/*
+	 * v0 page_shift: the adopted FW mkey carries its own
+	 * mkc.log_page_size from the source's CREATE_MKEY (preserved
+	 * across LOAD_VHCA_STATE per the S4b empirical chain), and
+	 * the data path uses that field for DMA address translation
+	 * -- not mr->page_shift. The kernel-side mr->page_shift is
+	 * only consulted by UMR descriptor generation (we never run
+	 * UMR on adopted MRs; cache_ent = NULL) and a handful of
+	 * diagnostic dumps. PAGE_SHIFT is safe; per-umem optimisation
+	 * via mlx5_umem_mkc_find_best_pgsz() is deferred.
+	 */
+	mr->page_shift = PAGE_SHIFT;
 
 	/*
 	 * Wire-visible identity. The dispatcher echoes these back to
@@ -3191,10 +3239,21 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	mr->ibmr.lkey = lkey_hint;
 	mr->ibmr.rkey = rkey_hint;
 
+	/*
+	 * reg_pages accounting parity with create_real_mr /
+	 * alloc_cacheable_mr / mlx5_ib_reg_user_mr_dmabuf: every
+	 * caller that assigns a non-NULL mr->umem bumps reg_pages by
+	 * ib_umem_num_pages() so the symmetric atomic_sub() in
+	 * __mlx5_ib_dereg_mr (mr.c, "if (mr->umem)" arm) does not
+	 * underflow.
+	 */
+	atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
+
 	mlx5_ib_dbg(dev,
-		    "vfmig_mr_dbg: restore_mr ibdev=%s mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x\n",
+		    "vfmig_mr_dbg: restore_mr ibdev=%s mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x umem_npages=%zu\n",
 		    dev_name(&ibpd->device->dev), req.mkey_index, lkey_hint,
-		    mpd->pdn, mpd->uid, target_handle);
+		    mpd->pdn, mpd->uid, target_handle,
+		    ib_umem_num_pages(umem));
 
 	return &mr->ibmr;
 }
