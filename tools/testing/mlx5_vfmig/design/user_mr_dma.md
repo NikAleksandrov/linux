@@ -1,23 +1,28 @@
 # DESIGN: user-MR DMA coverage in the v1 deterministic IOVA allocator
 
-> **Status (2026-05-18):**
+> **Status (2026-05-19):**
 >
 > * **Stage 1 — landed.** `vfmig_dma_ops` shim, `VFMIG_SLOT_USER_PAGE`,
 >   per-VF `dev->dma_iommu` override, registry external-page entries
 >   with the `awaiting_bind` field wired-but-unused. Source-side data
 >   path works on tracked VFs.
-> * **Stage 2 + Stage 3 — in this design revision; not yet
->   implemented.** Reshaped from the original sketches after
->   `uobject_restore.md` landed `UVERBS_OBJECT_RESTORE` /
->   `mlx5_ib_restore_mr` (S4b) as a kernel-only verb that adopts the
->   FW mkey without userspace re-registration. The original
->   cursor-based stage-2 and per-task-`vfmig_next_mkey` stage-3
->   sketches assumed userspace `ibv_reg_mr` drove the destination's
->   restoration; that trigger is gone in v0. Revised stages preserve
->   the registry data structures (the `awaiting_bind` flag and the
->   `awaiting_bind_hits` counter, see §4.2) but route the binding
->   work through a kernel-verb trigger instead. Original §6 and §7
->   prose preserved in §A.G for design history.
+> * **Stage 2 — landed.** Identity infrastructure (kind/fw_id keys,
+>   secondary rb_tree, observer ioctl, wire-format extension,
+>   LOAD-side replay-as-placeholder, source-side retag at every user
+>   uobject creation site). Empirical chain in §6.5 — eleven commits
+>   `504602987fb5` ⇒ `3513b4e28a0e`, validated end-to-end against the
+>   running kernel via
+>   `tools/testing/mlx5_vfmig/save_load/user_object_replay/test_user_object_replay.sh`
+>   FULL PASS verdict (`MR=4 CQ=1 QP=1 SRQ=1 DBR=1 total=8`).
+> * **Stage 3 — in this design revision; not yet implemented.**
+>   Reshaped from the original sketches after `uobject_restore.md`
+>   landed `UVERBS_OBJECT_RESTORE` / `mlx5_ib_restore_mr` (S4b) as a
+>   kernel-only verb that adopts the FW mkey without userspace
+>   re-registration. The original cursor-based stage-3 sketch
+>   (preserved in §A.G) assumed userspace `ibv_reg_mr` drove the
+>   destination's restoration; that trigger is gone in v0. Revised
+>   stage 3 consumes stage 2's `awaiting_bind` placeholders via a
+>   kernel-verb trigger — see §7.
 > * **Stage 4 — forward-compat sketch only (§8).** IOVA recycling for
 >   `VFMIG_SLOT_USER_PAGE`; not on the critical path for end-to-end
 >   data-path continuity.
@@ -633,11 +638,12 @@ the total DMA-block count across all restored uobjects. Used as a
 soft signal during development; the load-bearing data-path pass
 criterion is Phase J in §7.5.
 
-## 6. Stage 2 design: identity infrastructure
+## 6. Stage 2 design: identity infrastructure (landed)
 
-Stage 2 reshapes the original cursor-based sketch (preserved in §A.G)
+Stage 2 reshaped the original cursor-based sketch (preserved in §A.G)
 to fit the kernel-verb-driven trigger model. Three additive pieces;
-no behaviour change for fresh-registration code paths.
+no behaviour change for fresh-registration code paths. Landed across
+the eleven-commit series enumerated in §6.5.
 
 ### 6.1 What stage 2 delivers
 
@@ -655,36 +661,48 @@ mapping the FW will dereference.
 
 ### 6.2 The three pieces
 
-**(a) Wire format extension.** New tag `VFMIG_WIRE_TAG_HOST_USER_PAGE`
-(byte layout in §A.A). Carried alongside existing `HOST_PAGE`
-records. SAVE iterator (`vfmig_iova_for_each` extended with an
-`INCLUDE_EXTERNAL` flag) walks every external registry entry and
-emits one record per uobject -- not per sg, since the source-side
-IOVA range per uobject is contiguous (each umem's `.map_sg` call
-bumps the cursor monotonically per sg, so all IOVAs for the umem
-live in `[iova_base, iova_base + total_length)`). SAVE blob
-structure becomes `HOST_PAGE × N (kernel slots) + HOST_USER_PAGE × M
-(user-side) + opaque FW VHCA blob`.
+**(a) Wire format extension** (commit `e088700f16db`). New tag
+`VFMIG_WIRE_TAG_HOST_USER_PAGE` (byte layout in §A.A). Carried
+alongside existing `HOST_PAGE` records. The SAVE iterator
+(`vfmig_iova_for_each_external`) walks every external registry
+entry and emits one record per uobject -- not per sg, since the
+source-side IOVA range per uobject is contiguous (each umem's
+`.map_sg` call bumps the cursor monotonically per sg, so all IOVAs
+for the umem live in `[iova_base, iova_base + total_length)`). SAVE
+blob structure becomes `HOST_PAGE × N (kernel slots) +
+HOST_USER_PAGE × M (user-side) + opaque FW VHCA blob`. The
+`vfmig_stream_header.reserved` slot was repurposed to carry
+`num_user_pages`; `manifest_crc32` folds over the HUP tuples too.
 
-**(b) Source-side retag.** Stage 1 auto-numbers `instance_key` at
-`vfmig_dma_ops.map_sg` time because the FW resource id (`mkey_index`,
-`cqn`, …) isn't yet known there. Stage 2 adds a post-creation retag
-step at every user-uobject creation site that overwrites the
-auto-numbered key with `VFMIG_HUOBJ_KEY(kind, fw_id)`. Idempotent
-(re-tagging an already-tagged entry is a no-op). Callsites listed in
-§A.B.
+**(b) Source-side retag** (commits `b2ff659fa032` MR, `f6416c8b14a1`
+DBR, `fd81527efd4f` CQ, `c0183184ad82` QP, `4c522ea91f2e` SRQ). Stage
+1 auto-numbers `instance_key` at `vfmig_dma_ops.map_sg` time because
+the FW resource id (`mkey_index`, `cqn`, …) isn't yet known there.
+Stage 2 adds a post-creation retag at every user-uobject creation
+site that overwrites the auto-numbered key with
+`VFMIG_HUOBJ_KEY(kind, fw_id)`. Idempotent (re-tagging an
+already-tagged entry is a no-op). Callsites listed in §A.B. The
+public helper signature is
+`mlx5_vfmig_retag_user_<kind>(vf_dev, fw_id, iova_base, length)`;
+each callsite gates on `dev->mdev->cmd.vfmig_iova_dom` (O(1),
+lock-free, NULL on PF and non-vfmig VFs) to avoid touching the PF
+`intf_state_mutex` on the steady-state non-vfmig path. The DBR site
+retags only in the miss branch of `mlx5_ib_db_map_user` (hit branch
+is already retagged from first install).
 
-**(c) LOAD-side replay-as-placeholder.** New state-machine arc
-`VFMIG_LS_HUP_READ_HEADER → VFMIG_LS_HUP_REPLAY` in `vfmig.c`'s LOAD
+**(c) LOAD-side replay-as-placeholder** (commits `504602987fb5`
+foundation + `c44a482a91ce` consumption). New state-machine arc
+`VFMIG_LS_HUP_READ_SUBHDR → VFMIG_LS_HUP_REPLAY` in `vfmig.c`'s LOAD
 parser (alongside the existing `VFMIG_LS_HP_*` arc for `HOST_PAGE`).
-Calls a new `vfmig_iova_replay_external_locked(dom, slot,
-instance_key, iova, length, awaiting=true)` (the function name
-referenced since §4.2 and finally implemented here) that allocates
-a `vfmig_iova_page` with `external=true, page=NULL,
-awaiting_bind=true`, inserts it into the primary list and a new
-secondary index keyed by `(kind, fw_id)`, and bumps the slot cursor
-past `iova + length`. **No `alloc_pages`. No `iommu_map`.** The
-secondary index is the lookup point for stage 3's hint-aware binder.
+Calls `vfmig_iova_replay_external(dom, slot, instance_key, iova,
+length, awaiting=true)` (the function name referenced since §4.2,
+implemented in `504602987fb5`) that allocates a `vfmig_iova_page`
+with `external=true, page=NULL, awaiting_bind=true`, inserts it
+into the primary list and a new secondary index keyed by `(kind,
+fw_id)`, and bumps the slot cursor past `iova + length`. **No
+`alloc_pages`. No `iommu_map`.** The secondary index (a per-domain
+`rb_root` keyed by the 64-bit `instance_key`) is the lookup point
+for stage 3's binder.
 
 ### 6.3 Generality across MR / CQ / QP / SRQ / DBR
 
@@ -699,29 +717,81 @@ parent uobject by user VA; the dedup makes the second/third
 `RESTORE_X` that lands on a previously-bound DBR a refcount-up
 no-op. Full walkthrough in §A.E.
 
-### 6.4 Stage 2 success criterion
+### 6.4 Stage 2 success criterion (met)
 
-A new PF cdev ioctl `MLX5_VFMIG_IOC_QUERY_AWAITING_BIND` returns the
-count of `awaiting_bind=true` entries from the destination's
-registry (filterable by kind). New sidecar test
-`tools/testing/mlx5_vfmig/save_load/test_user_object_replay.sh`:
+The PF cdev ioctl `MLX5_VFMIG_IOC_QUERY_AWAITING_BIND` (commit
+`a0bb5ec10ed1`) returns the count of `awaiting_bind=true` entries
+from the destination's registry, filterable by kind. The sidecar
+test
+`tools/testing/mlx5_vfmig/save_load/user_object_replay/test_user_object_replay.sh`
+(commit `685842d9211d`, harness self-calibration `3513b4e28a0e`)
+drives it:
 
-* Phase A: bind a tracked source VF, register N user MRs, allocate a
-  CQ + a QP (touching DBR pages too).
-* Phase B: SAVE.
-* Phase C: bind the destination VF.
-* Phase D: LOAD.
-* Phase E: read the `awaiting_bind` count via the new ioctl.
+* Phase A: bind a tracked source VF.
+* Phase B: source probe (`user_object_replay_probe`) registers
+  `N` MRs + CQ + QP + best-effort SRQ; emits an `expected_*`
+  manifest the harness uses to self-calibrate the assertion
+  thresholds.
+* Phase C: SAVE.
+* Phase D: quit probe, tear down source VF.
+* Phase E: bind destination VF, LOAD.
+* Phase F: `QUERY_AWAITING_BIND` on the destination, compare against
+  the probe's emitted manifest.
 
-Pass criterion: count matches what was emitted on source, broken
-down by kind. Stage 2 alone PASS = "infrastructure works"; data
-path is *not* yet exercised (that's stage 3's Phase J). The
-count-match property is invariant under the choice of stage-3
+Pass criterion: per-kind count on the destination matches what the
+probe registered on the source. Stage 2 PASS = "infrastructure
+works"; data path is *not* yet exercised (that's stage 3's Phase J).
+The count-match property is invariant under the choice of stage-3
 binder consumption order and under the choice of sg shape on
 destination, which makes it a good fault-isolation signal: a
 stage-3 regression that breaks data path doesn't break stage-2
-count match, so this test keeps catching infrastructure
-regressions independently.
+count match, so this test keeps catching infrastructure regressions
+independently.
+
+### 6.5 Empirical chain (landed)
+
+Eleven-commit Stage 2 series, in landing order:
+
+| #  | Commit          | What it adds |
+|----|-----------------|--------------|
+| C1 | `504602987fb5`  | Foundation: `enum vfmig_huobj_kind`, `VFMIG_HUOBJ_KEY/KIND/FWID`, per-domain `rb_root user_index`, `vfmig_iova_install_external_placeholder_locked`, `vfmig_iova_replay_external`, `vfmig_iova_retag_external_range`, `vfmig_iova_for_each_external`, `vfmig_iova_count_awaiting_bind`. `reset_cursor` preserves the `VFMIG_SLOT_USER_PAGE` high-water mark. Buildable NOP (no callers in this commit). |
+| C2 | `a0bb5ec10ed1`  | `MLX5_VFMIG_IOC_QUERY_AWAITING_BIND` PF cdev ioctl + `query_awaiting_bind` CLI verb. Mirrors `PROBE_MKEY` / `PROBE_PD` shape. Observer ships before the observed. |
+| C3 | `685842d9211d`  | `user_object_replay_probe` (PD + N MRs + CQ + QP + best-effort SRQ; manifest + READY/quit handshake) + `test_user_object_replay.sh` harness (Phases A–F). C3-era baseline: ioctl callable, all counts zero (no source retag wired). |
+| C4 | `e088700f16db`  | SAVE-side emit: `VFMIG_WIRE_TAG_HOST_USER_PAGE` (0x4855) + 32-byte `vfmig_host_user_page_record`; `vfmig_stream_header.reserved` → `num_user_pages`; four-pass save walker (HP-size, HUP-size, HP-emit, HUP-emit); `manifest_crc32` covers HUP tuples; `KIND_NONE` entries skipped (no retag, no emit). |
+| C5 | `c44a482a91ce`  | LOAD-side replay: `VFMIG_LS_HUP_READ_SUBHDR` + `VFMIG_LS_HUP_REPLAY` states; `STREAM_HDR_READ` consumes `num_user_pages`; shared `vfmig_load_maybe_finalize_records` helper latches CRC verify + drift-detection arm to `(hp+hup)_seen == expected`; HUP subhdr validation + replay folds CRC and calls `vfmig_iova_replay_external`. |
+| C6 | `b2ff659fa032`  | Source-side retag — MR (`create_real_mr`, post-FW-wired). Public helper `mlx5_vfmig_retag_user_mr` uses `vf_dev->cmd.vfmig_iova_dom` for O(1) lock-free gate; callsite gates on `dev->mdev->cmd.vfmig_iova_dom && !umem->is_dmabuf`. Non-fatal warning on retag failure. |
+| C7 | `f6416c8b14a1`  | Source-side retag — DBR (`mlx5_ib_db_map_user`, miss branch only). `KIND_DBR`'s `fw_id` is `user_virt & PAGE_MASK` — only kind whose `fw_id` is a userspace VA (§6.3, §A.E). Hit branch deliberately not retagged. |
+| C8 | `fd81527efd4f`  | Source-side retag — CQ (`mlx5_ib_create_cq`, post-`mlx5_core_create_cq`). Gates: `udata && cq->buf.umem && vfmig_iova_dom && !is_dmabuf`. |
+| C9 | `c0183184ad82`  | Source-side retag — QP (`create_user_qp`, post-`mlx5_qpc_create_qp`). v0 skips `RAW_PACKET` / `IB_QP_CREATE_SOURCE_QPN` (split SQ/RQ umems out of scope) — see §10. |
+| C10| `4c522ea91f2e`  | Source-side retag — SRQ (`mlx5_ib_create_srq`, post-`mlx5_cmd_create_srq`). Covers BASIC / XRC / TM SRQ types. Completes the five-kind retag set. |
+| H  | `3513b4e28a0e`  | Harness self-calibration: `EXPECT_*_COUNT` default to the probe's emitted `src_expected_*` manifest values, so the harness automatically expects what was actually created (including `srqn=0`, which is a legitimate FW assignment). Removes the "PASS-in-disguise" failure mode. |
+
+Validation (running kernel
+`6.19.0-raphael-criu-dev-criu-c92f63055698+ #3`, 2026-05-19):
+
+```
+================ STAGE-2 USER OBJECT REPLAY VERDICT =====
+source (probe-emitted):
+  pdn = 20  num_mrs = 4  cqn = 2597  qpn = 200  srqn = 0
+destination (QUERY_AWAITING_BIND on dst vf 0):
+  kind  observed  expected
+  ----  --------  --------
+  MR           4         4
+  CQ           1         1
+  QP           1         1
+  SRQ          1         1
+  DBR          1         1
+  TOTAL        8         8
+FULL PASS (C6..C10): every kind round-trips identity infrastructure
+across SAVE/LOAD on a tracked VF.
+```
+
+A teardown-time `__iommu_group_free_device` WARN is emitted on
+`sriov_numvfs=0` — pre-existing detach-ordering issue, orthogonal
+to Stage 2. Diagnosis + suppression is deferred to a follow-on
+diagnostic-only commit (a `dev_info` trace at each early-return in
+`mlx5_vfmig_vf_detach_iova_domain` to identify which gate misfires
+under `sriov_numvfs=0`), then suppression once the branch is known.
 
 ## 7. Stage 3 design: kernel-verb-driven IOMMU binding
 
@@ -899,11 +969,12 @@ nothing in stage 1 prevents future support:
 
 ## 10. Open questions
 
-* **Stage 2 retag timing across kinds.** Validate the exact callsite
-  per kind in §A.B and confirm ordering against any concurrent SAVE
-  iterator. The iterator runs only on a quiesced unbound VF, so no
-  live registration concurrency, but stage-2 validation should
-  sanity-check this.
+* **Stage 2 retag timing across kinds — resolved.** The five
+  per-kind callsites in §A.B (commits C6..C10 in §6.5) all sit
+  post-FW-create and pre-uobject-finalize, so the retag observes the
+  authoritative `fw_id` and races no SAVE iterator (SAVE runs only
+  against a quiesced unbound VF). End-to-end validation: PASS
+  verdict in §6.5.
 * **`dev->dma_iommu` override visibility.** Are there subsystems that
   cache `dev->dma_iommu` somewhere else? `iommu_dma_init_domain`
   initializes the iova_cookie; `iommu_setup_dma_ops` is the only
@@ -911,22 +982,28 @@ nothing in stage 1 prevents future support:
   across a single uverbs MR registration to verify both states behave
   correctly.
 * **ODP** (`hmm_dma_map_pfn` not `dma_map_sgtable`): out of scope;
-  needs a separate hook + per-task hint shape (sub-page granularity).
+  needs a separate hook (sub-page granularity).
 * **DEVX user-side allocations** (`MLX5_IB_OBJECT_DEVX_OBJ` raw FW
   command issuance, including `CREATE_MKEY` from devx). Probably
   fits the design via a new kind enum entry; gate-question is whether
   devx-allocated user pages flow through `ib_umem_get` /
   `dma_map_sgtable` (quick read: yes via `mlx5_ib_devx_create_dct`
   and friends). Confirm before committing devx to v0 scope.
+* **RAW_PACKET / IB_QP_CREATE_SOURCE_QPN QPs (deferred from stage 2 C9).**
+  These QPs have split SQ/RQ umems plumbed through alternate paths
+  (`create_raw_packet_qp` rather than `create_user_qp`). The C9
+  callsite explicitly skips them (`init_attr->qp_type !=
+  IB_QPT_RAW_PACKET && !(qp->flags & IB_QP_CREATE_SOURCE_QPN)`). v0
+  scope leaves RAW_PACKET QPs unrestored at the umem layer; revisit
+  when a workload needs them.
 * **DMA-buf MRs (deferred from stage 1).** DMA-buf umems don't go
   through `pin_user_pages_fast`; they attach via
-  `dma_buf_map_attachment`. Source-side retag still works
-  (`dma_map_sgtable` lands in our `.map_sg`). But the destination's
-  dma-buf attachment regenerates the sg_table fresh -- open whether
-  the sg granularity matches across SAVE/LOAD; if dst sg shape
-  differs from source, the PAGE_SIZE-granular binder of §A.C still
-  works but we lose the stage-2 entry-count-match property. Validate
-  before declaring dma-buf MR continuity supported.
+  `dma_buf_map_attachment`. The C6/C8/C9/C10 callsites gate on
+  `!umem->is_dmabuf`, so dma-buf umems are deliberately skipped on
+  the source — they would not retag, would emit `KIND_NONE` (skipped
+  by the SAVE walker), and so would not appear as `awaiting_bind`
+  entries on the destination. Validating dma-buf MR continuity is a
+  follow-on once a workload needs it.
 * **Hint cross-talk hazard.** Per-task `vfmig_bind_hint` is
   vulnerable to a `dma_map_sgtable` call between hint-set and the
   intended `ib_umem_get`. Mitigated by one-shot semantics + WARN if
@@ -956,14 +1033,16 @@ invariant that requires the VF unbound at destroy.)
 * `drivers/infiniband/hw/mlx5/mr.c:1578` -- `mlx5_ib_reg_user_mr`.
 * `drivers/infiniband/hw/mlx5/main.c` -- `mlx5_ib_restore_mr` (S4b),
   the kernel verb stages 2+3 hang off.
-* `drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c` -- the
-  existing v1 allocator we're extending. Note
-  `vfmig_iova_replay_page` line ~1293 returns `-EOPNOTSUPP` for
-  `VFMIG_SLOT_USER_PAGE`; that's the audit-confirmed evidence that
-  stages 2+3 are not yet landed.
+* `drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c` -- the v1
+  allocator. `vfmig_iova_replay_external` (commit `504602987fb5`)
+  is the stage-2 LOAD-side primitive; `vfmig_iova_replay_page` now
+  routes `VFMIG_SLOT_USER_PAGE` to it instead of returning
+  `-EOPNOTSUPP`.
 * `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c` -- LOAD-side
-  state machine (`VFMIG_LS_HP_*`); stage 2 adds parallel
-  `VFMIG_LS_HUP_*` arc.
+  state machine. Stage 2 added the parallel `VFMIG_LS_HUP_*` arc
+  alongside the existing `VFMIG_LS_HP_*` (commit `c44a482a91ce`).
+* `tools/testing/mlx5_vfmig/save_load/user_object_replay/` --
+  stage-2 empirical harness (probe + shell script).
 * `tools/testing/mlx5_vfmig/design/uar_restore.md` -- the verb-pattern
   template stages 2+3 follow.
 * `tools/testing/mlx5_vfmig/design/uobject_restore.md` -- §9.1 (S4b
