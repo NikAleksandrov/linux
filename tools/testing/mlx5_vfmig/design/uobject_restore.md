@@ -590,12 +590,32 @@ plugin contribution.
   comp channel.
 * **Restore order**: CC before CQ.
 * **Kernel verb (CC)**: `UVERBS_METHOD_RESTORE_COMP_CHANNEL(target_handle)`
-  -> `ib_dev->ops.restore_comp_channel()`. Allocates the
-  `ib_uverbs_completion_event_file` uobject and its associated fd; CRIU's
-  fd-table machinery installs the fd at the user's saved fd number.
-* **Kernel verb (CQ)**: `UVERBS_METHOD_RESTORE_CQ(target_handle, attrs,
-  blob, comp_channel_handle?)`. The PD reference doesn't apply at CQ-create
-  time in modern uverbs; comp_channel_handle is the optional xref.
+  -> `ib_dev->ops.restore_comp_channel()`. **Deferred -- not part of v0
+  S5; lives in the future fd-bearing-uobjects micro-stage (S5c) alongside
+  `RESTORE_ASYNC_EVENT` (S8).** Both share the per-fd allocation +
+  CRIU-fd-table-reinstall plumbing, so they land together once the
+  `ib_write_bw -e` event-mode milestone (S10) becomes the active goal. v0
+  CQs that were bound to a comp channel on the source side cannot be
+  restored end-to-end until S5c lands; CRIU plugin policy at v0 is
+  "checkpoint only CQs created without a comp channel."
+* **Kernel verb (CQ)**: `UVERBS_METHOD_RESTORE_CQ(target_handle, cqe,
+  user_handle, comp_vector, flags?, comp_channel?, event_fd?, blob)`,
+  with `RESP_CQE` returned out. **Landed at S5 A1 (`a77cc4d8e8b9`).**
+  No core `cqn_hint` attr: the CQ identifier is not part of any
+  RDMA-spec wire packet, so drivers with FW-side cqn (mlx5_vfmig, S5
+  B-series) carry the source's cqn through their UHW payload (`struct
+  mlx5_ib_restore_cq_req.cqn`) and the driver enforces continuity
+  internally. Drivers with no cqn concept (rxe) allocate a fresh pool
+  slot. K8a's NLDEV `RES_HANDLE` for the restored CQ matches
+  `RESTORE_CQ_HANDLE` (the dispatcher-reserved ufile handle), so
+  user-visible identity continuity is preserved out of band by the
+  same mechanism PD/MR use. `comp_channel?` is declared `UA_OPTIONAL`
+  for forward compat with S5c, but the v0 dispatcher hard-rejects with
+  `-EOPNOTSUPP` if any caller passes one (so future plugins don't have
+  to dance around stale plugin policy when S5c lands). `event_fd?`
+  resolves via `ib_uverbs_get_async_event()` -> ufile default
+  `async_file` when absent (the v0 path; S8 will let it resolve to an
+  explicit restored async-event uobject without a UAPI bump).
 
 ### 5.3 QP
 
@@ -1085,9 +1105,10 @@ Concretely the per-driver predicate is wired as follows:
   and sets `rxe_ucontext.restore_mode = true` when present.
   `rxe_ucontext_is_restore_mode()` returns it.
 
-**Status (2026-05-14): RESTORE_PD landed as `e06868342fce`.** The
-namespace and dispatcher infrastructure described below is in place;
-RESTORE_CQ / RESTORE_QP / RESTORE_MR / RESTORE_SRQ / RESTORE_AH /
+**Status (2026-05-20): RESTORE_PD (`e06868342fce`), RESTORE_MR
+(`57cf75f25a48` core + `f422e6ba6bdc` rxe-hint primitive), RESTORE_CQ
+(`a77cc4d8e8b9`) landed.** The namespace and dispatcher infrastructure
+described below is in place; RESTORE_QP / RESTORE_SRQ / RESTORE_AH /
 RESTORE_COMP_CHANNEL / RESTORE_ASYNC_EVENT will reuse the exact same
 pattern (UVERBS_ATTR_PTR_IN target_handle + per-class init params +
 UHW driver blob).
@@ -1173,36 +1194,126 @@ It was added by the UAR restore work and implements the
 XA-insert-at-handle behaviour with the right errno contract. Each
 `RESTORE_<TYPE>` handler reuses this helper.
 
-Future per-class methods (CQ/QP/MR/SRQ/AH/COMP_CHANNEL/ASYNC_EVENT)
-will mirror the shape above: one `UVERBS_ATTR_PTR_IN` u32 target
-handle, plus whatever per-class init params are needed (e.g. CQ
-will add `cqe`, `comp_vector`, `comp_channel_handle`; QP will add
+Future per-class methods (QP/SRQ/AH/COMP_CHANNEL/ASYNC_EVENT) will
+mirror the shape above: one `UVERBS_ATTR_PTR_IN` u32 target handle,
+plus whatever per-class init params are needed (e.g. QP will add
 `pd_handle`, `send_cq_handle`, `recv_cq_handle`, init/modify attrs,
-state). Total: 8 new methods (PD landed, 7 remaining).
+state). Total: 8 new methods (PD/MR/CQ landed, 5 remaining).
+
+**RESTORE_CQ shape (S5 A1 landed concrete example).** CQ has no
+parent-IDR xref (no PD on the modern CREATE_CQ path), so the dispatcher
+takes only `UVERBS_ATTR_PTR_IN` u32s plus the optional FD-class attrs:
+
+```c
+DECLARE_UVERBS_NAMED_METHOD(
+    UVERBS_METHOD_RESTORE_CQ,
+    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_HANDLE,
+                       UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_CQE,
+                       UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_USER_HANDLE,
+                       UVERBS_ATTR_TYPE(__aligned_u64), UA_MANDATORY),
+    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR,
+                       UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_FLAGS,
+                       UVERBS_ATTR_TYPE(__u32), UA_OPTIONAL),
+    UVERBS_ATTR_FD(UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL,
+                   UVERBS_OBJECT_COMP_CHANNEL,
+                   UVERBS_ACCESS_READ, UA_OPTIONAL),
+    UVERBS_ATTR_FD(UVERBS_ATTR_RESTORE_CQ_EVENT_FD,
+                   UVERBS_OBJECT_ASYNC_EVENT,
+                   UVERBS_ACCESS_READ, UA_OPTIONAL),
+    UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_CQ_RESP_CQE,
+                        UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+    UVERBS_ATTR_UHW());
+```
+
+Three notable design choices, each load-bearing:
+
+1. **No `cqn_hint`.** Unlike RESTORE_MR (which has `lkey_hint` /
+   `rkey_hint` carrying wire-visible identity), the CQ identifier
+   does not appear in any RDMA-spec wire packet -- receive
+   completions are local to the receiver's HCA, and no SEND/RECV/RDMA
+   header references cqn. So a "wire-identity" attr would be
+   meaningless at the core level. Drivers that do have an FW-side
+   cqn (mlx5_vfmig: `qpc.cqn_snd`/`cqn_rcv` reference cqn as a
+   tracked FW resource) carry the source's cqn through their UHW
+   payload (`struct mlx5_ib_restore_cq_req.cqn`, S5 B1 pending), and
+   the driver's restore_cq enforces continuity internally. Drivers
+   with no cqn concept (rxe) ignore the question entirely.
+2. **`COMP_CHANNEL` declared `UA_OPTIONAL` but rejected at v0.** Comp
+   channel restore (RESTORE_COMP_CHANNEL) is deferred to S5c
+   alongside RESTORE_ASYNC_EVENT (S8); both share fd-table reinstall
+   plumbing. Declaring the attr now and rejecting it with
+   `-EOPNOTSUPP` keeps the UAPI shape stable -- when S5c lands no
+   plugin needs to bump its caller-side ABI.
+3. **`EVENT_FD` declared `UA_OPTIONAL`, default-fallback in
+   dispatcher.** The dispatcher calls
+   `ib_uverbs_get_async_event(attrs, UVERBS_ATTR_RESTORE_CQ_EVENT_FD)`
+   exactly the way `UVERBS_METHOD_CQ_CREATE` does. Absent attr ->
+   `ufile->default_async_file` (auto-allocated), which is the v0
+   path. Present attr -> the explicit `UVERBS_OBJECT_ASYNC_EVENT`
+   uobject the caller passed (S8 plugin path). Same helper, same
+   ufile-state machinery, no driver-side awareness. Net effect at
+   v0: the restored CQ's async events flow through the ufile default
+   regardless of how the source had them routed; S8 lifts that
+   limitation.
+
+The handler dispatches through `ib_dev->ops.restore_cq(cq,
+target_handle, &init_attr, &attrs->driver_udata)` after copying the
+attrs into a local `struct ib_cq_init_attr` -- driver shape is the
+existing `create_cq` signature plus the `target_handle` hint.
 
 ### 7.4 K4: ib_device_ops.restore_<type> callbacks
 
-**Status (2026-05-14): restore_pd landed as `e06868342fce`.** Shape
-deliberately mirrors the driver's existing `alloc_pd` plus an extra
-`u32 target_handle` hint and the standard `ib_udata` for driver
-vendor-private bytes. The generic dispatcher has already reserved
-the requested ufile handle via `rdma_alloc_begin_uobject_at_handle()`
-by the time this callback is invoked; the driver's job is just to
-make the `ib_pd` hw-usable. Drivers that ignore the hint (rxe)
-behave identically to alloc_pd. Drivers that consume the hint (mlx5,
-once landed) use it as the FW pdn allocate-with-id input.
+**Status (2026-05-20): restore_pd (`e06868342fce`), restore_mr
+(`57cf75f25a48`), restore_cq (`a77cc4d8e8b9`) landed.** Shape
+deliberately mirrors each driver's existing `alloc_pd` / `reg_user_mr`
+/ `create_cq` plus an extra `u32 target_handle` hint and the standard
+`ib_udata` for driver vendor-private bytes. The generic dispatcher has
+already reserved the requested ufile handle via
+`rdma_alloc_begin_uobject_at_handle()` by the time this callback is
+invoked; the driver's job is just to make the `ib_<class>` hw-usable.
+Drivers that ignore the hint behave identically to their alloc/create
+counterpart. Drivers that consume it use it as the FW
+allocate-with-id input.
 
 ```c
 struct ib_device_ops {
     ...
     int (*restore_pd)(struct ib_pd *pd, u32 target_handle,
                       struct ib_udata *udata);
-    /* future: restore_cq, restore_qp, restore_mr, restore_srq,
-     * restore_ah, restore_comp_channel, restore_async_event_file.
-     * Each mirrors the shape of its existing alloc/create
-     * counterpart plus a u32 target_handle hint. */
+    int (*restore_mr)(struct ib_mr *mr, u32 target_handle,
+                      u64 user_addr, u64 length, u64 iova,
+                      int access_flags, u32 lkey_hint, u32 rkey_hint,
+                      struct ib_udata *udata);
+    int (*restore_cq)(struct ib_cq *cq, u32 target_handle,
+                      const struct ib_cq_init_attr *attr,
+                      struct ib_udata *udata);
+    /* future: restore_qp, restore_srq, restore_ah,
+     * restore_comp_channel, restore_async_event_file. Each mirrors
+     * the shape of its existing alloc/create counterpart plus a
+     * u32 target_handle hint. */
 };
 ```
+
+**Per-driver `restore_cq` behaviour (S5 A1):**
+
+* **rxe**: `rxe_restore_cq` is intentionally near-identical to
+  `rxe_create_cq` -- there is no rxe-side cqn that userspace can
+  observe, so the `target_handle` hint is unused for hw-id purposes
+  (it's already been honoured by the dispatcher's ufile-handle
+  reservation; there's nothing further for the driver to do). The
+  rxe pool slot for the restored CQ may differ from the source's,
+  but pool slots are not exposed beyond restrack and are not part of
+  any wire / userspace-API contract (no rxe-DV cqn equivalent).
+* **mlx5_vfmig** (S5 B-series, pending): `mlx5_ib_restore_cq` will
+  adopt the source's cqn from `struct mlx5_ib_restore_cq_req.cqn`
+  carried through `udata` (Model A, mirroring `mlx5_ib_restore_pd` /
+  `mlx5_ib_restore_mr`). cqn continuity is FW-state-coherence-load-
+  bearing: `qpc.cqn_snd`/`cqn_rcv` of the source's preserved QPCs
+  point at source-side cqn values, and S6 (RESTORE_QP) will need
+  those CQs reachable at the same cqn on the destination.
 
 Driver-side population:
 
@@ -1816,8 +1927,106 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
     retag (`create_real_mr`) gates on `!umem->is_dmabuf`, and
     `mlx5_ib_restore_mr`'s `ib_umem_pin` path doesn't speak
     ODP (rejects `IB_ACCESS_ON_DEMAND` with `-EOPNOTSUPP`).
-* **S5: CQ restore + comp channel (rxe + mlx5_vfmig together).** With
-  PD + MR + CQ working, the send/recv completion path is back.
+* **S5a: CQ restore on rxe (landed).** Generic
+  `UVERBS_METHOD_RESTORE_CQ` dispatcher + `rxe_restore_cq` landed as
+  `a77cc4d8e8b9`. Shape mirrors S3a's PD landing: dispatcher gates,
+  `rdma_alloc_begin_uobject_at_handle()` for the ufile-handle
+  reservation, attribute parsing into `struct ib_cq_init_attr`,
+  driver callback. Two CQ-specific dispatcher decisions (no analogue
+  for PD/MR -- see ?7.3): (a) `UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL`
+  declared `UA_OPTIONAL` for forward-compat with S5c but rejected
+  with `-EOPNOTSUPP` at v0; (b) `UVERBS_ATTR_RESTORE_CQ_EVENT_FD`
+  routed through the existing `ib_uverbs_get_async_event()` helper,
+  which falls back to `ufile->default_async_file` when the attr is
+  absent (the v0 path -- restored CQ async events flow through the
+  ufile default; S8 will let plugins pin them to an explicit
+  restored async-event uobject without a UAPI bump).
+  rxe-side is intentionally near-identical to `rxe_create_cq` since
+  rxe has no userspace-visible cqn (no rxe-DV equivalent for
+  `mlx5dv_cq->cqn`); the `target_handle` hint is already honoured by
+  the dispatcher's ufile-handle reservation, so the driver has
+  nothing further to do for hw-id purposes. Empirically validated by
+  `cq_restore_probe_rxe` (see ?9.7).
+
+  **v0 dealloc semantics on rxe.** `rxe_destroy_cq` returns
+  `-EINVAL` only when `atomic_read(&cq->num_wq) != 0` (the standard
+  uverbs invariant: a CQ with attached WQs cannot be destroyed). At
+  v0 -- with no RESTORE_QP yet -- no kernel-side QP is attached to
+  the restored CQ, so the orphan adopted CQ destroys cleanly via
+  `IB_USER_VERBS_CMD_DESTROY_CQ`. (Different from mlx5's S5b case
+  below; the asymmetry mirrors the PD-vs-MR axis of ?10.8 and is
+  recorded explicitly there now that CQ has landed.)
+
+* **S5b: CQ restore on mlx5_vfmig (pending).** Will implement
+  `mlx5_ib_restore_cq` via Model A -- adopt the source's FW `cqn`
+  into a fresh kernel-side `mlx5_ib_cq` with no destination FW
+  round-trip. Empirical chain to anchor before the handler lands:
+
+  1. **K6 / `test_fw_id_continuity.sh`** -- already PASS for cqn
+     (PARTIAL PASS, +3..+5 deltas explained by destination internal
+     allocations, no missing high-water mark).
+  2. **B0 / `MLX5_VFMIG_IOC_PROBE_CQN`** (pending) -- raw
+     `QUERY_CQ` against the source's cqn on the destination VF
+     post-LOAD, asserting `(cqn, eqn, log_cq_size, log_page_size,
+     page_offset, status, oi)` byte-equal to the source's pre-SAVE
+     view. The `eqn` field is the load-bearing one CQ adds over
+     mkey: a CQ's events flow through an event queue (EQ), and the
+     EQ binding must survive `LOAD_VHCA_STATE` for adopted CQs to
+     deliver completions. Mirrors `MLX5_VFMIG_IOC_PROBE_MKEY`'s
+     shape (B3 in S4b); the Phase G out-of-band check inside
+     `cq_restore_probe_mlx5_vfmig`.
+  3. **B4 / `cq_restore_probe_mlx5_vfmig`** (pending) -- end-to-end
+     verb-path probe with the live adopted CQ, gated by
+     `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` and walking subtests 1-7
+     (gate, UAPI rejects, happy path with byte-identical RESP_CQE
+     echo, EBUSY collision, COMP_CHANNEL-rejection, EVENT_FD
+     default-fallback success), parking at READY for the harness to
+     run B0's PROBE_CQN, and on `quit` running subtest 8 (the
+     PD-side-of-the-asymmetry v0 dealloc semantics: orphan adopted
+     CQ DESTROY_CQ -> `-EINVAL` via FW BAD_RES_STATE because the
+     source's cqn-using QPCs are still alive in destination FW until
+     S6 lands).
+
+  **UAPI shape** (`include/uapi/rdma/mlx5-abi.h`, B1):
+  ```c
+  struct mlx5_ib_restore_cq_req {
+      __u32  cqn;            /* 24 bits significant */
+      __u32  reserved;       /* must be 0 */
+      __aligned_u64 reserved2; /* must be 0 */
+  };
+  ```
+  16-byte UHW payload, identical pattern to `mlx5_ib_restore_pd_req`
+  / `mlx5_ib_restore_mr_req`. Handler enforces:
+  `req.reserved == 0 && req.reserved2 == 0` (forward-compat),
+  `req.cqn != 0 && (req.cqn & ~0xffffff) == 0` (24-bit FW cqn, 0
+  reserved sentinel). No `lkey/rkey`-style cross-check against a
+  core hint because there is no core `cqn_hint` (see ?7.3) -- cqn
+  identity travels only through the UHW payload.
+
+  **Bind helpers (S5 B3, pending).** Mirrors S4b's
+  `mlx5_ib_umem_restore_mr` / `mlx5_vfmig_bind_user_mr`. Handler
+  composes `mlx5_ib_umem_restore_cq` (KIND_CQ buffer) and
+  `mlx5_ib_db_map_user_restore` (KIND_DBR doorbell page) before
+  populating mmkey-equivalent state. Both wrappers call
+  `vfmig_iova_bind_user_object()` (Stage-3 D2) against the
+  placeholder records emitted by Stage-2 C8/C7 source retags.
+
+* **S5c: COMP_CHANNEL restore (deferred to event-mode milestone).**
+  Lives with S8 (RESTORE_ASYNC_EVENT) -- both share fd-table
+  reinstall plumbing. Lands when `ib_write_bw -e` becomes the active
+  goal (S10). The S5 dispatcher's hard-reject of the COMP_CHANNEL
+  attr means CRIU plugin policy at v0 can be "checkpoint only CQs
+  created without a comp channel" without ABI churn when S5c finally
+  lands.
+
+  Combined empirical chain table (S5b only; S5a uses
+  `cq_restore_probe_rxe` directly):
+
+  | step | what | landed | output |
+  |------|------|--------|--------|
+  | K6 | LOAD_VHCA_STATE preserves cqn high-water mark | yes (?10 #1) | PARTIAL PASS |
+  | B0 | PROBE_CQN raw QUERY_CQ post-LOAD | pending | byte-equal cqc |
+  | B4 | live verb path adopts cqn cleanly | pending | 8/8 subtests + Phase G |
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
   to RTR per ?6.3 option (b). Fini-pass transitions to RTS. **First
   passing `rdma_test_agent` round-trip on a restored ucontext --
@@ -2050,6 +2259,79 @@ Failure modes the probe distinguishes (mirrors ?9.4's PD list):
   `test_fw_id_continuity.sh K6` and `test_mr_adopt.sh` in
   isolation to pin the source.
 
+### 9.7 cq_restore_probe_rxe -- empirical S5a validation
+
+Lives at
+`tools/testing/mlx5_vfmig/uobject_restore/cq_restore/cq_restore_probe_rxe.c`.
+Runs on any host with `CONFIG_RDMA_RXE=m`, no privileged access
+required. Mirrors `pd_restore_probe_rxe`'s shape (no SAVE/LOAD
+round-trip, no FW-side verifier -- rxe has no FW; the probe's job is
+to lock in the dispatcher contract before mlx5 layers cqn-adoption
+on top in S5b).
+
+Six subtests against `rxe0`:
+
+1. **Gate (negative).** Open a ucontext WITHOUT
+   `RXE_ALLOC_UCTX_RESTORE_MODE`. Invoke `RESTORE_CQ` with
+   `target_handle = 0x4242, cqe = 64, comp_vector = 0,
+   user_handle = 0xDEADBEEF`. Expect `-EPERM` from the per-driver
+   `ucontext_is_restore_mode` predicate; the ufile idr must not be
+   touched.
+2. **Bad comp_vector.** On a restore-mode ucontext, invoke
+   `RESTORE_CQ` with `comp_vector = UINT_MAX` (out of range).
+   Expect `-EINVAL` from the dispatcher's `comp_vector >=
+   ib_dev->num_comp_vectors` guard. Validates the dispatcher
+   pre-checks before reaching the driver callback.
+3. **Happy path.** Invoke `RESTORE_CQ(target = 0x4242, cqe = 64,
+   comp_vector = 0, user_handle = 0xDEADBEEF, no comp_channel,
+   no event_fd)`. Expect success. Assert (a) `RESP_CQE` is
+   non-zero (rxe-internal cqe count after `rxe_cq_chk_attr`
+   normalization), (b) `INFO_HANDLES(UVERBS_OBJECT_CQ)` includes
+   `0x4242`, (c) NLDEV `RES_CQ_GET` reports
+   `RDMA_NLDEV_ATTR_RES_HANDLE = 0x4242` (cross-check with K8a
+   path; user-visible identity continuity).
+4. **Collision.** Re-invoke `RESTORE_CQ(target = 0x4242, ...)` on
+   the same restore-mode ucontext. Expect `-EBUSY` from
+   `xa_insert()` inside `rdma_alloc_begin_uobject_at_handle`.
+5. **COMP_CHANNEL rejected.** On the restore-mode ucontext,
+   first allocate a comp channel via the legacy
+   `IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL` write-cmd
+   (`ibv_create_comp_channel()` from libibverbs); pass the cc fd
+   as `UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL` on a
+   `RESTORE_CQ(target = 0x4243, ...)` call. Expect `-EOPNOTSUPP`
+   from the dispatcher's v0 forward-compat-reject guard. Locks in
+   the design choice that the comp channel attr is declared but
+   refused at v0; any future regression that silently accepts it
+   would surface here.
+6. **Destroy round-trip.** Invoke
+   `IB_USER_VERBS_CMD_DESTROY_CQ(handle = 0x4242)`. Expect
+   success (rxe `cq->num_wq` is 0 with no QPs attached) and that
+   `INFO_HANDLES` no longer returns `0x4242`. The S5a-on-rxe
+   half of the v0 dealloc-ordering invariant: rxe restored CQs
+   destroy cleanly because rxe has no FW graph and no kernel-side
+   children at v0. (mlx5 S5b's analogous subtest 8 will assert
+   the inverse -- BAD_RES_STATE -- because mlx5 FW does carry
+   cqn in QPCs as a tracked dep; ?10.8.)
+
+Failure modes the probe explicitly distinguishes (mirrors ?9.4 and
+?9.5):
+
+* `-EOPNOTSUPP` on a restore-mode ucontext for subtests 3 / 4 / 6
+  => `rxe_restore_cq` not registered in `rxe_dev_ops` (rxe ops
+  registration regression).
+* `-EPERM` on a restore-mode ucontext => `rxe_ucontext_is_restore_mode`
+  is misreading the bit or the rxe alloc-ucontext udata parse is
+  wrong.
+* Success on subtest 5 => the dispatcher's COMP_CHANNEL reject
+  guard is disabled -- security-adjacent (forward-compat policy
+  drift is the kind of bug that surfaces years later and is hard
+  to back out cleanly).
+* RESP_CQE absent on subtest 3 => the dispatcher is not setting
+  the OUT attr after the driver callback (UA_MANDATORY violation
+  would already have been caught by attr-bundle decode, so this
+  is the post-callback wire-up); see ?9.6's comparable note for
+  RESP_LKEY/RESP_RKEY on RESTORE_MR.
+
 ## 10. Open questions
 
 1. **K6 outcome**: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id
@@ -2123,38 +2405,64 @@ Failure modes the probe distinguishes (mirrors ?9.4's PD list):
    state + IP/GID resolution cache are above the uobject layer. v0
    preserves CM_ID identity but not the full CMA state. Application
    re-establishes on top. Follow-on if needed.
-8. **PD/MR dealloc semantics asymmetry under v0**:
-   **Discovered (2026-05-17) -- recorded, not blocking.**
-   `mr_restore_probe_mlx5_vfmig`'s subtest 8 empirically
-   established that `DESTROY_MKEY` on an orphan adopted mkey
-   *succeeds* on destination FW post-LOAD-VHCA-STATE, even with
-   the source's mkey-using QPs still alive in FW (which is
-   itself the case until S6 lands). The mechanism: in the FW
-   resource graph mkey is a *leaf* under PD; QPs reference an
-   mkey by its (lkey/rkey) wire value rather than as a tracked
-   FW resource dependency, so FW has nothing to refuse against.
+8. **Per-class dealloc semantics asymmetry under v0 -- the FW
+   resource-graph axis**:
+   **Discovered (2026-05-17) for PD/MR; extended (2026-05-20) for
+   CQ as S5 lands. Recorded, not blocking.**
 
-   This is asymmetric with PD (S3b ?9.1's "v0 dealloc-ordering
-   invariant"), where `DEALLOC_PD` on an orphan adopted PD
-   *fails* with BAD_RES_STATE because PD is a parent in the FW
-   graph and its CQ/QP/MR/SRQ children are still alive.
+   The axis is "is this resource a *parent* in the FW resource
+   graph (i.e. does FW track other resources as children that
+   reference it)?" Resources on the parent side block orphan
+   dealloc with BAD_RES_STATE until their children are gone;
+   resources on the leaf side dealloc cleanly even with
+   referencing siblings still alive.
 
-   Implication for CRIU's plugin policy: PDs get teardown
-   ordering enforced for free by FW (the kernel parks the
-   orphan uobj until all children are torn down). MRs do not;
-   the kernel will accept any DEREG_MR. The plugin must not
-   issue DEREG_MR on adopted MRs ahead of the user's intent.
+   | class | FW-graph role at v0 | orphan dealloc | how validated |
+   |-------|---------------------|----------------|---------------|
+   | PD | parent (CQ/QP/MR/SRQ children reference pdn) | rejected `BAD_RES_STATE` -> `-EINVAL` | `pd_restore_probe_mlx5_vfmig` subtest 7 |
+   | MR | leaf (QPs reference by wire (l/r)key, not tracked) | accepts `DESTROY_MKEY` -> 0 | `mr_restore_probe_mlx5_vfmig` subtest 8 |
+   | CQ | parent (QPCs reference cqn_snd/cqn_rcv as tracked dep; SRQ context too) | will reject `BAD_RES_STATE` -> `-EINVAL` until S6 drains the source's cqn-using QPs | S5b `cq_restore_probe_mlx5_vfmig` subtest 8 (pending) |
+
+   **MR side** (the original surprise): in the FW resource graph
+   mkey is a leaf under PD; QPs reference an mkey by its
+   (lkey/rkey) wire value rather than as a tracked FW resource
+   dependency, so FW has nothing to refuse against. Empirically
+   established by `mr_restore_probe_mlx5_vfmig`'s subtest 8.
+
+   **CQ side** (S5 prediction): cqn IS a tracked dep --
+   `qpc.cqn_snd`/`cqn_rcv` and SRQ context all carry cqn as a FW
+   reference. So the orphan adopted CQ behaves like an orphan
+   adopted PD: FW rejects until the source's cqn-using QPs/SRQs
+   are themselves drained, which doesn't happen until S6/S7. v0
+   dealloc-ordering invariant for CQ inherits the PD shape.
+   Locked in by S5b `cq_restore_probe_mlx5_vfmig`'s subtest 8
+   when it lands.
+
+   **rxe is uniformly on the leaf side** (no FW graph at all):
+   rxe `destroy_<class>` returns `-EINVAL` only when kernel-side
+   refcounts (e.g. `cq->num_wq`, `pd->usecnt`) are non-zero, and
+   at v0 those are zero for all restored objects since no QPs
+   exist yet. So rxe restored PDs/MRs/CQs all dealloc cleanly at
+   v0 -- the asymmetry is mlx5-specific.
+
+   Implication for CRIU's plugin policy: the plugin destroys in
+   reverse-creation order (AH -> QP -> SRQ -> CQ -> MR -> PD).
+   On mlx5 the FW enforces the parent classes (PD, CQ) for free;
+   the plugin must enforce ordering for the leaf classes (MR) on
+   its own since the kernel will accept any DEREG_MR. The
+   `beea656e494d` rdma_core gate for restore-mode ufiles
+   suppresses the cleanup-loop WARN that would otherwise fire on
+   end-of-process closure with parent classes still parked.
 
    This is *correct behaviour* on FW's part -- the asymmetry
-   reflects the actual FW resource model -- but it's worth
-   recording explicitly because it's the inverse of what the
-   PD case would lead one to expect, and it's now the
-   load-bearing assumption behind subtest 8's PASS criterion.
-   Anything that reverses it on a future FW (e.g. a hardening
-   change that adds mkey-as-tracked-dep to QP) would surface
-   as a subtest 8 regression and would also force a CRIU
-   plugin-policy revisit. CQ/QP/SRQ likely fall on one side or
-   the other of the same axis; revisit each as S5/S6/S7 land.
+   reflects the actual FW resource model. Anything that reverses
+   the MR row (e.g. a hardening change that adds mkey-as-
+   tracked-dep to QP) would surface as a subtest 8 regression;
+   anything that reverses the CQ row (FW dropping cqn from QPC
+   tracking) would surface as a subtest 8 regression at S5b.
+   QP/SRQ rows fill in with S6/S7 -- both expected on the parent
+   side (QPs are referenced by the source's CM_ID / QPC graph;
+   SRQs are referenced by QPCs).
 
 ## 11. Sequencing relative to other work
 
