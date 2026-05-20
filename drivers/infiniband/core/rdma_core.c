@@ -1038,8 +1038,27 @@ void uverbs_destroy_ufile_hw(struct ib_uverbs_file *ufile,
 	       !__uverbs_cleanup_ufile(ufile, reason)) {
 	}
 
-	if (WARN_ON(!list_empty(&ufile->uobjects)))
+	if (!list_empty(&ufile->uobjects)) {
+		struct ib_device *ib_dev = ufile->ucontext->device;
+
+		/*
+		 * A ucontext opened in vfmig restore mode (per
+		 * ib_device_ops.ucontext_is_restore_mode) is expected to
+		 * hold orphan adopted parent objects whose FW dependents
+		 * were replayed by LOAD_VHCA_STATE but whose kernel
+		 * uobjects have not been restored yet. The driver's
+		 * dealloc_<obj> path reflects FW BAD_RES_STATE back as
+		 * an errno, which is by design and not a kernel bug, so
+		 * the cleanup loop above can't drain those uobjects in
+		 * the normal RDMA_REMOVE_CLOSE/RDMA_REMOVE_DRIVER_REMOVE
+		 * pass. Skip the warning for that opted-in case and fall
+		 * straight to RDMA_REMOVE_DRIVER_FAILURE which clears the
+		 * list with obj->object = NULL.
+		 */
+		WARN_ON(!ib_dev->ops.ucontext_is_restore_mode ||
+			!ib_dev->ops.ucontext_is_restore_mode(ufile->ucontext));
 		__uverbs_cleanup_ufile(ufile, RDMA_REMOVE_DRIVER_FAILURE);
+	}
 	ufile_destroy_ucontext(ufile, reason);
 
 done:
