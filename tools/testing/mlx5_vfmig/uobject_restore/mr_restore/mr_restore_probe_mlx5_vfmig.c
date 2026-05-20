@@ -143,6 +143,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -675,7 +676,61 @@ struct mr_args {
 	uint32_t	src_access_flags;
 	uint32_t	mr_target_handle;
 	uint32_t	pd_target_handle;
+	/*
+	 * Destination-side anonymous mapping that backs the RESTORE_MR
+	 * call's addr/iova arguments. user_mr_dma Stage 3 D4
+	 * (7c496744b43b) made mlx5_ib_restore_mr() call
+	 * ib_umem_pin(current->mm, addr, length) -- the kernel needs a
+	 * valid mapping in the *probe's* mm at @addr to pin pages from,
+	 * whereas @a->src_addr is a userspace VA from the *source
+	 * probe's* mm and cannot be walked here.
+	 *
+	 * In a real CRIU restore this slot is populated by CRIU's mm
+	 * replay (the destination process mmaps the source's VA range
+	 * with MAP_FIXED and seeds the bytes from the checkpoint). The
+	 * probe is not a full CRIU restore, so we fake the mapping with
+	 * a fresh anonymous mmap and pass that VA instead -- the bytes
+	 * themselves don't matter for kernel-side validation (no WQE
+	 * data path; the data path is Stage 3 D5's Phase J on the CRIU
+	 * agent side). What matters is that ib_umem_pin succeeds and
+	 * the sg_table built from the pinned pages has total length ==
+	 * placeholder len so mlx5_vfmig_bind_user_mr's length check
+	 * accepts it.
+	 *
+	 * @local_addr is the mmap return value (page-aligned, length ==
+	 * src_length, anonymous PROT_READ|PROT_WRITE). @src_addr is
+	 * preserved for logging only and is NOT passed as an addr/iova
+	 * to any RESTORE_MR call after this point.
+	 */
+	uint64_t	local_addr;
 };
+
+/*
+ * Allocate @a->local_addr by anonymous mmap'ing a->src_length bytes
+ * at any address the kernel picks. Returns 0 on success, -errno on
+ * mmap failure. The mapping leaks at probe exit, which is fine for a
+ * test binary.
+ */
+static int mr_args_mmap_local(struct mr_args *a)
+{
+	void *p = mmap(NULL, (size_t)a->src_length,
+		       PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		int err = errno;
+		fprintf(stderr,
+			"mr_restore_mlx5: mmap(%zu) for local_addr: %s\n",
+			(size_t)a->src_length, strerror(err));
+		return -err;
+	}
+	a->local_addr = (uint64_t)(uintptr_t)p;
+	printf("mr_restore_mlx5: local_addr=0x%llx (anonymous mmap, %zu bytes)\n"
+	       "                 src_addr=0x%llx kept for identity logging only\n",
+	       (unsigned long long)a->local_addr,
+	       (size_t)a->src_length,
+	       (unsigned long long)a->src_addr);
+	return 0;
+}
 
 /*
  * Subtest 1: gate-negative.
@@ -726,7 +781,7 @@ static int subtest_gate_negative(const char *cdev_path,
 	}
 
 	ret = do_restore_mr(fd, a->mr_target_handle, throwaway_pd_handle,
-			    a->src_addr, a->src_length, a->src_addr,
+			    a->local_addr, a->src_length, a->local_addr,
 			    a->src_access_flags, a->src_lkey, a->src_lkey,
 			    &uhw, &resp);
 	if (ret == -EPERM) {
@@ -758,7 +813,7 @@ static int expect_restore_mr_errno(int fd, const struct mr_args *a,
 {
 	struct restore_mr_response resp = {};
 	int ret = do_restore_mr(fd, a->mr_target_handle, a->pd_target_handle,
-				a->src_addr, a->src_length, a->src_addr,
+				a->local_addr, a->src_length, a->local_addr,
 				a->src_access_flags, lkey_hint, rkey_hint,
 				uhw, &resp);
 	if (ret == want_errno) {
@@ -873,7 +928,7 @@ static int subtest_happy_path(int fd, const struct mr_args *a)
 	       a->src_lkey);
 
 	ret = do_restore_mr(fd, a->mr_target_handle, a->pd_target_handle,
-			    a->src_addr, a->src_length, a->src_addr,
+			    a->local_addr, a->src_length, a->local_addr,
 			    a->src_access_flags, a->src_lkey, a->src_lkey,
 			    &uhw, &resp);
 	if (ret) {
@@ -928,7 +983,7 @@ static int subtest_collision(int fd, const struct mr_args *a)
 	       a->mr_target_handle);
 
 	ret = do_restore_mr(fd, a->mr_target_handle, a->pd_target_handle,
-			    a->src_addr, a->src_length, a->src_addr,
+			    a->local_addr, a->src_length, a->local_addr,
 			    a->src_access_flags, a->src_lkey, a->src_lkey,
 			    &uhw, &resp);
 	if (ret == -EBUSY) {
@@ -1127,6 +1182,18 @@ int main(int argc, char **argv)
 	       ibdev, cdev_path, a.src_pdn, a.src_mkey_index, a.src_lkey,
 	       (unsigned long long)a.src_addr, (unsigned long long)a.src_length,
 	       a.src_access_flags, a.mr_target_handle, a.pd_target_handle);
+
+	/*
+	 * Allocate the destination-side anonymous mapping that backs
+	 * the addr/iova arguments to every RESTORE_MR call below. See
+	 * the docstring on @local_addr in struct mr_args -- the kernel
+	 * (post-Stage-3 D4) calls ib_umem_pin(current->mm, addr,
+	 * length) inside mlx5_ib_restore_mr, so without this mapping
+	 * the happy-path subtest fails -EFAULT on
+	 * pin_user_pages_fast().
+	 */
+	if (mr_args_mmap_local(&a) != 0)
+		return 2;
 
 	/* Subtest 1 uses its own short-lived non-restore-mode ucontext. */
 	fails += subtest_gate_negative(cdev_path, &a);
