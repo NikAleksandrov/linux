@@ -995,6 +995,15 @@ void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom)
 		 dom->vf_id);
 }
 
+void vfmig_iova_domain_detach_dev_if_unbound(struct vfmig_iova_domain *dom)
+{
+	if (!dom || dom->dev_detached || !dom->vf_pdev)
+		return;
+	if (dom->vf_pdev->driver)
+		return;
+	vfmig_iova_domain_detach_dev(dom);
+}
+
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 {
 	struct vfmig_iova_page *p, *tmp;

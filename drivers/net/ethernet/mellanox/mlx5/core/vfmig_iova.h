@@ -528,6 +528,16 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
 void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom);
 
 /*
+ * Like vfmig_iova_domain_detach_dev(), but only acts when @dom's VF
+ * pci_dev currently has no driver bound (vf_pdev->driver == NULL).
+ * No-op otherwise. Lets the PF-side teardown sweep over every domain
+ * before pci_disable_sriov() runs without racing the still-active FW
+ * DMA on driver-bound VFs (those detach via the existing remove_one()
+ * tail hook, after mlx5_pci_close() drains the cmd ring + EQs).
+ */
+void vfmig_iova_domain_detach_dev_if_unbound(struct vfmig_iova_domain *dom);
+
+/*
  * Lookup-or-allocate a deterministic DMA-coherent region in @dom from
  * the IOVA sub-window owned by @slot.
  *
@@ -1080,6 +1090,7 @@ static inline int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 }
 static inline void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom) { }
 static inline void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom) { }
+static inline void vfmig_iova_domain_detach_dev_if_unbound(struct vfmig_iova_domain *dom) { }
 static inline int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 					enum vfmig_iova_slot slot,
 					u64 instance_key,

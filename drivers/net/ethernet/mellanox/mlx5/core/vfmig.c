@@ -5123,6 +5123,88 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
 }
 
 /*
+ * Detach the iommu_domain side of every vfs_ctx[].vfmig_iova_dom that
+ * belongs to a *driverless* VF, without freeing the domain struct.
+ *
+ * Why this exists: the VF's per-VF unmanaged paging domain is normally
+ * detached from its pci_dev by mlx5_core's remove_one() at the tail of
+ * device_release_driver(), well before pci_disable_sriov() reaches the
+ * device_del() that fires the iommu bus notifier. That hook only runs
+ * for *driver-bound* VFs, though. A VF that was made tracked +
+ * migratable but never bound to mlx5_core (e.g. the destination VF in
+ * a checkpoint/restore measurement, where the user-mode RESTORE_X
+ * verbs are intentionally invoked before driver bind) would otherwise
+ * keep its iommu_dom attached all the way into pci_disable_sriov(),
+ * and the iommu core's BUS_NOTIFY_REMOVED_DEVICE notifier would WARN
+ * at drivers/iommu/iommu.c:715 (group->domain != group->default_domain
+ * with no driver to "own" the override).
+ *
+ * Calling iommu_detach_device() on a driver-bound VF here would race
+ * its still-active FW DMA (mlx5_pci_close() hasn't drained the cmd
+ * ring + EQs yet at this point in the teardown), so we explicitly
+ * skip those: vf_pdev->driver != NULL means the VF is bound and the
+ * existing remove_one() hook will do the right thing once
+ * pci_disable_sriov() walks it.
+ *
+ * vfmig_iova_domain_detach_dev() sets @dev_detached, so the later
+ * vfmig_pf_drop_iova_domains_locked() -> vfmig_iova_domain_destroy()
+ * skips the redundant iommu_detach and proceeds straight to
+ * iommu_domain_free() + kfree.
+ *
+ * Caller-side locking matches drop_iova_domains_locked: vfmig->lock is
+ * held by the caller; we take ctxs_lock to read each
+ * vfs_ctx[].vfmig_iova_dom, then drop ctxs_lock to do the actual
+ * detach (which can sleep / take iommu group locks). We do NOT splice
+ * the dom out -- the existing drop helper still owns the free path.
+ */
+static void
+vfmig_pf_detach_unbound_iova_domains_locked(struct mlx5_vfmig_pf *vfmig)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	int total_vfs;
+	int i;
+
+	if (!pf_mdev)
+		return;
+	sriov = &pf_mdev->priv.sriov;
+	if (!sriov->vfs_ctx)
+		return;
+
+	total_vfs = sriov->num_vfs;
+	mutex_lock(&vfmig->ctxs_lock);
+	for (i = 0; i < total_vfs; i++) {
+		struct vfmig_iova_domain *dom =
+			sriov->vfs_ctx[i].vfmig_iova_dom;
+
+		if (!dom)
+			continue;
+		mutex_unlock(&vfmig->ctxs_lock);
+		vfmig_iova_domain_detach_dev_if_unbound(dom);
+		mutex_lock(&vfmig->ctxs_lock);
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
+}
+
+void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev)
+{
+	struct mlx5_vfmig_pf *vfmig;
+
+	if (!pf_mdev || !mlx5_core_is_pf(pf_mdev))
+		return;
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig)
+		return;
+
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_pf_detach_unbound_iova_domains_locked(vfmig);
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+}
+
+/*
  * Drop any per-VF deterministic IOVA domains. Mirror image of
  * vfmig_pf_drop_pending_loads_locked() but for vfs_ctx[].vfmig_iova_dom.
  *

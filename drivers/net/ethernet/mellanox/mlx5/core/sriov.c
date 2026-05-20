@@ -237,7 +237,24 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	 * iommu_detach_device() short-circuits when the device has no
 	 * group. The pci_dev itself stays alive because we hold a ref
 	 * via pci_dev_get() in vfmig_iova_domain_create().
+	 *
+	 * Before pci_disable_sriov() runs we additionally detach the
+	 * iommu_dom from any *driverless* VF that has a vfmig_iova_dom
+	 * attached. Driver-bound VFs detach their own iommu_dom from
+	 * mlx5_core's remove_one() tail (after mlx5_pci_close drains FW
+	 * DMA), but tracked VFs that were never bound -- the canonical
+	 * destination-VF case during checkpoint/restore measurement --
+	 * have no remove_one() call, so without an explicit pre-detach
+	 * here the iommu core's BUS_NOTIFY_REMOVED_DEVICE notifier WARNs
+	 * at drivers/iommu/iommu.c:715 when device_del() runs.
+	 *
+	 * The pre-detach is gated on vf_pdev->driver == NULL specifically
+	 * so it does NOT race a bound VF's still-active FW DMA: bound
+	 * VFs go through the existing remove_one() path during
+	 * pci_disable_sriov(), where mlx5_pci_close() has already drained
+	 * the cmd ring + EQs by the time iommu_detach_device() runs.
 	 */
+	mlx5_vfmig_pf_detach_unbound_iova_domains(dev);
 	pci_disable_sriov(pdev);
 	mlx5_vfmig_pf_drop_iova_domains(dev);
 	devl_lock(devlink);

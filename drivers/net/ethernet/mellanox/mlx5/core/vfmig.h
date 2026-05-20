@@ -109,6 +109,29 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * PF-side helper: detach the iommu_dom + dma_ops shim from every
+ * vfs_ctx[].vfmig_iova_dom whose VF is not currently bound to a
+ * driver, without freeing the domain struct itself. Counterpart to
+ * the VF-side mlx5_vfmig_vf_detach_iova_domain() hook, covering the
+ * gap when a tracked VF was made migratable but never driver-bound
+ * (e.g. the destination VF in a checkpoint/restore measurement that
+ * issues user-mode RESTORE_X verbs against the PF cdev before bind).
+ *
+ * Intended call site is mlx5_sriov_disable() *before*
+ * pci_disable_sriov(): we need the iommu_dom gone before the PCI core
+ * fires BUS_NOTIFY_REMOVED_DEVICE, otherwise the iommu core WARNs at
+ * drivers/iommu/iommu.c:715 because the per-VF iommu_group still
+ * holds our unmanaged paging domain. Driver-bound VFs are left alone
+ * here -- their detach happens at remove_one() tail, after
+ * mlx5_pci_close() has drained any in-flight FW DMA. The domain
+ * structs are freed later by mlx5_vfmig_pf_drop_iova_domains() once
+ * pci_disable_sriov() has returned.
+ *
+ * Safe to call when there is no vfmig PF context yet (no-op).
+ */
+void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev);
+
+/*
  * VF-side helper: detach this VF's vfmig_iova_dom from its PCI device
  * (iommu_dom + dma_ops shim) without freeing the domain struct itself.
  * Idempotent; no-op on PFs, untracked VFs, and orphaned VFs whose PF
@@ -269,6 +292,7 @@ static inline int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev) { return 0;
 static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev) { }
+static inline void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_vf_detach_iova_domain(struct mlx5_core_dev *vf_mdev) { }
 static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev,
 						  u16 *vhca_id_out)
