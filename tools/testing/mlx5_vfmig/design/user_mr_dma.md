@@ -15,14 +15,18 @@
 >   `tools/testing/mlx5_vfmig/save_load/user_object_replay/test_user_object_replay.sh`
 >   FULL PASS verdict (`MR=4 CQ=1 QP=1 SRQ=1 DBR=1 total=8`).
 > * **Stage 3 — in this design revision; not yet implemented.**
->   Reshaped from the original sketches after `uobject_restore.md`
->   landed `UVERBS_OBJECT_RESTORE` / `mlx5_ib_restore_mr` (S4b) as a
->   kernel-only verb that adopts the FW mkey without userspace
->   re-registration. The original cursor-based stage-3 sketch
->   (preserved in §A.G) assumed userspace `ibv_reg_mr` drove the
->   destination's restoration; that trigger is gone in v0. Revised
->   stage 3 consumes stage 2's `awaiting_bind` placeholders via a
->   kernel-verb trigger — see §7.
+>   Reshaped twice. First reshape (2026-05-18, preserved in §A.G)
+>   replaced the original cursor-based sketch with a per-task hint
+>   trigger after `uobject_restore.md` landed `UVERBS_OBJECT_RESTORE`
+>   / `mlx5_ib_restore_mr` (S4b). Second reshape (this revision,
+>   2026-05-19) dropped the per-task hint in favour of an
+>   `ib_umem_pin` IB-core primitive + a driver-side
+>   `mlx5_ib_umem_restore` wrapper. No `task_struct` extension, no
+>   side-channel between the verb handler and `vfmig_dma_ops.map_sg`;
+>   the bind is an explicit, type-safe call from
+>   `mlx5_ib_restore_X` to the vfmig binding primitive. See §7 for
+>   the current design; §A.C for the implementation sketch; §A.G for
+>   both superseded approaches.
 > * **Stage 4 — forward-compat sketch only (§8).** IOVA recycling for
 >   `VFMIG_SLOT_USER_PAGE`; not on the critical path for end-to-end
 >   data-path continuity.
@@ -104,7 +108,7 @@ format + LOAD-side placeholder installation + source-side retag).
 Stage 3 is the kernel-verb-driven binder that consumes stage 2's
 placeholders. They must land together because stage 2's
 `awaiting_bind` entries are write-only state until stage 3's
-hint-aware `.map_sg` reads them.
+binder reads them.
 
 **What stage 2 delivers (§6).** A new `HOST_USER_PAGE` wire record
 carries `(kind, fw_id, iova, length)` per source-side user uobject.
@@ -115,15 +119,20 @@ pages don't exist yet (CRIU restores the user process *after* LOAD).
 Source-side retag at every user-uobject creation site rewrites the
 auto-numbered `instance_key` with `VFMIG_HUOBJ_KEY(kind, fw_id)`.
 
-**What stage 3 delivers (§7).** Each `RESTORE_X` verb sets a per-task
-hint `current->vfmig_bind_hint = {kind, fw_id}` immediately before
-calling `ib_umem_get`. The hint-aware path inside
-`vfmig_dma_ops.map_sg` looks up the matching `awaiting_bind` entry
-by `(kind, fw_id)`, calls `iommu_map` PAGE_SIZE-at-a-time across the
-freshly-pinned destination phys pages at the source IOVAs, clears
-`awaiting_bind`, populates `sg_dma_address(sg)`. Hint is one-shot.
-Dereg flows symmetrically through the existing
-`vfmig_dma_ops.unmap_sg` path — no special cases.
+**What stage 3 delivers (§7).** Each `RESTORE_X` verb constructs
+its umem via a new `mlx5_ib_umem_restore(dev, kind, fw_id, addr,
+size, access)` driver helper instead of `ib_umem_get`. The helper
+composes two pieces: (i) a new IB-core primitive `ib_umem_pin` that
+pins user pages and builds the sgtable without calling
+`dma_map_sgtable`; (ii) a new vfmig primitive
+`vfmig_iova_bind_user_object(dom, kind, fw_id, sgt)` that looks up
+the matching `awaiting_bind` placeholder by `(kind, fw_id)`,
+`iommu_map`s the freshly-pinned phys pages PAGE_SIZE-at-a-time at
+the source IOVAs, populates `sg_dma_address(sg)`, clears
+`awaiting_bind`. `vfmig_dma_ops.map_sg` is untouched — the bind
+path never goes through the DMA shim. Dereg flows symmetrically
+through the existing `vfmig_dma_ops.unmap_sg` path — no special
+cases.
 
 **Generality.** The same mechanism covers MR, CQ, QP, SRQ, and
 shared DBR (doorbell record) pages. DBRs are sub-keyed under their
@@ -422,13 +431,17 @@ Lifecycle:
     `(kind, fw_id)` table for stage 3 lookup.
   * Entry has no `iommu_map` installed yet (`page` is NULL, no phys
     to map). The IOVA reservation exists in the registry only as
-    metadata for stage 3's hint-aware `.map_sg` to consume.
-  * Destination consumption: stage 3's `RESTORE_X` verb sets the
-    per-task hint, calls `ib_umem_get`, and our `.map_sg` looks up
-    the entry by `(kind, fw_id)`, iterates PAGE_SIZE-at-a-time over
-    the freshly-pinned phys pages calling
-    `iommu_map(dom, source_iova_offset, dst_phys, PAGE_SIZE, prot)`,
-    clears `awaiting_bind`. Full pseudo-code in §A.C.
+    metadata for stage 3's binder to consume.
+  * Destination consumption: stage 3's `RESTORE_X` verb constructs
+    its umem via `mlx5_ib_umem_restore(dev, kind, fw_id, ...)`,
+    which calls `ib_umem_pin` to pin user pages + build the sgtable
+    (no `dma_map_sgtable`), then calls
+    `vfmig_iova_bind_user_object(dom, kind, fw_id, sgt)`, which
+    looks the entry up by `(kind, fw_id)` in the C1 rb_tree,
+    iterates PAGE_SIZE-at-a-time over the freshly-pinned phys pages
+    calling `iommu_map(dom, source_iova_offset, dst_phys, PAGE_SIZE,
+    prot)`, populates `sg_dma_address` per sg, clears
+    `awaiting_bind`. Full implementation sketch in §A.C.
 * When `external == false` (kernel slots):
   * Existing `vfmig_iova_install_page_locked` continues to be the
     creator. Behaviour unchanged from before this work.
@@ -591,10 +604,10 @@ Stage 2 documented expectation: `dest_rkey != source_rkey` *(still
 not equal)*. Stage 2 ships only identity infrastructure --
 `HOST_USER_PAGE` records on the wire and pre-installed
 `awaiting_bind` entries on the destination -- but no consumer of
-those entries without stage 3's hint-aware binder. Stage 2's
-observable signal is **count match** between source emissions and
-destination installations (the `MLX5_VFMIG_IOC_QUERY_AWAITING_BIND`
-ioctl, see §6.4), not rkey continuity.
+those entries without stage 3's binder. Stage 2's observable
+signal is **count match** between source emissions and destination
+installations (the `MLX5_VFMIG_IOC_QUERY_AWAITING_BIND` ioctl, see
+§6.4), not rkey continuity.
 
 Stage 3 documented expectation under fresh `ibv_reg_mr` (this test):
 `dest_rkey != source_rkey` *(still not equal -- stage 3 doesn't
@@ -630,8 +643,9 @@ that pre-installs `awaiting_bind=true` entries; stage 2's signal is
 `MLX5_VFMIG_IOC_QUERY_AWAITING_BIND`, §6.4), not the counter -- no
 consumer of `awaiting_bind` entries exists at stage 2.
 
-Stage 3 lands the consumer (the hint-aware `vfmig_dma_ops.map_sg`
-path). Per `RESTORE_X` verb invocation, the counter increments by
+Stage 3 lands the consumer (the new `vfmig_iova_bind_user_object`
+primitive, invoked from `mlx5_ib_umem_restore` -- see §7.2 / §A.C).
+Per `RESTORE_X` verb invocation, the counter increments by
 `ib_umem_num_dma_blocks(umem)`. Post-SAVE/LOAD/`RESTORE_X` cycle, the
 diagnostic `vfmig_user_mr: awaiting_bind_hits=K` reports K equal to
 the total DMA-block count across all restored uobjects. Used as a
@@ -796,12 +810,12 @@ under `sriov_numvfs=0`), then suppression once the branch is known.
 ## 7. Stage 3 design: kernel-verb-driven IOMMU binding
 
 Stage 3 introduces the consumer of stage 2's pre-installed
-`awaiting_bind` entries. The consumer is a per-task hint that
-switches `vfmig_dma_ops.map_sg` between two behaviours: hint-unset
-→ existing stage-1 cursor-allocate path (fresh registrations);
-hint-set → hint-aware binder path (restored uobjects). Symmetric
-dereg through existing `vfmig_dma_ops.unmap_sg` works without
-changes.
+`awaiting_bind` entries. The consumer is an **explicit kernel-side
+call chain** from `mlx5_ib_restore_X` (the restore verb body)
+through a new driver helper `mlx5_ib_umem_restore` to a new vfmig
+primitive `vfmig_iova_bind_user_object`. No side-channel storage,
+no DMA-shim conditional branch, no `task_struct` extension. The
+fresh-registration path is untouched.
 
 ### 7.1 What stage 3 delivers
 
@@ -814,52 +828,99 @@ IOMMU resolves to dst phys → DMA succeeds.
 
 This closes the data-path gap recorded as `uobject_restore.md` §10.9.
 
-### 7.2 Per-task hint mechanism
+### 7.2 Binding mechanism: `ib_umem_pin` + driver wrapper
+
+The mechanism has three layers; each is a normal function call with
+typed arguments. Nothing is set on `current`. The new pieces are:
+
+**(a) IB-core primitive `ib_umem_pin`** -- a refactor of the existing
+`ib_umem_get` in `drivers/infiniband/core/umem.c`. `ib_umem_pin`
+does steps 1-5 of today's `ib_umem_get` (validate args, allocate
+`ib_umem`, pin user pages via `pin_user_pages_fast`, build the
+sgtable via `sg_alloc_append_table_from_pages`) and **stops before
+`dma_map_sgtable`**. The returned umem has `sg_page(sg)` populated
+per sg, but `sg_dma_address(sg)` / `sg_dma_len(sg)` are zero. The
+caller is responsible for either populating them via a
+driver-specific binder before first DMA, or calling `ib_umem_release`
+to roll the pins back. `ib_umem_get` itself becomes a thin wrapper
+around `ib_umem_pin` + `ib_dma_map_sgtable_attrs`; no behaviour
+change for existing callers.
+
+**(b) vfmig primitive `vfmig_iova_bind_user_object`** -- new
+`drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c` entry point:
 
 ```c
-struct vfmig_bind_hint {
-    u8  kind;           /* VFMIG_HUOBJ_KIND_{MR,CQ,QP,SRQ,DBR} */
-    u8  reserved[7];
-    u64 fw_id;          /* mkey_index | cqn | qpn | srqn | dbr_user_va */
-};
-
-/* Stored in task_struct (or thread_info on architectures that have
- * one). Default-zero; nonzero kind means "binder mode". Cleared by
- * vfmig_dma_ops.map_sg on first consumption. */
+int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
+                                u8 kind, u64 fw_id,
+                                struct sg_table *sgt);
 ```
 
-The hint is a **trigger**, not a payload. When set, it tells
-`.map_sg` "the umem you're about to map is for a restored uobject
-identified by `(kind, fw_id)` -- look up the awaiting_bind chain for
-it and bind sg pages there instead of allocating fresh IOVAs from
-the slot cursor." Full pseudo-code for the hint-aware `.map_sg` is
-in §A.C.
+Under `dom->lock`, looks up the placeholder by `instance_key =
+VFMIG_HUOBJ_KEY(kind, fw_id)` via the C1 rb_tree. If the entry is
+missing → `-ENOENT` (hard fail). If the entry has `awaiting_bind ==
+false` → `-EBUSY` (hard fail: double-bind). Otherwise: walks the
+sgtable at PAGE_SIZE granularity, `iommu_map`s each phys chunk at
+the corresponding source-IOVA offset within the placeholder's range,
+writes `sg_dma_address(sg)` / `sg_dma_len(sg)` per sg as it goes,
+clears `awaiting_bind`. On any partial-bind failure, rolls back the
+`iommu_map`s already issued and leaves `awaiting_bind = true` for
+retry/diagnosis.
 
-The hint is **one-shot**: cleared by `.map_sg` after consumption.
-This rules out cross-talk where a single `RESTORE_X` verb's hint
-incorrectly affects a subsequent unrelated `dma_map_sgtable` call
-on the same task. Cross-talk hazards and mitigations enumerated in
-§A.H.
+PAGE_SIZE granularity matters because src and dst phys layouts can
+differ -- src might have one 1 MiB hugepage compounded into one sg
+segment, dst might have 256 × 4 KiB pages with 256 sg segments. The
+IOMMU just needs `iommu_map(iova, phys, PAGE_SIZE)` calls covering
+the right total range; per-uobject granularity at the wire level +
+PAGE_SIZE iteration at the bind site is the right combination.
+
+**(c) Driver wrapper `mlx5_ib_umem_restore`** -- new helper in
+`drivers/infiniband/hw/mlx5/`:
+
+```c
+struct ib_umem *mlx5_ib_umem_restore(struct mlx5_ib_dev *dev,
+                                     enum vfmig_huobj_kind kind,
+                                     u64 fw_id,
+                                     unsigned long addr,
+                                     size_t size, int access);
+```
+
+Composes (a) and (b): `ib_umem_pin` → on success,
+`vfmig_iova_bind_user_object` → on success returns the populated
+umem; on either failure, releases the umem and propagates the
+errno. Each kind has its own typed callsite (no opaque blob in core);
+the wrapper itself is the type-safe container of `(struct
+mlx5_ib_dev *, enum vfmig_huobj_kind, u64 fw_id)`. Full
+implementation sketch in §A.C.
+
+Rationale for choosing this shape over a per-task hint (which was
+the prior revision, preserved in §A.G): see §A.H risks 1, 3, 4 in
+the prior revision -- all three (hint cross-talk between
+`vfmig_set_bind_hint` and the intended `ib_umem_get`, verb-error
+leaves hint set, kernel-thread-deferred `dma_map_sgtable`) are
+structurally impossible with `ib_umem_pin` because the binding is an
+explicit synchronous call from the verb body, not a side channel.
 
 ### 7.3 Per-uobject application
 
-Each `RESTORE_X` verb sets the hint immediately before calling
-`ib_umem_get` for its corresponding umem. Concretely:
+Each `RESTORE_X` verb calls `mlx5_ib_umem_restore` directly, passing
+the kind and FW id from its UAPI input. No "set hint" / "clear hint"
+dance:
 
-* **`mlx5_ib_restore_mr`**: hint = `(KIND_MR, mkey_index)` before
-  `ib_umem_get(addr, length, access)` for the MR's user buffer.
-  Replaces the current `mr->umem = NULL` stub.
-* **`mlx5_ib_restore_cq`** (S5, future): hint = `(KIND_CQ, cqn)`
-  before `ib_umem_get` for the CQE buffer; then hint =
-  `(KIND_DBR, dbr_user_va)` before `mlx5_ib_db_map_user`.
+* **`mlx5_ib_restore_mr`**: replaces today's `mr->umem = NULL` stub
+  with
+  `mr->umem = mlx5_ib_umem_restore(dev, KIND_MR, mkey_index, addr,
+  length, access)`. Returns the umem error directly on failure.
+* **`mlx5_ib_restore_cq`** (S5, future):
+  `cq->buf.umem = mlx5_ib_umem_restore(dev, KIND_CQ, cqn, cqe_buf_addr,
+  cqe_buf_len, access)`; DBR handled via a new
+  `mlx5_ib_db_map_user_restore` wrapper, see §A.E.
 * **`mlx5_ib_restore_qp`** (S6, future): analogous with `qpn`.
 * **`mlx5_ib_restore_srq`** (S7, future): analogous with `srqn`.
-* **DBR pages**: handled inside the parent verbs via the second
-  hint. `mlx5_ib_db_map_user`'s existing dedup short-circuits the
-  `ib_umem_get` call when a previously-restored parent has already
-  bound the DBR page at the same user VA -- in which case the hint
-  is *not* consumed, and the verb explicitly clears it before
-  returning. See §A.E for the full DBR walkthrough.
+* **DBR pages**: `mlx5_ib_db_map_user`'s existing dedup is preserved
+  by a parallel restore-time entrypoint that, on cache miss, calls
+  `mlx5_ib_umem_restore(dev, KIND_DBR, user_va & PAGE_MASK, ...)`
+  for the single-page DBR umem; on cache hit, refcount++ as today.
+  No hint dance, no clear-on-error. Full walkthrough in §A.E.
 
 ### 7.4 Symmetric dereg
 
@@ -869,10 +930,15 @@ dispatches to `vfmig_dma_ops.unmap_sg`, which walks
 `sg_dma_address` per sg, looks each up in the registry, and calls
 `vfmig_iova_user_page_unmap_phys` (existing stage-1 helper) to
 `iommu_unmap` and remove the entry. **Same code path as
-fresh-registration's unmap.** The asymmetry between bind-via-hint
-and unbind-via-iova is deliberate: dereg has the IOVA in
-`sg_dma_address` and doesn't need a hint to find the registry
-entry.
+fresh-registration's unmap.** This works because
+`vfmig_iova_bind_user_object` populates `sg_dma_address` to
+USER_PAGE-slot IOVAs that the registry recognizes; the
+`is_external`-entry invariant in `vfmig_iova_user_page_unmap_phys`
+is satisfied by both fresh and restored entries (both have
+`external = true`). The asymmetry between bind-via-explicit-call and
+unbind-via-iova is deliberate: dereg has the IOVA in
+`sg_dma_address` and doesn't need any out-of-band info to find the
+registry entry.
 
 ### 7.5 Stage 3 success criterion: Phase J data-path subtest
 
@@ -1004,11 +1070,19 @@ nothing in stage 1 prevents future support:
   by the SAVE walker), and so would not appear as `awaiting_bind`
   entries on the destination. Validating dma-buf MR continuity is a
   follow-on once a workload needs it.
-* **Hint cross-talk hazard.** Per-task `vfmig_bind_hint` is
-  vulnerable to a `dma_map_sgtable` call between hint-set and the
-  intended `ib_umem_get`. Mitigated by one-shot semantics + WARN if
-  `.map_sg` consumes a hint whose IOVA-range size doesn't match the
-  awaiting_bind chain's recorded length. Full enumeration in §A.H.
+* **Stage 3 mechanism choice.** The prior revision used a per-task
+  `vfmig_bind_hint` as the verb-handler→`.map_sg` side channel; the
+  current revision uses an explicit `ib_umem_pin` IB-core primitive
+  + a driver-side `mlx5_ib_umem_restore` wrapper that calls
+  `vfmig_iova_bind_user_object` directly. The hint cross-talk
+  hazard (5 risks enumerated in §A.H of the prior revision) is
+  structurally impossible in the current shape -- there's no
+  side-channel. Open: validate at D2 time that the
+  `vfmig_iova_user_page_unmap_phys` `is_external`-entry invariant
+  is satisfied by placeholders bound through
+  `vfmig_iova_bind_user_object` exactly as for stage-1
+  cursor-allocated entries (it should be -- both set `external =
+  true` -- but worth confirming).
 * **Stage 4 trigger.** When do we land it? Exhaustion has to be
   observed once on a real workload; until then, it's tempting to
   defer indefinitely. Suggest tracking max watermark of cursor
@@ -1027,9 +1101,13 @@ invariant that requires the VF unbound at destroy.)
 * `include/linux/iommu-dma.h:13` -- `use_dma_iommu` -> `dev->dma_iommu`.
 * `drivers/iommu/dma-iommu.c:2107` -- `iommu_setup_dma_ops` is the
   only writer of `dev->dma_iommu`.
-* `drivers/infiniband/core/umem.c:164` -- `ib_umem_get`.
+* `drivers/infiniband/core/umem.c:164` -- `ib_umem_get`. Stage 3 D1
+  factors lines 178-255 (pin + sgtable build) into a new
+  `ib_umem_pin` helper; `ib_umem_get` then becomes a thin wrapper
+  around `ib_umem_pin` + `ib_dma_map_sgtable_attrs` (see §A.C).
 * `drivers/infiniband/core/umem.c:260` -- `ib_dma_map_sgtable_attrs`
-  call site inside `ib_umem_get`.
+  call site inside `ib_umem_get`. Stage 3 D1 moves this to the
+  `ib_umem_get` wrapper, after `ib_umem_pin` returns.
 * `drivers/infiniband/hw/mlx5/mr.c:1578` -- `mlx5_ib_reg_user_mr`.
 * `drivers/infiniband/hw/mlx5/main.c` -- `mlx5_ib_restore_mr` (S4b),
   the kernel verb stages 2+3 hang off.
@@ -1164,100 +1242,185 @@ branch (the new-allocation path). Hit branch (refcount-up on existing
 `mlx5_ib_user_db_page`) does nothing -- entry is already retagged
 from the first miss.
 
-### A.C Hint mechanism implementation
+### A.C Binding mechanism implementation
+
+**Step 1: IB-core refactor.** `drivers/infiniband/core/umem.c`
+factors `ib_umem_get` into a head + tail:
 
 ```c
-/* include/linux/sched.h or per-arch thread_info.h */
-struct task_struct {
-    ...
-    struct vfmig_bind_hint vfmig_bind_hint;  /* {kind, fw_id} */
-    ...
-};
-/* Default-zero. Nonzero kind means binder mode. */
-```
+/**
+ * ib_umem_pin - Pin userspace memory and build sgtable; no DMA mapping.
+ *
+ * Like ib_umem_get(), but skips ib_dma_map_sgtable_attrs(). The
+ * returned umem has sg_page() populated for each sgl entry, but
+ * sg_dma_address() and sg_dma_len() are unpopulated. The caller MUST
+ * populate them (via a driver-specific bind helper) before the umem
+ * can serve DMA, or call ib_umem_release() to roll back the pins.
+ */
+struct ib_umem *ib_umem_pin(struct ib_device *device, unsigned long addr,
+                            size_t size, int access);
+EXPORT_SYMBOL(ib_umem_pin);
 
-Setter helpers (used by RESTORE_X verbs):
-
-```c
-static inline void vfmig_set_bind_hint(u8 kind, u64 fw_id) {
-    current->vfmig_bind_hint.kind  = kind;
-    current->vfmig_bind_hint.fw_id = fw_id;
-}
-
-static inline void vfmig_clear_bind_hint(void) {
-    current->vfmig_bind_hint = (struct vfmig_bind_hint){0};
-}
-```
-
-Hint-aware `.map_sg`:
-
-```c
-int vfmig_dma_map_sg(struct device *dev, struct scatterlist *sg,
-                     int nents, enum dma_data_direction dir,
-                     unsigned long attrs)
+struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
+                            size_t size, int access)
 {
-    struct vfmig_iova_domain *dom = ...;
-    struct vfmig_bind_hint hint = current->vfmig_bind_hint;
-    int err;
+    struct ib_umem *umem;
+    unsigned long dma_attr = (access & IB_ACCESS_RELAXED_ORDERING)
+                             ? DMA_ATTR_WEAK_ORDERING : 0;
+    int ret;
 
-    if (hint.kind != 0) {
-        /* Binder mode: consume hint, look up awaiting_bind entry,
-         * iommu_map at source IOVAs PAGE_SIZE-at-a-time. */
-        struct vfmig_iova_page *entry;
+    umem = ib_umem_pin(device, addr, size, access);
+    if (IS_ERR(umem))
+        return umem;
 
-        vfmig_clear_bind_hint();  /* one-shot */
+    ret = ib_dma_map_sgtable_attrs(device, &umem->sgt_append.sgt,
+                                   DMA_BIDIRECTIONAL, dma_attr);
+    if (ret) {
+        ib_umem_release(umem);
+        return ERR_PTR(ret);
+    }
+    return umem;
+}
+EXPORT_SYMBOL(ib_umem_get);
+```
 
-        mutex_lock(&dom->lock);
-        entry = vfmig_iova_lookup_external_locked(dom,
-                                                  hint.kind, hint.fw_id);
-        if (!entry) {
-            mutex_unlock(&dom->lock);
-            return -ENOENT;
-        }
-        if (!entry->awaiting_bind) {
-            mutex_unlock(&dom->lock);
-            return -EALREADY;
-        }
-        /* sg_table total length must match entry length: */
-        if (vfmig_sgt_total_length(sg, nents) != entry->len) {
-            WARN_ONCE(1, "vfmig: hint kind=%u fw_id=%llx length mismatch",
-                      hint.kind, hint.fw_id);
-            mutex_unlock(&dom->lock);
-            return -EINVAL;
-        }
+No behaviour change for existing `ib_umem_get` callers. The
+extracted head is otherwise identical to today's lines 178-255 of
+`drivers/infiniband/core/umem.c`.
 
-        err = vfmig_iova_bind_awaiting_locked(dom, entry, sg, nents);
-        atomic_long_add(vfmig_sgt_total_pages(sg, nents),
-                        &dom->awaiting_bind_hits);
-        mutex_unlock(&dom->lock);
-        return err ?: nents;
+**Step 2: vfmig binding primitive.** In
+`drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c`:
+
+```c
+int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
+                                u8 kind, u64 fw_id,
+                                struct sg_table *sgt)
+{
+    u64 instance_key = VFMIG_HUOBJ_KEY(kind, fw_id);
+    struct vfmig_iova_page *entry;
+    struct scatterlist *sg;
+    dma_addr_t iova_cur;
+    unsigned int i;
+    size_t total = 0;
+    int err = 0;
+
+    mutex_lock(&dom->lock);
+
+    entry = vfmig_iova_user_index_lookup_locked(dom, instance_key);
+    if (!entry) {
+        err = -ENOENT;        /* hard fail: no placeholder */
+        goto out_unlock;
+    }
+    if (!entry->awaiting_bind) {
+        err = -EBUSY;         /* hard fail: double bind */
+        goto out_unlock;
     }
 
-    /* Non-binder mode: existing stage-1 cursor-allocate path. */
-    return vfmig_dma_map_sg_fresh(dev, sg, nents, dir, attrs);
+    /* sgtable total bytes must match the placeholder's recorded length. */
+    for_each_sgtable_sg(sgt, sg, i)
+        total += sg->length;
+    if (total != entry->len) {
+        err = -EINVAL;
+        goto out_unlock;
+    }
+
+    iova_cur = entry->iova;
+    for_each_sgtable_sg(sgt, sg, i) {
+        phys_addr_t phys = page_to_phys(sg_page(sg)) + sg->offset;
+        size_t left = sg->length;
+        size_t step;
+
+        sg_dma_address(sg) = iova_cur;
+        sg_dma_len(sg)     = sg->length;
+
+        while (left) {
+            step = min_t(size_t, left, PAGE_SIZE);
+            err = iommu_map(dom->iommu_domain, iova_cur, phys, step,
+                            entry->prot, GFP_KERNEL);
+            if (err)
+                goto out_rollback;
+            iova_cur += step;
+            phys     += step;
+            left     -= step;
+        }
+    }
+
+    entry->awaiting_bind = false;
+    atomic_long_add(total >> PAGE_SHIFT, &dom->awaiting_bind_hits);
+
+out_unlock:
+    mutex_unlock(&dom->lock);
+    return err;
+
+out_rollback:
+    /* Unmap whatever we mapped so far; sg_dma_address values are
+     * partially populated -- callers MUST not consume sgt after a
+     * failing bind. */
+    iommu_unmap(dom->iommu_domain, entry->iova, iova_cur - entry->iova);
+    goto out_unlock;
+}
+EXPORT_SYMBOL(vfmig_iova_bind_user_object);
+```
+
+Hard-fail policy per user direction (May 2026):
+
+* `-ENOENT` on placeholder miss surfaces CRIU plugin bugs that try
+  to restore a uobject the source never SAVE'd, or whose `fw_id`
+  doesn't match what stage 2 emitted.
+* `-EBUSY` on `awaiting_bind == false` surfaces double-bind --
+  either a CRIU plugin issuing two `RESTORE_X` for the same FW id,
+  or a stage-3 internal bug.
+
+Both errno values propagate up through `mlx5_ib_umem_restore` and
+the parent `RESTORE_X` verb's UAPI rc; no silent fallback.
+
+**Step 3: driver wrapper.** In
+`drivers/infiniband/hw/mlx5/restore_umem.c` (new file, or inline
+into `mr.c`/`cq.c`/`qp.c` per-kind):
+
+```c
+struct ib_umem *mlx5_ib_umem_restore(struct mlx5_ib_dev *dev,
+                                     enum vfmig_huobj_kind kind,
+                                     u64 fw_id,
+                                     unsigned long addr, size_t size,
+                                     int access)
+{
+    struct vfmig_iova_domain *dom = dev->mdev->cmd.vfmig_iova_dom;
+    struct ib_umem *umem;
+    int err;
+
+    if (!dom)
+        return ERR_PTR(-ENODEV);   /* non-vfmig path; gate at caller */
+
+    umem = ib_umem_pin(&dev->ib_dev, addr, size, access);
+    if (IS_ERR(umem))
+        return umem;
+
+    err = vfmig_iova_bind_user_object(dom, kind, fw_id,
+                                       &umem->sgt_append.sgt);
+    if (err) {
+        ib_umem_release(umem);
+        return ERR_PTR(err);
+    }
+    return umem;
 }
 ```
 
-`vfmig_iova_bind_awaiting_locked` walks the sg_table at PAGE_SIZE
-granularity (independently of source vs destination sg shapes, which
-need not match), `iommu_map`s each PAGE_SIZE chunk at the
-corresponding source-IOVA offset in the awaiting_bind entry's range,
-sets `sg_dma_address(sg) = first_iova_for_this_sg` /
-`sg_dma_len(sg) = sg->length`, clears `entry->awaiting_bind`.
+Caller pattern (using MR as the canonical example):
 
-PAGE_SIZE granularity matters because src and dst phys layouts can
-differ -- src might have one 1 MiB hugepage compounded into one sg
-segment, dst might have 256 × 4 KiB pages with 256 sg segments.
-The IOMMU just needs `iommu_map(iova, phys, PAGE_SIZE)` calls
-covering the right total range; per-uobject granularity at the wire
-level + PAGE_SIZE iteration at the bind site is the right combination.
+```c
+/* drivers/infiniband/hw/mlx5/mr.c, in mlx5_ib_restore_mr */
+mr->umem = mlx5_ib_umem_restore(dev, VFMIG_HUOBJ_KIND_MR,
+                                req->mkey_index,
+                                cmd->addr, cmd->length, access_flags);
+if (IS_ERR(mr->umem))
+    return PTR_ERR(mr->umem);
+```
 
-One-shot consumption (cleared on entry, before any work) is the
-critical invariant. If `vfmig_dma_map_sg_fresh` (called from
-fresh-registration code paths during `RESTORE_X`'s setup) is hit
-before our intended `ib_umem_get`, the hint would otherwise
-incorrectly bind that fresh umem. Cleared-before-work means the
-next call sees no hint. Cross-talk hazards in §A.H.
+No state on `current`. No DMA-shim conditional branch. The bind is
+synchronous and explicit; if anything fails between `ib_umem_pin`
+and the `mr->umem` assignment, the verb returns the errno and the
+adopted-mkey kuobject is rolled back by the caller.
 
 ### A.D reg_create refactor (optional code-quality polish)
 
@@ -1328,31 +1491,36 @@ PAGE_SIZE granularity (DBR is always single-page).
 Source-side SAVE: emits one `HOST_USER_PAGE` record per DBR umem,
 keyed by `(KIND_DBR, page_va)`.
 
-Destination-side at restore time, two-stage hint inside RESTORE_CQ
-(analogously RESTORE_QP / RESTORE_SRQ):
+Destination-side at restore time, two-call sequence inside
+RESTORE_CQ (analogously RESTORE_QP / RESTORE_SRQ):
 
 ```c
 /* mlx5_ib_restore_cq pseudo-code, S5 */
-vfmig_set_bind_hint(VFMIG_HUOBJ_KIND_CQ, cqn);
-umem = ib_umem_get(ibdev, cqe_buf_addr, cqe_buf_len, access);
-/* hint consumed by .map_sg (one-shot) */
+cq->buf.umem = mlx5_ib_umem_restore(dev, VFMIG_HUOBJ_KIND_CQ, cqn,
+                                    cqe_buf_addr, cqe_buf_len, access);
+if (IS_ERR(cq->buf.umem))
+    return PTR_ERR(cq->buf.umem);
 
-vfmig_set_bind_hint(VFMIG_HUOBJ_KIND_DBR, dbr_user_va & PAGE_MASK);
-err = mlx5_ib_db_map_user(context, dbr_user_va, &cq->db);
-/* If this is the first restored uobject to need this DBR page,
- * mlx5_ib_db_map_user enters the miss branch -> ib_umem_get ->
- * .map_sg consumes the hint -> binds at source IOVA (page-aligned).
- * If a previous restored uobject already restored this DBR (hit
- * branch), the hint is NOT consumed because mlx5_ib_db_map_user
- * short-circuits before ib_umem_get. Clear explicitly: */
-vfmig_clear_bind_hint();
+/* DBR variant of mlx5_ib_db_map_user that, on cache miss, uses
+ * mlx5_ib_umem_restore(KIND_DBR, user_va & PAGE_MASK) for the
+ * single-page DBR umem; on cache hit (a previously-restored parent
+ * already bound this DBR page), refcount++ and reuse existing
+ * db->dma -- no umem_restore needed. */
+err = mlx5_ib_db_map_user_restore(context, dbr_user_va, &cq->db);
+if (err)
+    goto err_release_buf;
 ```
 
 The dedup machinery thus naturally handles the "multiple uobjects
-share one DBR" case: first restored uobject does the bind,
-subsequent ones are no-ops at the binder level (the existing
-refcount semantics in `mlx5_ib_user_db_page` cover them at the
-kernel-state level).
+share one DBR" case: first restored uobject does the bind (cache
+miss → `mlx5_ib_umem_restore(KIND_DBR, ...)` → `iommu_map` at the
+DBR placeholder's IOVA), subsequent ones are refcount-ups on the
+existing `mlx5_ib_user_db_page`. No "clear on cache hit" cleanup
+step is required because nothing was set in the hit path. The new
+restore-variant of `mlx5_ib_db_map_user` is a parallel entry point
+that takes `dev` + `(KIND_DBR, virt & PAGE_MASK)` and calls
+`mlx5_ib_umem_restore` directly on cache miss instead of
+`ib_umem_get`.
 
 ### A.F Cross-reference matrix
 
@@ -1370,16 +1538,33 @@ PD and AH have no umem at all (pure FW-state-only resources) and
 don't intersect with this design. Async-event uobjects (S8) are
 also pure FW-state.
 
-### A.G Earlier sketches (superseded 2026-05-18)
+### A.G Earlier sketches (superseded)
 
-The two subsections below are the original §6 and §7 prose, preserved
-verbatim for design history. They were superseded when
-`uobject_restore.md` landed `UVERBS_OBJECT_RESTORE` /
-`mlx5_ib_restore_mr` (S4b) as a kernel-only verb that adopts the FW
-mkey without userspace re-registration. That landing changed the
-*trigger* model (kernel verb instead of userspace `ibv_reg_mr`) and
-made the cursor-based stage-2 binding and the per-task
-`vfmig_next_mkey` stage-3 hint described below obsolete.
+This appendix preserves earlier design revisions for history. The
+revision-1 cursor-based prose (superseded 2026-05-18) is in
+§A.G.1-§A.G.2; the revision-2 per-task `vfmig_bind_hint` mechanism
+(superseded 2026-05-19) is in §A.G.3. The current design is in §7
+and §A.C.
+
+#### A.G.0 Why each prior revision was superseded
+
+* **Revision 1 → 2 (2026-05-18).** `uobject_restore.md` landed
+  `UVERBS_OBJECT_RESTORE` / `mlx5_ib_restore_mr` (S4b) as a
+  kernel-only verb that adopts the FW mkey without userspace
+  re-registration. That landing changed the *trigger* model
+  (kernel verb instead of userspace `ibv_reg_mr`) and made the
+  cursor-based stage-2 binding and the per-task `vfmig_next_mkey`
+  stage-3 hint described in §A.G.1-§A.G.2 obsolete.
+* **Revision 2 → 3 (2026-05-19).** The per-task `vfmig_bind_hint`
+  shape (§A.G.3) required either a `task_struct` extension or a
+  per-domain task-keyed map; both add cost or core-kernel surface
+  area. User direction was to avoid `task_struct` and avoid lookup
+  cost on the `vfmig_dma_ops.map_sg` hot path (which fires on
+  every kernel cmd-ring / EQ / frag-buf DMA, not just restore).
+  The current `ib_umem_pin` + `mlx5_ib_umem_restore` shape
+  achieves the same outcome with an explicit synchronous call
+  from the verb body to the vfmig binding primitive, no
+  side-channel storage, and zero changes to `.map_sg`.
 
 The infrastructure pieces foreshadowed in stage 1 (the
 `awaiting_bind` flag, the `awaiting_bind_hits` counter, the
@@ -1584,53 +1769,138 @@ flipped from userspace re-registration to kernel verb. The
 specific `(mkey, sg_idx)` lookup key is also replaced -- the new
 design uses `(kind, fw_id)` *per uobject* (one wire record per
 umem, not per sg) and iterates PAGE_SIZE chunks at bind time
-inside `.map_sg`, decoupling source vs destination sg shapes.
-Consequently the source-side retag also reshapes: now it tags
-entries with `(kind, fw_id)` post-FW-create rather than
-`(mkey, sg_idx)` post-UMR, and applies uniformly across MR / CQ
-/ QP / SRQ / DBR rather than just MR (§A.B).
+inside the binding primitive, decoupling source vs destination sg
+shapes. Consequently the source-side retag also reshapes: now it
+tags entries with `(kind, fw_id)` post-FW-create rather than
+`(mkey, sg_idx)` post-UMR, and applies uniformly across MR / CQ /
+QP / SRQ / DBR rather than just MR (§A.B).
+
+#### A.G.3 Revision-2 per-task `vfmig_bind_hint` mechanism (superseded 2026-05-19)
+
+This revision (the prose previously at §7.2 and §A.C between
+2026-05-18 and 2026-05-19) routed `(kind, fw_id)` from the verb
+handler to `vfmig_dma_ops.map_sg` via a side channel on
+`task_struct`:
+
+> ```c
+> struct vfmig_bind_hint {
+>     u8  kind;       /* VFMIG_HUOBJ_KIND_{MR,CQ,QP,SRQ,DBR} */
+>     u8  reserved[7];
+>     u64 fw_id;      /* mkey_index | cqn | qpn | srqn | dbr_user_va */
+> };
+> /* Stored in task_struct. Default-zero; nonzero kind means "binder
+>  * mode". Cleared by vfmig_dma_ops.map_sg on first consumption. */
+> ```
+>
+> The hint was a **trigger** for `.map_sg`, not a payload. Each
+> `RESTORE_X` verb set it immediately before calling `ib_umem_get`:
+>
+> ```c
+> vfmig_set_bind_hint(VFMIG_HUOBJ_KIND_MR, mkey_index);
+> mr->umem = ib_umem_get(ibdev, addr, length, access);
+> /* hint consumed (cleared) by .map_sg inside ib_umem_get */
+> vfmig_clear_bind_hint();  /* defensive on error paths */
+> ```
+>
+> Inside `.map_sg`, when the hint was set, the shim entered "binder
+> mode": looked up the placeholder by `(kind, fw_id)` in the C1
+> rb_tree, `iommu_map`d freshly-pinned pages at the source IOVAs,
+> populated `sg_dma_address`, cleared `awaiting_bind`. When the hint
+> was unset, the existing stage-1 cursor-allocate path ran. DBR
+> pages got a second hint set/clear cycle before
+> `mlx5_ib_db_map_user`'s dedup'd umem_get.
+>
+> The hint was **one-shot** (cleared on consumption) to prevent a
+> single verb's hint from incorrectly binding a subsequent
+> unrelated `dma_map_sgtable` call on the same task. The known risk
+> enumeration was Risks 1-5 documented in the
+> 2026-05-18-to-2026-05-19 §A.H ("Hint cross-talk hazard, full
+> enumeration").
+
+**Why superseded.** Per-task storage required either extending
+`task_struct` directly (touching core kernel surface area + a
+Kconfig gate) or maintaining a per-domain task-keyed map (RCU or
+mutex lookup on every `.map_sg` -- not just restore traffic, but
+every cmd-ring / EQ / frag-buf DMA on every vfmig-tracked VF; for
+the steady-state RDMA workload that's the wrong tradeoff). The
+`ib_umem_pin` shape achieves the same outcome with no `task_struct`
+extension, no `.map_sg` hot-path lookup, and zero side-channel
+risk (Risks 1-5 of the prior revision are all structurally
+impossible -- see §A.H bullet 1).
+
+The deeper architectural shift: in revision 2, the bind was driven
+by `dma_map_sgtable` (via the standard
+`ib_umem_get → dma_map_sgtable → vfmig_dma_ops.map_sg` chain) with
+the hint as the disambiguator. In the current revision, the bind
+is driven directly by the verb body, and `dma_map_sgtable` is not
+called at all on the restore path -- a clean separation between
+"steady-state DMA mapping" and "CRIU restore-time binding".
+Symmetric dereg is preserved because populating `sg_dma_address`
+during the explicit bind makes the existing
+`vfmig_dma_ops.unmap_sg` path work unmodified.
 
 ### A.H Implementation notes / extended open questions
 
-* **Hint cross-talk hazard, full enumeration.**
-  * Risk 1: `vfmig_set_bind_hint` is followed by some intermediate
-    syscall path that calls `dma_map_sgtable` before the intended
-    `ib_umem_get`. Mitigation: hint-set immediately precedes
-    `ib_umem_get` in the verb body, no intervening allocation.
-    WARN-on-mismatch in §A.C catches a length disagreement.
-  * Risk 2: `ib_umem_get` internally calls `dma_map_sgtable` more
-    than once for a single umem (e.g. via a sub-allocation).
-    Mitigation: inspect `ib_umem_get` to confirm exactly one
-    `dma_map_sgtable` per umem (it's the case today).
-  * Risk 3: Verb error path leaves hint set. Mitigation: always
-    `vfmig_clear_bind_hint()` on the verb's error path before
-    returning (covered in §A.E for DBR; analogously for primary
-    verbs).
-  * Risk 4: Verb is preempted between hint-set and `ib_umem_get`,
-    rescheduled on a different CPU. Per-task storage means the
-    hint follows the task; benign.
-  * Risk 5: Concurrent `dma_map_sgtable` from a kernel thread on
-    behalf of `current` (e.g. workqueue-deferred DMA work). Hint
-    is per-task, so kernel threads (which have their own
-    task_struct) don't see our hint. Verify by inspection that no
-    in-tree mlx5_ib path defers `dma_map_sgtable` to a workqueue.
+* **Hint cross-talk hazard -- no longer applies.** The 5-risk
+  enumeration from the prior revision (Risk 1: intermediate
+  `dma_map_sgtable` between hint-set and intended `ib_umem_get`;
+  Risk 3: error path leaves hint set; Risk 4: preemption; Risk 5:
+  kernel-thread workqueue defers `dma_map_sgtable` and misses the
+  per-task hint) is structurally impossible in the `ib_umem_pin`
+  approach because there is no out-of-band channel: the bind is a
+  direct synchronous call from `mlx5_ib_umem_restore` (the verb
+  body's helper) to `vfmig_iova_bind_user_object`, with all args
+  passed by value. The vfmig `.map_sg` shim is untouched by stage 3.
+  Risk 2 (single-vs-multiple `dma_map_sgtable` per umem) is also
+  moot because `ib_umem_pin` doesn't call `dma_map_sgtable` at all.
+  Original enumeration preserved in §A.G for design history.
+* **`ib_umem_pin` lifecycle invariants** (replaces the hint
+  enumeration).
+  * **L1 Caller obligation.** After `ib_umem_pin` returns success,
+    the caller MUST either populate `sg_dma_address` for every sg
+    (via `vfmig_iova_bind_user_object` or equivalent) before any
+    DMA touches the umem, OR call `ib_umem_release` to roll back
+    the pins. There's no third option; the umem is not consumable
+    in the half-pinned state.
+  * **L2 Release-before-bind ordering on error.** If
+    `vfmig_iova_bind_user_object` fails *after* partially
+    populating `sg_dma_address`, the rollback path inside the
+    primitive does `iommu_unmap` for the partially-bound range but
+    leaves `sg_dma_address` half-written. The caller (the
+    `mlx5_ib_umem_restore` wrapper) MUST treat the umem as opaque
+    on the error path and only call `ib_umem_release` -- it must
+    not consume `sg_dma_address` itself. `ib_umem_release` is
+    safe in this state because `vfmig_dma_ops.unmap_sg` walks
+    `sg_dma_address` per sg and skips zero values.
+  * **L3 No partial-success returns.** `vfmig_iova_bind_user_object`
+    is all-or-nothing at the placeholder level: on any failure
+    after the lookup, it rolls back all `iommu_map`s and returns
+    the umem to "awaiting_bind = true" state for retry/diagnosis
+    by userspace. This trades a sliver of internal complexity for
+    a clean retry semantics.
+* **Hard-fail policy on placeholder mismatch / double-bind.**
+  Both `-ENOENT` (no placeholder for the requested `(kind, fw_id)`)
+  and `-EBUSY` (placeholder already bound) are returned directly to
+  the caller without silent fallback. Per user direction (May
+  2026): silent fallback would mask CRIU plugin bugs (e.g.
+  restoring an MR the source never SAVE'd, or issuing two
+  `RESTORE_X` for the same FW id). Userspace observes the failure
+  via the verb's UAPI rc and can debug deterministically.
 * **Source-side retag concurrency.** Retag walks registry entries
   in a range with `dom->lock`. The range is freshly populated by
   the just-completed `dma_map_sgtable` from the same task; no
   other task observes those entries until retag returns. Race-free.
-* **Stage 2 alone runtime.** If stage 2 lands in a kernel build
-  but stage 3 doesn't, what happens? Source emits HOST_USER_PAGE
-  records; destination LOAD pre-installs awaiting_bind entries.
-  `mlx5_ib_restore_mr` (which is in tree per S4b) does *not* set
-  the hint (stage-3 code not present). Result: awaiting_bind
-  entries remain `awaiting_bind=true` forever, the verb returns
-  success but data path faults at first DMA. Failure mode is
-  identical to today's "S4b identity-only PASS" -- no worse, no
-  better. To prevent silent half-landing, gate stage 3's
-  hint-aware `.map_sg` behind a `CONFIG_MLX5_VFMIG_BIND_HINT`
-  Kconfig that depends on `CONFIG_MLX5_VFMIG`, and add a
-  stage-2-only smoke test that asserts awaiting_bind installation
-  count without exercising binding.
+* **Stage 2 alone runtime.** Stage 2 has landed; stage 3 has not.
+  Current behaviour: source emits `HOST_USER_PAGE` records;
+  destination LOAD pre-installs `awaiting_bind` entries;
+  `mlx5_ib_restore_mr` continues to set `mr->umem = NULL` (S4b
+  identity-only). Result: `awaiting_bind` entries remain
+  `awaiting_bind = true` forever, the verb returns success but
+  data path faults at first DMA. Failure mode is identical to
+  today's "S4b identity-only PASS" -- no worse, no better. Stage 3
+  D4 (the `mlx5_ib_restore_mr` rewire) closes this gap; until
+  then, the `test_user_object_replay.sh` harness PASS continues to
+  assert stage-2 infrastructure independently of data path.
 * **`MLX5_VFMIG_IOC_QUERY_AWAITING_BIND` ioctl shape.** Returns:
 
   ```c
@@ -1646,15 +1916,17 @@ entries with `(kind, fw_id)` post-FW-create rather than
   Used by `test_user_object_replay.sh` to assert installation
   count matches source-side emission count, broken down by kind.
 * **awaiting_bind_hits counter, scope.** Incremented on every
-  PAGE_SIZE chunk bound by the hint-aware binder. Surfaced via
-  the existing `vfmig_iova_awaiting_bind_hits` accessor + a
+  PAGE_SIZE chunk bound by `vfmig_iova_bind_user_object`. Surfaced
+  via the existing `vfmig_iova_awaiting_bind_hits` accessor + a
   debugfs entry. Not used as a hard pass criterion (Phase J
   data-path test is); used as a soft signal during development.
 * **Multi-process VF sharing under v0.** v0 is single-process per
-  VF (CRIU's primary use case). The hint mechanism is
-  multi-process-safe by construction (per-task storage), so
-  multi-process is not a future redesign -- just a future enabler
-  in the CRIU plugin layer.
+  VF (CRIU's primary use case). The binding mechanism is also
+  multi-process-safe by construction: each `mlx5_ib_umem_restore`
+  call is independently authenticated by `(kind, fw_id)` against
+  the per-VF rb_tree, with no per-task state involved.
+  Multi-process is therefore not a future redesign -- just a future
+  enabler in the CRIU plugin layer.
 * **Stage 4 trigger heuristic.** Track the slot's high-water
   cursor position; emit a tracepoint when it crosses 50% of slot
   size. Reopen stage 4 when any deployed VF emits this tracepoint
