@@ -108,6 +108,8 @@ static inline bool __rdma_umem_block_iter_next(struct ib_block_iter *biter)
 
 #ifdef CONFIG_INFINIBAND_USER_MEM
 
+struct ib_umem *ib_umem_pin(struct ib_device *device, unsigned long addr,
+			    size_t size, int access);
 struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
 			    size_t size, int access);
 void ib_umem_release(struct ib_umem *umem);
@@ -182,6 +184,12 @@ void ib_umem_dmabuf_revoke(struct ib_umem_dmabuf *umem_dmabuf);
 
 #include <linux/err.h>
 
+static inline struct ib_umem *ib_umem_pin(struct ib_device *device,
+					  unsigned long addr, size_t size,
+					  int access)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
 static inline struct ib_umem *ib_umem_get(struct ib_device *device,
 					  unsigned long addr, size_t size,
 					  int access)

@@ -154,14 +154,34 @@ unsigned long ib_umem_find_best_pgsz(struct ib_umem *umem,
 EXPORT_SYMBOL(ib_umem_find_best_pgsz);
 
 /**
- * ib_umem_get - Pin and DMA map userspace memory.
+ * ib_umem_pin - Pin userspace memory and build an sg_append_table for it.
  *
- * @device: IB device to connect UMEM
+ * @device: IB device the region belongs to. Only consulted for
+ *          ib_dma_max_seg_size() while building the sgtable; no DMA mapping
+ *          is performed.
  * @addr: userspace virtual address to start at
  * @size: length of region to pin
- * @access: IB_ACCESS_xxx flags for memory being pinned
+ * @access: IB_ACCESS_xxx flags. Only IB_ACCESS_ON_DEMAND (rejected) and the
+ *          writable bit (via ib_access_writable()) affect this step.
+ *          DMA-mapping-only flags such as IB_ACCESS_RELAXED_ORDERING are
+ *          honoured by ib_umem_get() instead.
+ *
+ * Returns a struct ib_umem whose ->sgt_append is populated with pinned
+ * struct page entries but is NOT yet dma_map_sgtable'd: sg_dma_address /
+ * sg_dma_len are unset on every entry. The caller MUST finish the
+ * construction by either:
+ *
+ *   - calling ib_dma_map_sgtable_attrs() on ->sgt_append.sgt (ib_umem_get()
+ *     is the canonical wrapper that does this), OR
+ *   - establishing equivalent device-visible mappings out-of-band (e.g. the
+ *     vfmig restore path's vfmig_iova_bind_user_object()).
+ *
+ * before handing the umem to ib_umem_release() or otherwise exposing it to
+ * the data path. Releasing a never-mapped umem via ib_umem_release() is
+ * not currently a supported state; on rollback before the mapping step the
+ * caller must unwind manually (see ib_umem_get() for the canonical sequence).
  */
-struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
+struct ib_umem *ib_umem_pin(struct ib_device *device, unsigned long addr,
 			    size_t size, int access)
 {
 	struct ib_umem *umem;
@@ -169,10 +189,9 @@ struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
 	unsigned long lock_limit;
 	unsigned long new_pinned;
 	unsigned long cur_base;
-	unsigned long dma_attr = 0;
 	struct mm_struct *mm;
 	unsigned long npages;
-	int pinned, ret;
+	int pinned, ret = 0;
 	unsigned int gup_flags = FOLL_LONGTERM;
 
 	/*
@@ -253,14 +272,6 @@ struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
 			goto umem_release;
 		}
 	}
-
-	if (access & IB_ACCESS_RELAXED_ORDERING)
-		dma_attr |= DMA_ATTR_WEAK_ORDERING;
-
-	ret = ib_dma_map_sgtable_attrs(device, &umem->sgt_append.sgt,
-				       DMA_BIDIRECTIONAL, dma_attr);
-	if (ret)
-		goto umem_release;
 	goto out;
 
 umem_release:
@@ -274,6 +285,49 @@ umem_kfree:
 		kfree(umem);
 	}
 	return ret ? ERR_PTR(ret) : umem;
+}
+EXPORT_SYMBOL(ib_umem_pin);
+
+/**
+ * ib_umem_get - Pin and DMA map userspace memory.
+ *
+ * @device: IB device to connect UMEM
+ * @addr: userspace virtual address to start at
+ * @size: length of region to pin
+ * @access: IB_ACCESS_xxx flags for memory being pinned
+ *
+ * Composition: ib_umem_pin() + ib_dma_map_sgtable_attrs(). On DMA-map
+ * failure the pin is unwound (sg pages unpinned, pinned_vm reversed, mm
+ * dropped, umem freed) so that callers continue to observe the original
+ * "success returns mapped umem, failure returns ERR_PTR with no resources
+ * left over" contract.
+ */
+struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
+			    size_t size, int access)
+{
+	unsigned long dma_attr = 0;
+	struct ib_umem *umem;
+	int ret;
+
+	umem = ib_umem_pin(device, addr, size, access);
+	if (IS_ERR(umem))
+		return umem;
+
+	if (access & IB_ACCESS_RELAXED_ORDERING)
+		dma_attr |= DMA_ATTR_WEAK_ORDERING;
+
+	ret = ib_dma_map_sgtable_attrs(device, &umem->sgt_append.sgt,
+				       DMA_BIDIRECTIONAL, dma_attr);
+	if (ret) {
+		__ib_umem_release(device, umem, 0);
+		atomic64_sub(ib_umem_num_pages(umem),
+			     &umem->owning_mm->pinned_vm);
+		mmdrop(umem->owning_mm);
+		kfree(umem);
+		return ERR_PTR(ret);
+	}
+
+	return umem;
 }
 EXPORT_SYMBOL(ib_umem_get);
 
