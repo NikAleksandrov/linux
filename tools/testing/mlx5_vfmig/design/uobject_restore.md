@@ -233,11 +233,16 @@ compose DAG.
   ?3): cross-host empirically confirmed. Source's FW UAR ids re-installable
   on destination via the new RESTORE_UCONTEXT/RESTORE_DYN_UARS verbs.
   R3 leans on the same property for the rest of the uobject ids if K6 holds.
-* **User-MR DMA on tracked VFs** (`user_mr_dma.md` stage 1): landed
-  in kernel HEAD. `ibv_reg_mr` succeeds on a tracked VF without the
-  `IB_WC_MW_BIND_ERR` failure mode. Means MR creation in the destination
-  (during R3 restore) won't itself fail at the IOMMU layer; only the
-  identity continuity (rkey preservation) is open.
+* **User-MR DMA on tracked VFs** (`user_mr_dma.md` stages 1-3
+  landed; stage 1 = transparent IOMMU shim, stage 2 = source-side
+  `(KIND_X, fw_id)` retag + `HOST_USER_PAGE` SAVE/LOAD wire path,
+  stage 3 = `ib_umem_pin` + `vfmig_iova_bind_user_object`
+  destination-bind primitive driven from inside the per-class
+  RESTORE_X verb body). `ibv_reg_mr` succeeds on a tracked VF
+  without the `IB_WC_MW_BIND_ERR` failure mode (stage 1), and
+  rkey continuity across SAVE/LOAD is delivered by the kernel
+  inside RESTORE_MR (stages 2+3) so the plugin path stays a
+  single ioctl. The same pattern extends to CQ/QP/SRQ via S5/S6/S7.
 * **RC ping pong on tracked VF** (kernel HEAD `52021ccf9ab3 ... Hacks
   which enable RC ping pong`): hacks landed enabling RC QP traffic on
   tracked VFs. Direct evidence that an RC QP on a tracked VF is wire-functional
@@ -472,7 +477,8 @@ Image-format notes:
   silently. Restore allocates fresh restrack ids on the destination
   ibdev; the source's are not preserved. Documented as a known
   externally-visible identity discontinuity (parallel to the wire-rkey
-  discontinuity stage 3 of `user_mr_dma.md` solves for MRs).
+  discontinuity that stage 3 of `user_mr_dma.md` solved for MRs;
+  S5/S6/S7 will extend the same pattern to CQ/QP/SRQ rkey-equivalents).
   No mitigation in v0; lifted only if a real consumer needs it.
 * `xref` edges always reference `restrack_id` (the cross-resource key).
   Restore translates `restrack_id` -> `ufile_handle` via the per-ufile
@@ -629,10 +635,18 @@ plugin contribution.
 * **Kernel verb**: `UVERBS_METHOD_RESTORE_MR(target_handle, virt_addr,
   length, access_flags, lkey_hint, rkey_hint, blob, pd_handle)`. Honours
   rkey/lkey as identity hints.
-* **Driver-side (mlx5_vfmig)**: see also `user_mr_dma.md` stage 3,
-  which is the user-MR-DMA-side counterpart to this verb. R3 owns the
-  uobject identity; user_mr_dma stage 3 owns the IOMMU-side mkey-keyed
-  page binding. The two land together as a coherent per-MR restore.
+* **Driver-side (mlx5_vfmig)**: see also `user_mr_dma.md` stage 3
+  (landed), which is the user-MR-DMA-side counterpart to this
+  verb. R3 owns the uobject identity; user_mr_dma stage 3 owns
+  the IOMMU-side mkey-keyed page binding. The two landed
+  together as a coherent per-MR restore: `mlx5_ib_restore_mr`
+  (S4b B2) calls `mlx5_ib_umem_restore_mr` (Stage-3 D3), which
+  composes `ib_umem_pin` (D1) + `mlx5_vfmig_bind_user_mr` (D3)
+  + `vfmig_iova_bind_user_object` (D2) inside the RESTORE_MR
+  verb body -- the destination's `mr->umem` is real and bound
+  to the source-emitted IOVA before the verb returns. Plugin
+  side: zero changes from the S4b shape; no separate
+  post-restore IOMMU-bind hook needed (see ?6.2).
 * **Driver-side (rxe)**: standard `rxe_reg_user_mr` + identity-hint on
   mkey allocation. rxe is a software provider, so the user pages re-pin
   via `pin_user_pages_fast` against the destination process's mm; no
@@ -723,19 +737,20 @@ For each ufile in image (in dependency-free order across ufiles):
                            blob=uobj.plugin_blob,
                            **resolved_xrefs)
         handle_map[uobj.restrack_id] = new_handle
-        if uobj.type == MR:
-            plugin.post_restore_mr(uobj, new_handle)         # see below
 ```
 
-v0 ships exactly **one** plugin hook: `post_restore_mr`. It exists
-because MR restore couples with `user_mr_dma.md` stage 3 (rkey
-continuity at the IOMMU layer) -- the post-MR hook is where the plugin
-re-binds the per-MR IOVA map after the kernel verb has allocated the
-mkey. Every other class restores cleanly from the kernel verb alone in
-v0; we don't pre-declare empty hooks for them. If a future per-class
-quirk surfaces (DM/DEVX, or a mlx5e-style netdev coupling), we add the
-hook at that point. CRIU core handles fd-table install for CC/AEF
-directly; no plugin hook needed.
+v0 ships **zero** plugin post-restore hooks. The original sketch
+needed a `post_restore_mr` hook because MR restore couples with
+`user_mr_dma.md` stage 3 (rkey continuity at the IOMMU layer)
+and the kernel verb couldn't itself re-bind the per-MR IOVA map.
+Stage-3 D3+D4 fold the bind into the verb body
+(`mlx5_ib_restore_mr` -> `mlx5_ib_umem_restore_mr` ->
+`ib_umem_pin` + `mlx5_vfmig_bind_user_mr`), so the plugin path
+collapses to a single ioctl per uobject for every v0 class.
+CRIU core handles fd-table install for CC/AEF directly; no
+plugin hook needed there either. If a future per-class quirk
+surfaces (DM/DEVX, dma-buf, or a mlx5e-style netdev coupling),
+we add a hook at that point.
 
 ### 6.3 Restore-fini activation pass
 
@@ -807,9 +822,15 @@ registers the DB MKEY). The experiment therefore shows:
   alone carries across `LOAD_VHCA_STATE`; and
 * by independent argument (K6's user-page result), the **user
   RQ buffer** and the **user DB page** -- which carry the actual
-  WQE entries and the SW producer index -- survive via the
-  `vfmig_iova` `HOST_PAGE`-replay machinery, since both live in
-  the QP's user-mode umem which `user_mr_dma` already preserves.
+  WQE entries and the SW producer index -- will survive via the
+  `vfmig_iova` `HOST_USER_PAGE`-replay machinery (Stage-2 C4/C5
+  emit + LOAD-time placeholder install) bound on RESTORE_QP via
+  the same `mlx5_ib_umem_restore_<class>` wrapper pattern S4b
+  uses for the MR umem (S6 will land the QP wrapper +
+  `mlx5_vfmig_bind_user_qp`/`_user_dbr` analogues; Stage-2
+  retag callsites for both KIND_QP and KIND_DBR have already
+  landed via C9 + C7). Both buffers live in the QP's user-mode
+  umem which `user_mr_dma` is responsible for.
 
 Together these are sufficient. We could not drive a live RTR/RTS
 round-trip in the same experiment without GIDs + active port, which
@@ -1651,17 +1672,30 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   restore. With PD + MR working, the `rdma_test_agent` send
   buffer is restorable end-to-end.
 
-  **Model A (no FW round-trip on adoption).** The `mlx5_ib_mr`
-  wrapper is `kzalloc`'d, its `mmkey.key` is set to the source's
-  full FW key (`(mkey_index << 8) | variant_byte`), and its
-  `umem` and `cache_ent` are left NULL -- `user_mr_dma` stage 3
-  owns the IOMMU side, and the cache path doesn't apply to
-  adopted mkeys. The wrapper is wire-visible at the source's
-  `lkey`/`rkey`; mlx5 always honours the identity hint
-  (`mlx5_ib_dispatcher` echoes back `mr->lkey`/`mr->rkey`
-  byte-identical to the caller's hint -- contrast with rxe,
-  where `__rxe_add_to_pool_at_index` decides whether to honour
-  it; see S4a for the rxe path).
+  **Model A (no FW round-trip on mkey adoption).** The
+  `mlx5_ib_mr` wrapper is `kzalloc`'d, its `mmkey.key` is set
+  to the source's full FW key (`(mkey_index << 8) |
+  variant_byte`), and its `cache_ent` is left NULL (the cache
+  path doesn't apply to adopted mkeys). The wrapper is
+  wire-visible at the source's `lkey`/`rkey`; mlx5 always
+  honours the identity hint (`mlx5_ib_dispatcher` echoes back
+  `mr->lkey`/`mr->rkey` byte-identical to the caller's hint --
+  contrast with rxe, where `__rxe_add_to_pool_at_index` decides
+  whether to honour it; see S4a for the rxe path).
+
+  **`mr->umem` is real (Stage-3 D3+D4 landed).** `mlx5_ib_restore_mr`
+  calls `mlx5_ib_umem_restore_mr` before mmkey-state population;
+  that helper composes `ib_umem_pin` (D1, IB-core refactor that
+  pins user pages without DMA-mapping) + `mlx5_vfmig_bind_user_mr`
+  (D3 driver wrapper) + `vfmig_iova_bind_user_object` (D2 vfmig
+  primitive, looks up the `(KIND_MR, mkey_index)` placeholder
+  Stage-2 C5 installed during LOAD and `iommu_map`s each sg at
+  the source-emitted IOVA). On verb success `mr->umem` carries
+  the destination's pinned pages; on dereg `__mlx5_ib_dereg_mr`
+  follows the `if (mr->umem)` arm (FW `DESTROY_MKEY` -> 0,
+  `ib_umem_release(mr->umem)` releases the pins, registry
+  placeholder is dropped). Page accounting is symmetric with
+  `create_real_mr` via `atomic_add(ib_umem_num_pages, &reg_pages)`.
 
   **Empirical chain anchoring Model A** (each ran on
   destination FW 28.48.1000, mkey class only, `uid=0`):
@@ -1725,12 +1759,16 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   FW resource dependency, so `MLX5_CMD_OP_DESTROY_MKEY` on the
   orphan adopted mkey *succeeds* even with the source's
   mkey-using QPs still alive in destination FW post-LOAD.
-  `__mlx5_ib_dereg_mr` (umem == NULL + cache_ent == NULL after
-  Model A adoption) collapses to FW DESTROY_MKEY -> 0;
+  `__mlx5_ib_dereg_mr` follows the `if (mr->umem)` arm:
+  FW DESTROY_MKEY -> 0, `ib_umem_release(mr->umem)` drops the
+  destination-side pins (and Stage-3 D2's
+  `vfmig_dma_ops.unmap_sg` runs against the bound sg-table so
+  the registry placeholder is freed too); then
   `uverbs_destroy_uobject` removes the uobj from the ufile.
   Empirically validated by `mr_restore_probe_mlx5_vfmig`'s
   subtest 8: `DEREG_MR(adopted_handle) -> 0` and
-  `INFO_HANDLES(MR)` drops the handle.
+  `INFO_HANDLES(MR)` drops the handle, with no kernel WARNs and
+  no umem leak (mkey is a leaf in the FW resource graph).
 
   v0 implication for CRIU: where PDs get restore-ordering
   enforcement *for free* via FW (the kernel parks the orphan
@@ -1760,9 +1798,13 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
 
   **v0 limitations** (deliberate; not blocking):
 
-  * No kernel-side `umem` on adopted MRs. `user_mr_dma` stage
-    3 owns the IOMMU side via its `HOST_PAGE` replay; the
-    kernel doesn't double-pin pages.
+  * IOMMU-bind happens via `user_mr_dma`'s `HOST_USER_PAGE`
+    replay path (Stage-2 C4/C5 + Stage-3 D2). The destination
+    pins its own copy of the user pages via `ib_umem_pin`
+    inside the verb body and `iommu_map`s them at the
+    source-emitted IOVA, so the wire-visible iova survives
+    SAVE/LOAD; the source's pages themselves do not migrate
+    (deliberate -- only identity does).
   * No kernel-side mkey cache participation. Adopted mkeys
     bypass the destination's mkey cache; on dereg they go
     direct to FW DESTROY_MKEY rather than back to a cache
@@ -1770,6 +1812,10 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
     restored MR; not a correctness issue.
   * No `REREG_MR` on adopted MRs. Out of scope for v0; if it
     becomes needed, the plugin can dereg + re-restore.
+  * dma-buf MRs and ODP MRs are out of scope for v0. Stage-2
+    retag (`create_real_mr`) gates on `!umem->is_dmabuf`, and
+    `mlx5_ib_restore_mr`'s `ib_umem_pin` path doesn't speak
+    ODP (rejects `IB_ACCESS_ON_DEMAND` with `-EOPNOTSUPP`).
 * **S5: CQ restore + comp channel (rxe + mlx5_vfmig together).** With
   PD + MR + CQ working, the send/recv completion path is back.
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
@@ -2036,8 +2082,11 @@ Failure modes the probe distinguishes (mirrors ?9.4's PD list):
    round-trips byte-equal across LOAD_VHCA_STATE for all 13 fields we
    sampled (state, pd, q_key, cqn_snd/rcv, srqn_rmpn_xrqn, all PSN
    fields, both sq/rq counter pairs). User-mode RQ WQE buffer + DB
-   page are independently preserved via `user_mr_dma` HOST_PAGE
-   replay. No driver-side `QUERY_QP_PENDING_WRS` ioctl needed.
+   page are independently preserved via `user_mr_dma` Stage-2
+   `HOST_USER_PAGE` SAVE/LOAD wire path + Stage-3
+   `vfmig_iova_bind_user_object` (call chain to be wired in by S6
+   via `mlx5_ib_umem_restore_qp`/`mlx5_ib_db_map_user_restore`).
+   No driver-side `QUERY_QP_PENDING_WRS` ioctl needed.
    Caveat: live RTR/RTS confirmation is gated on the netdev TX-dropper
    on tracked VFs and was not run; structural argument is sufficient
    for v0. See `test_fw_id_continuity.sh K6_POST_RECV_WRS=N` and ?6.3.
@@ -2113,11 +2162,22 @@ Failure modes the probe distinguishes (mirrors ?9.4's PD list):
   the substrate R3 lives on top of. R3 cannot start until ucontext
   restore works (it does, end-to-end as of `87e9813c6` in CRIU and
   matching kernel commits).
-* **Parallel to** `user_mr_dma.md`: the user-MR DMA work
-  preserves IOMMU-level page binding identity; R3 preserves uobject-level
-  user-handle and rkey identity. The two converge at MR restore (S7) and
-  must land together to deliver end-to-end MR continuity. Stages 1-6 of
-  R3 are independent of `user_mr_dma` and can land first.
+* **Coupled to** `user_mr_dma.md`: the user-MR DMA work
+  preserves IOMMU-level page binding identity; R3 preserves
+  uobject-level user-handle and rkey identity. The two
+  converged at S4 (MR restore): S4b B2 (`mlx5_ib_restore_mr`
+  Model A) + Stage-3 D1-D4 landed together as a coherent
+  per-MR restore, with the kernel's IOMMU bind folded into the
+  RESTORE_MR verb body so the plugin path stays a single ioctl
+  per uobject. S5/S6/S7 (CQ/QP/SRQ restore) extend the same
+  pattern: their kernel handlers will compose
+  `mlx5_ib_umem_restore_<class>` (parallel to
+  `mlx5_ib_umem_restore_mr`) onto the corresponding
+  `KIND_<CLASS>` placeholder, with the destination's user
+  buffers + DBR page rebound from `vfmig_iova_replay_external`
+  records emitted by Stage-2 C7-C10 source retags. Stages 1-3
+  (UAR / ucontext / PD) are independent of `user_mr_dma` and
+  landed first.
 * **Precedes** XRC / DM / DEVX uobject continuity work. The `LIST_UOBJS`
   (K2) and per-class restore (K3/K4) machinery extends naturally to those
   types when needed.
