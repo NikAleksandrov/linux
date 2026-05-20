@@ -4480,6 +4480,41 @@ int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_mr);
 
 /*
+ * Public Stage-3 D3 destination-side bind entry point for the mlx5_ib
+ * RESTORE_MR verb body. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * Unlike the retag family (which gracefully no-ops on a non-vfmig
+ * deployment by returning 0), bind is a hard "yes vfmig is here, the
+ * placeholder exists, bind the umem to it" operation: a caller that
+ * reaches this entry point has already gated on vfmig_restore_mode +
+ * a tracked-VF ucontext and *needs* the bind to land. A NULL
+ * vfmig_iova_dom here therefore surfaces as -ENODEV so the verb body
+ * fails loudly rather than silently leaving the umem un-bound and
+ * the awaiting_bind placeholder dangling (which would later trip the
+ * Stage-3 D2 invariant that placeholders consumed at FW data-path
+ * time must have already been bound).
+ */
+int mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			    struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !sgt)
+		return -EINVAL;
+	if (mkey_index == 0 || (mkey_index & ~0xffffffU))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_bind_user_object(dom, VFMIG_HUOBJ_KIND_MR,
+					   (u64)mkey_index, sgt);
+}
+EXPORT_SYMBOL(mlx5_vfmig_bind_user_mr);
+
+/*
  * Public Stage-2 source-side retag entry point for the mlx5_ib user
  * doorbell-page allocation path. Header docstring lives in
  * include/linux/mlx5/driver.h.

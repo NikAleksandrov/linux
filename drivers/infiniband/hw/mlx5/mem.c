@@ -34,6 +34,69 @@
 #include "mlx5_ib.h"
 
 /*
+ * Stage-3 D3: pin a user MR's backing pages and bind them to the
+ * Stage-2 placeholder that LOAD_VHCA_STATE-replayed HOST_USER_PAGE
+ * records installed for the source's (KIND_MR, mkey_index) tuple.
+ *
+ * Composition (design doc §A.C):
+ *
+ *   1. ib_umem_pin(&dev->ib_dev, addr, size, access) -- pins user
+ *      pages and builds the sg_append_table without calling
+ *      dma_map_sgtable. The umem is returned in a "pinned but not
+ *      DMA-mapped" state.
+ *   2. mlx5_vfmig_bind_user_mr(dev->mdev, mkey_index, sgt) --
+ *      iommu_maps each sg at consecutive IOVAs starting at the
+ *      placeholder's recorded IOVA base, populates sg_dma_address /
+ *      sg_dma_len so subsequent vfmig_dma_ops.unmap_sg under
+ *      ib_umem_release() can match each entry, and transitions
+ *      placeholder.awaiting_bind=true -> false.
+ *
+ * On bind failure (-ENOENT placeholder miss / -EBUSY double-bind /
+ * -EINVAL sgt mismatch / iommu_map errno), the umem is unwound via
+ * ib_umem_release(). Per design §A.H L2 this is safe on a tracked VF
+ * even when sg_dma_address is partially populated: the underlying
+ * vfmig_dma_ops.unmap_sg path skips sgs whose sg_dma_address is zero
+ * (vfmig_dma_ops.c::vfmig_dma_ops_unmap_sg), so the un-bound sgs
+ * are no-ops and the partially-bound ones (whose iommu_map this
+ * helper *did* land before failing) match registry entries already
+ * unmapped by mlx5_vfmig_bind_user_mr()'s rollback path. The net
+ * effect is exactly one iommu_map / unmap pair per partially-bound
+ * sg, identical to the success-then-release lifecycle.
+ *
+ * Caller (mlx5_ib_restore_mr) responsibilities:
+ *   - Gate on context->vfmig_restore_mode + a tracked-VF ucontext
+ *     before calling. A non-tracked VF reaches this helper only via
+ *     direct driver-internal misuse; -ENODEV surfaces from the
+ *     mlx5_vfmig_bind_user_mr fast-path gate so the verb fails
+ *     loudly rather than silently leaking pins.
+ *   - mkey_index must match what the SAVE-side retag emitted as the
+ *     HOST_USER_PAGE record's fw_id (== source mkey >> 8).
+ *
+ * Returns the populated struct ib_umem on success (the caller stores
+ * it in mr->umem); ERR_PTR on any failure with all resources
+ * released.
+ */
+struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
+					u32 mkey_index, unsigned long addr,
+					size_t size, int access)
+{
+	struct ib_umem *umem;
+	int err;
+
+	umem = ib_umem_pin(&dev->ib_dev, addr, size, access);
+	if (IS_ERR(umem))
+		return umem;
+
+	err = mlx5_vfmig_bind_user_mr(dev->mdev, mkey_index,
+				      &umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(umem);
+		return ERR_PTR(err);
+	}
+	return umem;
+}
+
+/*
  * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
  * filled in the pas array.
  */

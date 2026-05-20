@@ -1520,6 +1520,70 @@ mlx5_vfmig_retag_user_srq(struct mlx5_core_dev *vf_dev, u32 srqn,
 }
 #endif
 
+struct sg_table;
+
+/*
+ * Stage-3 D3: destination-side bind for a freshly-pinned user MR umem
+ * inside the per-VF vfmig deterministic IOVA domain.
+ *
+ * Mirrors the SAVE-side retag chain (mlx5_vfmig_retag_user_mr) but
+ * runs on the destination after LOAD_VHCA_STATE has installed the
+ * (kind=MR, fw_id=mkey_index) placeholder and after the RESTORE_MR
+ * verb body has pinned the user pages via ib_umem_pin(). The bind
+ * iommu_maps each sg in @sgt at the placeholder's IOVA range,
+ * populates sg_dma_address / sg_dma_len so subsequent
+ * vfmig_dma_ops.unmap_sg under ib_umem_release() can find and unmap
+ * each entry, and transitions the placeholder awaiting_bind=true ->
+ * false.
+ *
+ * @vf_dev:        this ucontext's underlying mlx5_core_dev
+ *                 (mlx5_ib_dev->mdev). O(1) NULL-load gate on
+ *                 vf_dev->cmd.vfmig_iova_dom; no PF intf_state_mutex
+ *                 hit on non-vfmig deployments.
+ * @mkey_index:    24-bit FW mkey_index that identifies the source
+ *                 MR. Same value the SAVE-side retag emitted on the
+ *                 wire via HOST_USER_PAGE record's instance_key.
+ * @sgt:          umem->sgt_append.sgt from ib_umem_pin(). All sgs
+ *                 must have phys + length both PAGE_SIZE-aligned;
+ *                 summed length must equal the placeholder's
+ *                 recorded len (== the source umem's byte length).
+ *
+ * Returns 0 on success, or:
+ *   -ENODEV   non-vfmig deployment / VF not tracked (no domain).
+ *             Callers gate at a higher level and shouldn't reach
+ *             this errno; surface it so the verb body fails loudly
+ *             rather than silently leaving the umem un-bound.
+ *   -ENOENT   no placeholder at (KIND_MR, mkey_index) -- CRIU
+ *             plugin is binding a uobject the source never
+ *             SAVE'd, or whose mkey_index doesn't match Stage 2's
+ *             emit.
+ *   -EBUSY    placeholder already bound (double-bind).
+ *   -EINVAL   sgt total != placeholder len / non-page-aligned sg /
+ *             KIND validation.
+ *   <0        iommu_map failure (rolled back inside the primitive;
+ *             placeholder retained for retry).
+ *
+ * Per design §A.H L2, on a non-zero return the caller MUST NOT
+ * consume sg_dma_address on any sg; partially-populated values are
+ * left in place so the caller's ib_umem_release() unwind reaches
+ * vfmig_dma_ops.unmap_sg which skips zero-iova sgs safely.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §7 and
+ * §A.C (Stage 3 D3: mlx5_ib_umem_restore -> mlx5_vfmig_bind_user_mr
+ * -> vfmig_iova_bind_user_object).
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			    struct sg_table *sgt);
+#else
+static inline int
+mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {
