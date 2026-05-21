@@ -1523,9 +1523,20 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 }
 
 /*
- * dom->lock held. Insert @new into the (kind, fw_id) secondary
- * rb-tree index keyed by @new->instance_key. Returns 0 on success,
- * -EEXIST if a different entry already lives at the same key.
+ * dom->lock held. Insert @new into the (instance_key, iova) secondary
+ * rb-tree index. The composite ordering matters: a single user
+ * uobject (MR/CQ/QP/SRQ) whose umem spans more than one page produces
+ * one registry entry per source-side sg (vfmig_dma_ops_map_sg iterates
+ * the umem's sg_table and bumps the cursor per sg). All those
+ * registry entries share @instance_key (one (kind, fw_id) pair per
+ * uobject) but have distinct iovas, so without iova in the secondary
+ * key the second sibling's insert would falsely collide with the
+ * first.
+ *
+ * Returns 0 on success, -EEXIST only on the truly-impossible
+ * same-(instance_key, iova) duplicate, which would mean the caller
+ * inserted the same entry twice or the dom->pages primary index has
+ * gone out of sync with itself (kernel bug, not a caller bug).
  *
  * Pre-condition: VFMIG_HUOBJ_KIND(@new->instance_key) != KIND_NONE
  * (auto-numbered entries don't go in the tree). Caller is
@@ -1547,6 +1558,10 @@ vfmig_iova_user_index_insert_locked(struct vfmig_iova_domain *dom,
 			link = &parent->rb_left;
 		else if (new->instance_key > p->instance_key)
 			link = &parent->rb_right;
+		else if (new->iova < p->iova)
+			link = &parent->rb_left;
+		else if (new->iova > p->iova)
+			link = &parent->rb_right;
 		else
 			return -EEXIST;
 	}
@@ -1556,34 +1571,74 @@ vfmig_iova_user_index_insert_locked(struct vfmig_iova_domain *dom,
 }
 
 /*
- * dom->lock held. Look up the external registry entry whose
- * @instance_key equals @key in the (kind, fw_id) secondary index, or
- * return NULL if no entry exists at that key.
+ * dom->lock held. Look up the LEFTMOST (lowest-iova) external
+ * registry entry whose @instance_key equals @key in the
+ * (instance_key, iova) secondary index, or return NULL if no entry
+ * exists at that key.
+ *
+ * For a single-page uobject the leftmost match is the only match.
+ * For a multi-page uobject (umem spans >1 page producing N source-
+ * side sgs and N registry sibling entries), the leftmost match is
+ * the head of the sibling chain; the caller iterates with
+ * vfmig_iova_user_index_next_sibling_locked() to walk the rest.
  *
  * The C1 foundation commit deferred this helper because no in-tree
  * caller existed yet; Stage 3 D2's vfmig_iova_bind_user_object() is
  * the first consumer. Stage 3 wires the verb-driven bind path
  * (mlx5_ib_restore_X -> mlx5_ib_umem_restore -> vfmig_iova_bind_user_object)
  * and uses this lookup to translate a verb-supplied (kind, fw_id)
- * pair into the awaiting_bind=true placeholder installed earlier by
- * vfmig_iova_replay_external().
+ * pair into the awaiting_bind=true placeholder(s) installed earlier
+ * by vfmig_iova_replay_external().
  */
 static struct vfmig_iova_page *
 vfmig_iova_user_index_lookup_locked(struct vfmig_iova_domain *dom, u64 key)
 {
 	struct rb_node *n = dom->user_index.rb_node;
 	struct vfmig_iova_page *p;
+	struct vfmig_iova_page *found = NULL;
 
 	while (n) {
 		p = rb_entry(n, struct vfmig_iova_page, user_index_node);
-		if (key < p->instance_key)
+		if (key < p->instance_key) {
 			n = n->rb_left;
-		else if (key > p->instance_key)
+		} else if (key > p->instance_key) {
 			n = n->rb_right;
-		else
-			return p;
+		} else {
+			/*
+			 * Match: any leftmost-with-the-same-key candidate
+			 * lives in n->rb_left (composite ordering: (key,
+			 * x < n->iova) is in the left subtree). Walking
+			 * left from a non-matching node still terminates
+			 * at the correct leaf because the BST invariant
+			 * guarantees go-left/go-right decisions explore
+			 * the right subtrees.
+			 */
+			found = p;
+			n = n->rb_left;
+		}
 	}
-	return NULL;
+	return found;
+}
+
+/*
+ * dom->lock held. Return the next sibling of @p in the
+ * (instance_key, iova) secondary index, or NULL if @p is the
+ * trailing sibling. Sibling ordering is iova-ascending, mirroring
+ * the dom->pages primary index for the iova range a single uobject
+ * occupies.
+ */
+static struct vfmig_iova_page *
+vfmig_iova_user_index_next_sibling_locked(struct vfmig_iova_page *p)
+{
+	struct rb_node *next = rb_next(&p->user_index_node);
+	struct vfmig_iova_page *q;
+
+	if (!next)
+		return NULL;
+	q = rb_entry(next, struct vfmig_iova_page, user_index_node);
+	if (q->instance_key != p->instance_key)
+		return NULL;
+	return q;
 }
 
 /*
@@ -1604,7 +1659,10 @@ vfmig_iova_user_index_lookup_locked(struct vfmig_iova_domain *dom, u64 key)
  * Same window/alignment validation as install_external_phys_locked:
  *   -EINVAL  bad alignment / wrong slot / KIND_NONE key
  *   -ERANGE  IOVA outside USER_PAGE sub-window
- *   -EEXIST  duplicate IOVA or duplicate instance_key
+ *   -EEXIST  duplicate IOVA (the secondary index uses composite
+ *            (instance_key, iova) ordering, so multi-page replays
+ *            sharing one instance_key across N distinct iovas no
+ *            longer collide on the second sibling)
  *   -ENOMEM  kzalloc failure
  */
 static int
@@ -1720,13 +1778,22 @@ int vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 	/*
 	 * Iteration order: dom->pages is sorted by IOVA, so a single
 	 * forward walk finds every entry that overlaps [base, limit).
-	 * If a mid-range secondary-index insert fails (-EEXIST means
-	 * the destination is asking to claim a (kind, fw_id) that's
-	 * already taken by another uobject), a rollback re-walks the
-	 * same range and reverts every entry we tagged with
-	 * @new_instance_key back to instance_key = 0 (the auto-
-	 * numbered values are not preserved -- v0 retag callsites
-	 * abandon the auto-numbered identity on success anyway).
+	 * Multi-page user objects (umem spanning >1 page) yield
+	 * multiple registry entries inside [base, limit), one per
+	 * source-side sg, all retagged with the same key. The
+	 * (instance_key, iova) secondary index disambiguates them
+	 * (siblings have distinct iovas), so per-page inserts no
+	 * longer self-collide.
+	 *
+	 * The "another uobject already claimed this (kind, fw_id)"
+	 * case is caught by the kind != NONE check below before the
+	 * insert, returning -EEXIST. A rare insert-time -EEXIST means
+	 * a (instance_key, iova) duplicate, which is a kernel-state
+	 * bug. Either error triggers the rollback walk, which reverts
+	 * every entry we tagged with @new_instance_key in this call
+	 * back to instance_key = 0 (the auto-numbered values are not
+	 * preserved -- v0 retag callsites abandon the auto-numbered
+	 * identity on success anyway).
 	 */
 
 	if (!dom || length == 0)
@@ -1773,9 +1840,10 @@ int vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 		}
 		/*
 		 * Auto-numbered (kind == NONE) entry: overwrite the key
-		 * and insert into the secondary index. If the insert
-		 * conflicts with an entry already at this key, roll back
-		 * everything we did this call (see retagged_entries).
+		 * and insert into the secondary index. With composite
+		 * (instance_key, iova) ordering this only fails on a
+		 * truly-duplicate (key, iova) pair (kernel bug). Either
+		 * way roll back everything we did this call.
 		 */
 		p->instance_key = new_instance_key;
 		err = vfmig_iova_user_index_insert_locked(dom, p);
@@ -1845,11 +1913,13 @@ int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 				u8 kind, u64 fw_id,
 				struct sg_table *sgt)
 {
-	struct vfmig_iova_page *entry;
+	struct vfmig_iova_page *head, *sib;
 	struct scatterlist *sg;
 	u64 instance_key;
-	u64 iova_cur, iova_start;
-	size_t total = 0;
+	u64 iova_cur, iova_start, sib_walk;
+	size_t reg_total = 0;
+	size_t sgt_total = 0;
+	unsigned int n_siblings = 0;
 	unsigned int i;
 	int err;
 
@@ -1862,62 +1932,102 @@ int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 
 	mutex_lock(&dom->lock);
 
-	entry = vfmig_iova_user_index_lookup_locked(dom, instance_key);
-	if (!entry) {
+	head = vfmig_iova_user_index_lookup_locked(dom, instance_key);
+	if (!head) {
 		err = -ENOENT;
 		goto out_unlock;
 	}
+
 	/*
-	 * Defensive: secondary index is only populated for external
-	 * USER_PAGE entries (see install_external_placeholder_locked and
-	 * retag_external_range). A non-USER_PAGE hit here means the
-	 * index has been corrupted, which is a kernel bug rather than a
-	 * caller bug -- still return an errno (not BUG_ON) so the verb
-	 * surface can propagate it.
+	 * Walk every sibling under @instance_key (multi-page user
+	 * MR/CQ/QP/SRQ produce one registry entry per source-side sg,
+	 * all sharing the same instance_key but at distinct iovas).
+	 *
+	 * Validate, in one pass:
+	 *   (a) every sibling is an external USER_PAGE entry,
+	 *   (b) every sibling is still awaiting bind (a partial-bound
+	 *       state is a kernel-state bug; we mark all-or-nothing),
+	 *   (c) sibling iovas are tightly contiguous -- the source-side
+	 *       map_sg path uses a bump cursor for the whole sg_table
+	 *       in one call, so consecutive sgs of one umem land on
+	 *       consecutive iovas; replay_external honours that exact
+	 *       layout when re-installing the placeholders, so
+	 *       contiguity should always hold here. Anything else is
+	 *       SAVE/LOAD wire-format drift or registry corruption,
+	 *       not a CRIU caller bug.
+	 *
+	 * Also accumulate reg_total = sum of sibling lens so we can
+	 * verify the destination's umem covers the same byte range.
 	 */
-	if (!entry->external || entry->slot != VFMIG_SLOT_USER_PAGE) {
-		dev_err_ratelimited(&dom->vf_pdev->dev,
-				    "vfmig_iova: vf %u bind_user_object: kind=%u fw_id=0x%llx index hit non-USER_PAGE entry (slot=%u external=%d)\n",
-				    dom->vf_id, kind,
-				    (unsigned long long)fw_id, entry->slot,
-				    entry->external);
-		err = -EINVAL;
-		goto out_unlock;
-	}
-	if (!entry->awaiting_bind) {
-		err = -EBUSY;
-		goto out_unlock;
+	sib_walk = head->iova;
+	for (sib = head; sib;
+	     sib = vfmig_iova_user_index_next_sibling_locked(sib)) {
+		if (!sib->external || sib->slot != VFMIG_SLOT_USER_PAGE) {
+			dev_err_ratelimited(&dom->vf_pdev->dev,
+					    "vfmig_iova: vf %u bind_user_object: kind=%u fw_id=0x%llx sibling %u hit non-USER_PAGE entry (slot=%u external=%d)\n",
+					    dom->vf_id, kind,
+					    (unsigned long long)fw_id,
+					    n_siblings, sib->slot,
+					    sib->external);
+			err = -EINVAL;
+			goto out_unlock;
+		}
+		if (!sib->awaiting_bind) {
+			err = -EBUSY;
+			goto out_unlock;
+		}
+		if (sib->iova != sib_walk) {
+			dev_err_ratelimited(&dom->vf_pdev->dev,
+					    "vfmig_iova: vf %u bind_user_object: kind=%u fw_id=0x%llx sibling %u iova 0x%llx not contiguous with previous end 0x%llx\n",
+					    dom->vf_id, kind,
+					    (unsigned long long)fw_id,
+					    n_siblings,
+					    (unsigned long long)sib->iova,
+					    (unsigned long long)sib_walk);
+			err = -EINVAL;
+			goto out_unlock;
+		}
+		sib_walk = sib->iova + sib->len;
+		reg_total += sib->len;
+		n_siblings++;
 	}
 
 	/*
-	 * The placeholder's @len is the umem byte length the source
-	 * SAVE'd (carried by the HOST_USER_PAGE wire record and replayed
-	 * verbatim by vfmig_iova_replay_external). The destination's
-	 * ib_umem_pin produces an sg_table whose summed sg lengths equal
-	 * the same umem byte length, so a mismatch means the verb body
-	 * is binding the wrong umem (different addr/size from SAVE).
+	 * The aggregate placeholder length is the umem byte length the
+	 * source SAVE'd, summed across all siblings. The destination's
+	 * ib_umem_pin produces an sg_table whose summed sg lengths
+	 * equal the same umem byte length, so a mismatch means the
+	 * verb body is binding the wrong umem (different addr/size
+	 * from SAVE). The destination's sg layout doesn't have to
+	 * match the source's sibling layout 1:1 -- only the total byte
+	 * coverage matches. We map the dst sgs sequentially at
+	 * consecutive iovas starting from the head sibling's iova,
+	 * filling the [head->iova, head->iova + reg_total) range the
+	 * source SAVE'd, regardless of how the dst-side sg_table
+	 * happens to be split.
 	 */
 	for_each_sgtable_sg(sgt, sg, i)
-		total += sg->length;
-	if (total != entry->len) {
+		sgt_total += sg->length;
+	if (sgt_total != reg_total) {
 		dev_warn_ratelimited(&dom->vf_pdev->dev,
-				     "vfmig_iova: vf %u bind_user_object: kind=%u fw_id=0x%llx sgt total %zu != placeholder len %zu\n",
+				     "vfmig_iova: vf %u bind_user_object: kind=%u fw_id=0x%llx sgt total %zu != registry total %zu (across %u sibling(s))\n",
 				     dom->vf_id, kind,
-				     (unsigned long long)fw_id, total,
-				     entry->len);
+				     (unsigned long long)fw_id, sgt_total,
+				     reg_total, n_siblings);
 		err = -EINVAL;
 		goto out_unlock;
 	}
 
 	/*
-	 * One iommu_map per sg, mapping the run of physically-contiguous
-	 * pages sg_alloc_append_table_from_pages built. sg->offset is 0
-	 * and sg->length is PAGE_SIZE-aligned for umem-pinned sg_tables;
-	 * we still validate per sg before each iommu_map so a future
-	 * caller with non-umem sgt shapes fails loudly rather than
-	 * tripping iommu_map's internal alignment WARN.
+	 * One iommu_map per dst sg, mapping the run of physically-
+	 * contiguous pages sg_alloc_append_table_from_pages built.
+	 * sg->offset is 0 and sg->length is PAGE_SIZE-aligned for
+	 * umem-pinned sg_tables; we still validate per sg before each
+	 * iommu_map so a future caller with non-umem sgt shapes fails
+	 * loudly rather than tripping iommu_map's internal alignment
+	 * WARN.
 	 */
-	iova_start = entry->iova;
+	iova_start = head->iova;
 	iova_cur   = iova_start;
 	for_each_sgtable_sg(sgt, sg, i) {
 		phys_addr_t phys = page_to_phys(sg_page(sg)) + sg->offset;
@@ -1944,7 +2054,20 @@ int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 		iova_cur += sg->length;
 	}
 
-	entry->awaiting_bind = false;
+	/*
+	 * All-or-nothing transition: every sibling flips together so
+	 * a partial bind is never observable.
+	 *
+	 * @awaiting_bind_hits is the bind-call counter, so it
+	 * increments once per uobject (one bind = one uobject =
+	 * potentially many sibling pages). The QUERY_AWAITING_BIND
+	 * ioctl, which iterates dom->pages, naturally reports per-
+	 * page residency: a multi-page uobject contributes N to its
+	 * kind's awaiting count until bind flips all N flags here.
+	 */
+	for (sib = head; sib;
+	     sib = vfmig_iova_user_index_next_sibling_locked(sib))
+		sib->awaiting_bind = false;
 	atomic_long_inc(&dom->awaiting_bind_hits);
 	err = 0;
 
@@ -1960,8 +2083,9 @@ out_rollback:
 	 * and uses ib_umem_release() to drop pins. vfmig_dma_ops.unmap_sg
 	 * skips sgs with sg_dma_address == 0, so partially-bound sgs that
 	 * we did *not* populate above (and the iommu range we just freed)
-	 * see no second unmap attempt. @entry remains awaiting_bind=true
-	 * so subsequent RESTORE_X retries on the same fw_id can try again.
+	 * see no second unmap attempt. Every sibling remains
+	 * awaiting_bind=true so subsequent RESTORE_X retries on the same
+	 * (kind, fw_id) can try again.
 	 */
 	if (iova_cur > iova_start)
 		(void)iommu_unmap(dom->iommu_dom, iova_start,
