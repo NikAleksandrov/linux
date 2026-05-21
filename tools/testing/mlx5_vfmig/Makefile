@@ -19,6 +19,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig	\
 	uobject_restore/mr_restore/mr_restore_probe_rxe	\
 	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig		\
+	uobject_restore/cq_restore/cq_restore_probe_rxe		\
 	save_load/user_object_replay/user_object_replay_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
@@ -106,6 +107,17 @@ uobject_restore/mr_restore/mr_restore_probe_rxe: \
 # Both are inlined in the probe; libmlx5 has no plumbing for either.
 uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig: \
 		uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# RESTORE_CQ + rxe_restore_cq S5a probe (design/uobject_restore.md §9.7).
+# Same libibverbs-only / raw-uverbs pattern as pd_restore_probe_rxe:
+# library is used only for ibdev->uverbs cdev mapping; the GET_CONTEXT
+# udata path needs the rxe RXE_ALLOC_UCTX_RESTORE_MODE flag, plus the
+# probe issues a raw RESTORE_CQ ioctl with FD-class attrs (COMP_CHANNEL),
+# none of which librxe / libibverbs has plumbing for. UAPI ids inlined
+# in the source for the same reason as the other rxe restore probes.
+uobject_restore/cq_restore/cq_restore_probe_rxe: \
+		uobject_restore/cq_restore/cq_restore_probe_rxe.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 # user_mr_dma stage-2 success-criterion probe
