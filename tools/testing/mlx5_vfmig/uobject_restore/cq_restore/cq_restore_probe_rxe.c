@@ -33,7 +33,19 @@
  *      the design choice that the comp_channel attr is declared but
  *      refused at v0 -- any future regression that silently accepts
  *      it would surface here.
- *   6. Destroy round-trip. IB_USER_VERBS_CMD_DESTROY_CQ clears the
+ *   6. NLDEV identity. Walk RDMA_NLDEV_CMD_RES_CQ_GET (the same view
+ *      `rdma resource show cq` consumes) and assert that exactly one
+ *      entry in the dump carries pid=getpid() AND
+ *      RDMA_NLDEV_ATTR_RES_HANDLE=TARGET_HANDLE. INFO_HANDLES already
+ *      validates that the uobj is in the ufile xarray under
+ *      target_handle (subtest 3); this subtest validates the
+ *      complementary path -- that the restrack tree sees the CQ and
+ *      reports the same handle. Catches a regression class
+ *      INFO_HANDLES does not: forgetting `rdma_restrack_add` in the
+ *      restore handler, or any future drift between the xarray and
+ *      restrack views of the same CQ. Locks in the K8a claim of
+ *      design §7.5.1 for the RESTORE_CQ path.
+ *   7. Destroy round-trip. IB_USER_VERBS_CMD_DESTROY_CQ clears the
  *      CQ handle; INFO_HANDLES no longer reports it. The S5a-on-rxe
  *      half of the v0 dealloc-ordering invariant: rxe restored CQs
  *      destroy cleanly because rxe has no FW graph and no
@@ -67,11 +79,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <linux/netlink.h>
+
 #include <infiniband/verbs.h>
 #include <rdma/ib_user_verbs.h>
+
+/*
+ * In-tree kernel UAPI header (rather than rdma-core's installed copy)
+ * so we always pick up the full set of NLDEV attribute enumerators
+ * regardless of the host's rdma-core version. Same coupling shape as
+ * tools/testing/mlx5_vfmig/uobject_restore/nldev_res_handle/...
+ */
+#include "../../../../../include/uapi/rdma/rdma_netlink.h"
 
 /*
  * Mirrors include/uapi/rdma/rdma_user_rxe.h. See pd_restore_probe_rxe.c
@@ -353,6 +376,288 @@ static bool handle_present(const uint32_t *list, uint32_t n, uint32_t want)
 	return false;
 }
 
+/* ----------------------- NETLINK_RDMA helpers ---------------------------- *
+ *
+ * Specialised slice of the helpers in
+ * tools/testing/mlx5_vfmig/uobject_restore/nldev_res_handle/nldev_res_handle_probe.c
+ * for the single (ibdev -> dev_index, dump RES_CQ -> find pid+handle)
+ * lookup subtest 6 needs. Kept inline here rather than refactored into a
+ * shared header because (a) the netlink surface is small enough that
+ * duplication beats build-system coupling for probe binaries, and (b)
+ * the two probes have different walk semantics (this one is
+ * point-lookup, the other is full-validation across all classes).
+ */
+
+#define NL_BUFSZ		(64 * 1024)
+
+#ifndef NLA_TYPE_MASK
+#define NLA_TYPE_MASK    (~(NLA_F_NESTED | NLA_F_NET_BYTEORDER))
+#endif
+
+#define NLA_OK(p, rem)   ((rem) >= (int)sizeof(struct nlattr) &&         \
+			  (p)->nla_len >= sizeof(struct nlattr) &&       \
+			  (p)->nla_len <= (rem))
+#define NLA_NEXT(p, rem) ((rem) -= NLA_ALIGN((p)->nla_len),              \
+			  (struct nlattr *)((char *)(p) + NLA_ALIGN((p)->nla_len)))
+#define NLA_DATA(p)      ((void *)((char *)(p) + NLA_HDRLEN))
+#define NLA_PAYLOAD(p)   ((p)->nla_len - NLA_HDRLEN)
+
+static int nl_open(void)
+{
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	int sk;
+
+	sk = socket(AF_NETLINK, SOCK_RAW, NETLINK_RDMA);
+	if (sk < 0) {
+		perror("socket(NETLINK_RDMA)");
+		return -1;
+	}
+	if (bind(sk, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		perror("bind(NETLINK_RDMA)");
+		close(sk);
+		return -1;
+	}
+	return sk;
+}
+
+static struct nlattr *nla_find(void *buf, int len, uint16_t type)
+{
+	struct nlattr *nla;
+
+	for (nla = buf; NLA_OK(nla, len); nla = NLA_NEXT(nla, len))
+		if ((nla->nla_type & NLA_TYPE_MASK) == type)
+			return nla;
+	return NULL;
+}
+
+/*
+ * Send a NETLINK_RDMA dump request. RDMA_NLDEV_CMD_RES_CQ_GET requires
+ * RDMA_NLDEV_ATTR_DEV_INDEX in the request (kernel rejects with -EINVAL
+ * via res_get_common_dumpit otherwise). The plain RDMA_NLDEV_CMD_GET
+ * dump used to resolve ibdev_name -> dev_index does NOT take
+ * DEV_INDEX (with_devix=false enumerates every device).
+ */
+static int nl_send_dump(int sk, uint16_t nlmsg_type, bool with_devix,
+			uint32_t dev_index)
+{
+	struct {
+		struct nlmsghdr  hdr;
+		struct nlattr    devix_hdr;
+		uint32_t         devix_val;
+	} req = {0};
+	struct iovec iov = { .iov_base = &req };
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	struct msghdr msg = {
+		.msg_name = &sa,
+		.msg_namelen = sizeof(sa),
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
+
+	if (with_devix) {
+		req.hdr.nlmsg_len  = NLMSG_HDRLEN +
+				     NLA_HDRLEN + sizeof(uint32_t);
+		req.devix_hdr.nla_len  = NLA_HDRLEN + sizeof(uint32_t);
+		req.devix_hdr.nla_type = RDMA_NLDEV_ATTR_DEV_INDEX;
+		req.devix_val          = dev_index;
+		iov.iov_len = req.hdr.nlmsg_len;
+	} else {
+		req.hdr.nlmsg_len = NLMSG_HDRLEN;
+		iov.iov_len = NLMSG_HDRLEN;
+	}
+	req.hdr.nlmsg_type  = nlmsg_type;
+	req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	req.hdr.nlmsg_seq   = 1;
+
+	if (sendmsg(sk, &msg, 0) < 0) {
+		perror("sendmsg(NETLINK_RDMA dump)");
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Walk RDMA_NLDEV_CMD_GET to translate ibdev_name -> kernel dev_index.
+ * Returns 0 on hit (with *out populated), -1 on transport / parse error
+ * or if the name was not in the dump.
+ *
+ * NB: dev_index 0 IS valid (xa_limit_31b starts at 0); never overload
+ * 0 as "not found".
+ */
+static int nl_resolve_ibdev_index(const char *ibdev, uint32_t *out)
+{
+	char buf[NL_BUFSZ];
+	bool done = false;
+	int sk = nl_open();
+
+	if (sk < 0)
+		return -1;
+	if (nl_send_dump(sk, RDMA_NL_GET_TYPE(RDMA_NL_NLDEV,
+					      RDMA_NLDEV_CMD_GET),
+			 false, 0)) {
+		close(sk);
+		return -1;
+	}
+
+	while (!done) {
+		ssize_t n = recv(sk, buf, sizeof(buf), 0);
+		struct nlmsghdr *nh;
+
+		if (n < 0) {
+			perror("recv(NLDEV_CMD_GET dump)");
+			close(sk);
+			return -1;
+		}
+		for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, n);
+		     nh = NLMSG_NEXT(nh, n)) {
+			void *payload;
+			int   len;
+			struct nlattr *name_attr;
+			struct nlattr *idx_attr;
+
+			if (nh->nlmsg_type == NLMSG_DONE) {
+				done = true;
+				break;
+			}
+			if (nh->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *e = NLMSG_DATA(nh);
+
+				fprintf(stderr,
+					"NLMSG_ERROR resolving %s: %d (%s)\n",
+					ibdev, e->error, strerror(-e->error));
+				close(sk);
+				return -1;
+			}
+			payload = NLMSG_DATA(nh);
+			len     = nh->nlmsg_len - NLMSG_HDRLEN;
+			name_attr = nla_find(payload, len,
+					     RDMA_NLDEV_ATTR_DEV_NAME);
+			idx_attr  = nla_find(payload, len,
+					     RDMA_NLDEV_ATTR_DEV_INDEX);
+			if (!name_attr || !idx_attr)
+				continue;
+			if (strncmp(NLA_DATA(name_attr), ibdev,
+				    NLA_PAYLOAD(name_attr)) != 0)
+				continue;
+			*out = *(uint32_t *)NLA_DATA(idx_attr);
+			close(sk);
+			return 0;
+		}
+	}
+	close(sk);
+	fprintf(stderr, "ibdev %s not found in NLDEV_CMD_GET dump\n", ibdev);
+	return -1;
+}
+
+/*
+ * Dump RDMA_NLDEV_CMD_RES_CQ_GET for @dev_index, look for an entry
+ * with RES_PID == @want_pid and RES_HANDLE == @want_handle. On hit
+ * sets *@found_out=true and returns the matching RES_CQN in
+ * *@cqn_out (for diagnostic logging only). Returns 0 on success
+ * (transport-level), -1 on netlink failure.
+ */
+static int nl_find_cq_handle(uint32_t dev_index, uint32_t want_pid,
+			     uint32_t want_handle, bool *found_out,
+			     uint32_t *cqn_out)
+{
+	char buf[NL_BUFSZ];
+	bool done = false;
+	int sk = nl_open();
+
+	if (sk < 0)
+		return -1;
+	if (nl_send_dump(sk, RDMA_NL_GET_TYPE(RDMA_NL_NLDEV,
+					      RDMA_NLDEV_CMD_RES_CQ_GET),
+			 true, dev_index)) {
+		close(sk);
+		return -1;
+	}
+
+	*found_out = false;
+	*cqn_out   = 0;
+
+	while (!done) {
+		ssize_t n = recv(sk, buf, sizeof(buf), 0);
+		struct nlmsghdr *nh;
+
+		if (n < 0) {
+			perror("recv(NLDEV RES_CQ dump)");
+			close(sk);
+			return -1;
+		}
+		for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, n);
+		     nh = NLMSG_NEXT(nh, n)) {
+			void *payload;
+			int   len;
+			struct nlattr *table;
+			struct nlattr *nla;
+			int rem;
+
+			if (nh->nlmsg_type == NLMSG_DONE) {
+				done = true;
+				break;
+			}
+			if (nh->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *e = NLMSG_DATA(nh);
+
+				fprintf(stderr,
+					"NLMSG_ERROR (NLDEV RES_CQ dump): %d (%s)\n",
+					e->error, strerror(-e->error));
+				close(sk);
+				return -1;
+			}
+			payload = NLMSG_DATA(nh);
+			len     = nh->nlmsg_len - NLMSG_HDRLEN;
+
+			table = nla_find(payload, len,
+					 RDMA_NLDEV_ATTR_RES_CQ);
+			if (!table)
+				continue;
+
+			rem = NLA_PAYLOAD(table);
+			for (nla = NLA_DATA(table); NLA_OK(nla, rem);
+			     nla = NLA_NEXT(nla, rem)) {
+				bool h_seen = false, p_seen = false;
+				uint32_t handle = 0, pid = 0, cqn = 0;
+				int erem;
+				struct nlattr *e;
+
+				if ((nla->nla_type & NLA_TYPE_MASK) !=
+				    RDMA_NLDEV_ATTR_RES_CQ_ENTRY)
+					continue;
+
+				erem = NLA_PAYLOAD(nla);
+				for (e = NLA_DATA(nla); NLA_OK(e, erem);
+				     e = NLA_NEXT(e, erem)) {
+					uint16_t t = e->nla_type & NLA_TYPE_MASK;
+
+					if (t == RDMA_NLDEV_ATTR_RES_HANDLE &&
+					    NLA_PAYLOAD(e) >= 4) {
+						h_seen = true;
+						handle = *(uint32_t *)NLA_DATA(e);
+					} else if (t == RDMA_NLDEV_ATTR_RES_PID &&
+						   NLA_PAYLOAD(e) >= 4) {
+						p_seen = true;
+						pid = *(uint32_t *)NLA_DATA(e);
+					} else if (t == RDMA_NLDEV_ATTR_RES_CQN &&
+						   NLA_PAYLOAD(e) >= 4) {
+						cqn = *(uint32_t *)NLA_DATA(e);
+					}
+				}
+
+				if (h_seen && p_seen &&
+				    pid == want_pid &&
+				    handle == want_handle) {
+					*found_out = true;
+					*cqn_out   = cqn;
+				}
+			}
+		}
+	}
+	close(sk);
+	return 0;
+}
+
 /* ----------------------- device discovery -------------------------------- */
 
 static int resolve_cdev_path(const char *ibdev_name, char *out, size_t outlen)
@@ -575,13 +880,55 @@ static int subtest_comp_channel_rejected(int fd)
 	return ret;
 }
 
+static int subtest_nldev_handle_match(const char *ibdev)
+{
+	uint32_t dev_index = 0;
+	uint32_t cqn = 0;
+	bool found = false;
+	uint32_t self_pid = (uint32_t)getpid();
+	int ret;
+
+	printf("[6] nldev identity: RES_CQ dump must report pid=%u handle=0x%x\n",
+	       self_pid, TARGET_HANDLE);
+
+	if (nl_resolve_ibdev_index(ibdev, &dev_index) != 0) {
+		fprintf(stderr, "  FAIL nl_resolve_ibdev_index(%s)\n", ibdev);
+		return 1;
+	}
+
+	ret = nl_find_cq_handle(dev_index, self_pid, TARGET_HANDLE, &found,
+				&cqn);
+	if (ret) {
+		fprintf(stderr, "  FAIL NLDEV RES_CQ dump (transport)\n");
+		return 1;
+	}
+
+	if (!found) {
+		fprintf(stderr,
+			"  FAIL NLDEV RES_CQ dump: no entry with pid=%u and\n"
+			"       RES_HANDLE=0x%x. Possible regressions:\n"
+			"       - rdma_restrack_add() not called in restore_cq\n"
+			"         dispatcher path (CQ missing from restrack)\n"
+			"       - cq->uobject not pointing at the restored uobj\n"
+			"         (RES_HANDLE read site in fill_res_cq_entry)\n"
+			"       - rdma_alloc_begin_uobject_at_handle() fell back\n"
+			"         to a fresh id instead of honoring target_handle\n",
+			self_pid, TARGET_HANDLE);
+		return 1;
+	}
+
+	printf("  PASS NLDEV RES_CQ entry pid=%u res_cqn=%u handle=0x%x\n",
+	       self_pid, cqn, TARGET_HANDLE);
+	return 0;
+}
+
 static int subtest_destroy_round_trip(int fd)
 {
 	uint32_t list[16] = {};
 	uint32_t total = 0;
 	int ret;
 
-	printf("[6] destroy round-trip: DESTROY_CQ(0x%x) succeeds + handle gone\n",
+	printf("[7] destroy round-trip: DESTROY_CQ(0x%x) succeeds + handle gone\n",
 	       TARGET_HANDLE);
 
 	ret = do_destroy_cq(fd, TARGET_HANDLE);
@@ -646,6 +993,7 @@ int main(int argc, char **argv)
 	fails += subtest_happy_path(fd_restore);
 	fails += subtest_collision_handle(fd_restore);
 	fails += subtest_comp_channel_rejected(fd_restore);
+	fails += subtest_nldev_handle_match(ibdev);
 	fails += subtest_destroy_round_trip(fd_restore);
 
 	close(fd_restore);

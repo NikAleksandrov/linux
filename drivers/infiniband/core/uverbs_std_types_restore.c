@@ -276,6 +276,13 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)(
 	if (ret)
 		return ret;
 	ib_dev = ctx->device;
+	/*
+	 * destroy_cq is checked alongside restore_cq because the cleanup
+	 * path (uverbs_free_cq -> ib_destroy_cq_user) calls it
+	 * unconditionally on any CQ uobject -- including ones we just
+	 * created here via restore. A driver that lacks destroy_cq would
+	 * leak the kernel object on uobject teardown; reject up front.
+	 */
 	if (!ib_dev->ops.restore_cq || !ib_dev->ops.destroy_cq)
 		return -EOPNOTSUPP;
 
