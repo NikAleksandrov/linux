@@ -166,6 +166,35 @@ enum {
 	UVERBS_ATTR_RESTORE_CQ_RESP_CQE		= 7,
 };
 
+/*
+ * UA_UHW()'s output half. UVERBS_ID_DRIVER_NS_SHIFT is 12 (1<<12 = 4096)
+ * and UVERBS_ATTR_UHW_OUT = UVERBS_ID_DRIVER_NS + 1; mirrored from
+ * include/uapi/rdma/ib_user_ioctl_cmds.h. Same constant the existing
+ * pd_restore_probe_mlx5_vfmig and mr_restore_probe_mlx5_vfmig probes
+ * inline for the same reason -- the headers-install rdma uapi layout
+ * doesn't expose this through libibverbs.
+ */
+#define UVERBS_ATTR_UHW_OUT			((uint16_t)4097)
+
+/*
+ * Mirrors include/uapi/rdma/rdma_user_rxe.h's struct rxe_create_cq_resp
+ * (one struct mminfo: __aligned_u64 offset, __u32 size, __u32 pad).
+ * rxe_restore_cq insists on udata->outlen >= sizeof(rxe_create_cq_resp)
+ * and writes the kernel-allocated CQ ring's mmap offset/size into it.
+ * The probe never actually mmaps the resulting buffer (subtest 7
+ * tears it down via DESTROY_CQ before it would matter); we just need
+ * a buffer of the right size to satisfy rxe's pre-check.
+ */
+struct rxe_mminfo_local {
+	uint64_t	offset;
+	uint32_t	size;
+	uint32_t	pad;
+};
+
+struct rxe_create_cq_resp_local {
+	struct rxe_mminfo_local mi;
+};
+
 /* Matches enum in include/uapi/rdma/ib_user_ioctl_verbs.h. */
 #define RDMA_DRIVER_RXE_LOCAL			14
 
@@ -261,21 +290,26 @@ static int do_destroy_cq(int fd, uint32_t cq_handle)
  * RESTORE_CQ ioctl request. core: HANDLE/CQE/USER_HANDLE/COMP_VECTOR
  * mandatory + RESP_CQE mandatory out; FLAGS/COMP_CHANNEL/EVENT_FD
  * optional. We omit FLAGS + EVENT_FD on every call (v0 plugin path),
- * and only include COMP_CHANNEL on the rejection subtest.
+ * and only include COMP_CHANNEL on the rejection subtest. We always
+ * attach a UHW_OUT buffer because rxe_restore_cq insists on
+ * udata->outlen >= sizeof(struct rxe_create_cq_resp); the buffer's
+ * contents are written by the kernel but ignored by the probe.
  *
  * Wire encoding refresher (uverbs_ioctl.c):
  *   - PTR_IN(__u32):	len = 4, data = inline value
  *   - PTR_IN(__u64):	len = 8, data = inline value
  *   - PTR_OUT(__u32):	len = 4, data = (uintptr_t)&user_buf
  *   - FD/IDR class:	len = 0, data = fd / idr handle
+ *   - UHW_IN/UHW_OUT:	len = sizeof(buf), data = (uintptr_t)&buf
  */
 static int do_restore_cq(int fd, uint32_t target_handle, uint32_t cqe,
 			 uint64_t user_handle, uint32_t comp_vector,
 			 int comp_channel_fd, uint32_t *resp_cqe_out)
 {
+	struct rxe_create_cq_resp_local uhw_out = {};
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[6];
+		struct ib_uverbs_attr		attrs[7];
 	} cmd = {};
 	unsigned int n = 0;
 
@@ -319,6 +353,19 @@ static int do_restore_cq(int fd, uint32_t target_handle, uint32_t cqe,
 	cmd.attrs[n].len	= sizeof(uint32_t);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)resp_cqe_out;
+	n++;
+
+	/*
+	 * UHW_OUT: rxe_restore_cq's mandatory uresp-buffer-size check.
+	 * Optional in the dispatcher schema (UA_UHW), so flags = 0;
+	 * we provide it unconditionally because the dispatcher passes
+	 * the length straight through to rxe via attrs->driver_udata
+	 * and rxe rejects with -EINVAL if outlen < sizeof(uresp).
+	 */
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_UHW_OUT;
+	cmd.attrs[n].len	= sizeof(uhw_out);
+	cmd.attrs[n].flags	= 0;
+	cmd.attrs[n].data	= (uintptr_t)&uhw_out;
 	n++;
 
 	cmd.hdr.num_attrs = n;
