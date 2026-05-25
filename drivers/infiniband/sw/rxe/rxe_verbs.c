@@ -1223,27 +1223,51 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 		uresp = udata->outbuf;
 
 		/*
-		 * UHW_IN is optional. inlen == 0 means the caller did
-		 * not provide a struct rxe_restore_cq_req (legacy /
-		 * pgoff-agnostic restore); inlen >= sizeof(req) accepts
-		 * future-extended versions and copies in the prefix we
-		 * understand. Any other inlen is a malformed request
-		 * (a truncated req would silently lose vm_pgoff bits).
+		 * UHW_IN is optional.
+		 *   inlen == 0      -- legacy / pgoff-agnostic restore;
+		 *                      forced_vm_pgoff stays 0.
+		 *   inlen >= 8B+1   -- userspace shipped a real
+		 *                      rxe_restore_cq_req (the struct is
+		 *                      sized strictly larger than __u64
+		 *                      to escape the inline-attr trap;
+		 *                      see the size note in
+		 *                      include/uapi/rdma/rdma_user_rxe.h).
+		 *                      Copy the prefix we understand
+		 *                      (sizeof(req) here, capped to
+		 *                      what userspace shipped) and
+		 *                      validate forward-compat reserved
+		 *                      bits are zero. Tolerate trailing
+		 *                      bytes silently for ABI evolution.
+		 *   0 < inlen <= 8B -- malformed: would land in the
+		 *                      inline-attr path and the kernel
+		 *                      would read attr->data verbatim
+		 *                      as the payload (almost certainly
+		 *                      a userspace pointer, never the
+		 *                      pgoff the caller meant). Reject
+		 *                      to surface the bug loudly.
 		 */
-		if (udata->inlen >= sizeof(req)) {
-			err = ib_copy_from_udata(&req, udata, sizeof(req));
+		if (udata->inlen > sizeof(__u64)) {
+			size_t n = min_t(size_t, udata->inlen, sizeof(req));
+
+			err = ib_copy_from_udata(&req, udata, n);
 			if (err) {
 				rxe_dbg_dev(rxe,
 					    "bad restore cq req, err = %d\n",
 					    err);
 				goto err_out;
 			}
+			if (req.reserved) {
+				err = -EINVAL;
+				rxe_dbg_dev(rxe,
+					    "restore cq req reserved must be 0\n");
+				goto err_out;
+			}
 			forced_vm_pgoff = req.vm_pgoff;
 		} else if (udata->inlen != 0) {
 			err = -EINVAL;
 			rxe_dbg_dev(rxe,
-				    "short restore cq req inbuf (%zu < %zu)\n",
-				    udata->inlen, sizeof(req));
+				    "restore cq req inbuf must exceed inline-attr threshold (got %zu, need > %zu)\n",
+				    udata->inlen, sizeof(__u64));
 			goto err_out;
 		}
 	}
