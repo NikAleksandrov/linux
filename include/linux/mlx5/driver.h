@@ -331,6 +331,44 @@ struct mlx5_cmd {
 	 */
 	void	       *vfmig_iova_dom;
 
+	/*
+	 * Per-device opt-out of switching the cmd interface from polling
+	 * to event mode at mlx5_eq_table_create() time. When true,
+	 * create_async_eqs() leaves cmd_eq in polling mode (does not call
+	 * mlx5_cmd_use_events()) and destroy_async_eqs() does not undo
+	 * what was never set up. All cmds against this mdev for the
+	 * lifetime of the device complete via lay->status_own polling on
+	 * the cmd ring; the cmd EQ is created (so FW has a place to drop
+	 * cmd-completion EQEs if it chooses to) but the host never reads
+	 * from it.
+	 *
+	 * Targeted workaround for the post-LOAD slot-0 ghost EQE / lost
+	 * real-completion failure mode. Empirically every observed
+	 * variant of that failure happens after mlx5_cmd_use_events()
+	 * runs on a freshly-restored VF. vfio-pci-mlx5 (the upstream
+	 * SR-IOV live-migration driver) never calls mlx5_cmd_use_events()
+	 * on the VF -- the VF cmd interface is guest-owned -- and never
+	 * exhibits this failure. Mirroring that "no cmd_use_events on the
+	 * VF" property is the most direct way to remove the trigger
+	 * without re-architecting probe.
+	 *
+	 * Set by mlx5_load() before mlx5_eq_table_create() on a restored
+	 * VHCA when vfmig_load_skip_cmd_use_events is Y; cleared only in
+	 * mlx5_init_cmd_data() (i.e., next mdev probe). Default false on
+	 * every other code path.
+	 *
+	 * Note: cmd-interface mode and force_polling are orthogonal.
+	 * Setting this leaves the mdev in polling MODE (no EQ-fed
+	 * completions on cmd_eq, no cmd-comp notifier registered);
+	 * setting force_polling instead keeps the mdev in event mode and
+	 * just routes individual cmds through the polling ring on the
+	 * issue side. The two have different semantics on teardown:
+	 * skipping cmd_use_events is symmetric (we also skip the matching
+	 * cmd_use_polling at destroy_async_eqs), while force_polling has
+	 * to be paired with a regular cmd_use_polling unwind.
+	 */
+	bool		vfmig_skip_cmd_use_events;
+
 	/* protect command queue allocations
 	 */
 	spinlock_t	alloc_lock;

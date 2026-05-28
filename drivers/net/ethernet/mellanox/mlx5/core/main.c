@@ -88,6 +88,72 @@ static unsigned int prof_sel = MLX5_DEFAULT_PROF;
 module_param_named(prof_sel, prof_sel, uint, 0444);
 MODULE_PARM_DESC(prof_sel, "profile selector. Valid range 0 - 2");
 
+/*
+ * vfmig workaround. On a restored VF, leave the cmd interface in
+ * polling mode for the lifetime of the mdev: skip the
+ * mlx5_cmd_use_events() call inside create_async_eqs() and the matching
+ * mlx5_cmd_use_polling() in destroy_async_eqs(). Default true; the
+ * module parameter is a runtime emergency disable, not an opt-in.
+ *
+ * Empirical motivation. FW post-LOAD_VHCA_STATE intermittently emits a
+ * stale completion EQE on cmd_eq slot 0 before producing the legitimate
+ * completion for the next cmd issued on this VF -- typically the
+ * mlx5_core.eth probe's CREATE_MKEY or ALLOC_UAR -- causing that cmd to
+ * time out 60s later with "No done completion" and breaking the entire
+ * post-LOAD probe. Every previously-tried mitigation (SAVE-side NOP /
+ * QUERY_ISSI barriers, LOAD/SAVE settle msleeps, slot-0 reservation,
+ * Layer-1/Layer-2 dup-EQE filters) only shifted the timing or victim
+ * cmd; none eliminated the trigger.
+ *
+ * The architectural comparison vs vfio-pci-mlx5 (the upstream SR-IOV
+ * live-migration driver) identifies the trigger: vfio-pci-mlx5 never
+ * calls mlx5_cmd_use_events() on the VF -- the VF cmd interface is
+ * guest-owned -- and never exhibits the failure. Mirroring that "no
+ * cmd_use_events on the VF" property removes the trigger without re-
+ * architecting the LOAD path or the aux-device probe stack. Verified
+ * end-to-end: across three iterations on two hosts (six restored LOAD
+ * cycles total), zero "Command completion arrived after timeout", zero
+ * "No done completion", probe completes in ~100ms instead of 60+s.
+ *
+ * What changes when this is Y on a restored VF:
+ *   - cmd_eq is still created in setup_async_eq("cmd"). FW gets a
+ *     cmd-completion EQ to write into if it chooses; the host just
+ *     never registers a notifier or reads from it.
+ *   - mlx5_cmd_use_events() is skipped, so dev->cmd.mode stays
+ *     CMD_MODE_POLLING. Every cmd against this mdev (LOAD-time setup,
+ *     mlx5_register_device aux probe -- mlx5_core.eth probe is the
+ *     bulk of post-LOAD cmd traffic -- IB device register, and any
+ *     subsequent CRIU-driven cmd) completes via lay->status_own
+ *     polling on the cmd ring.
+ *   - destroy_async_eqs() skips the matching mlx5_cmd_use_polling(),
+ *     because the notifier-unregister inside it would walk a list the
+ *     notifier was never added to.
+ *   - Async events on async_eq / pages_eq are unaffected: those EQs
+ *     are still created and their notifiers still registered. Only
+ *     cmd-completion delivery is changed.
+ *
+ * Cost: per-cmd polling overhead (microseconds per cmd, vs ~1us EQ-
+ * delivered). Probe takes a bit longer; steady-state RDMA is
+ * unaffected (FW cmds in steady-state are rare).
+ *
+ * This differs from the older vfmig_polling_restored_vf knob and from
+ * dev->cmd.force_polling: those kept cmd_eq in event MODE and only
+ * routed individual cmds through polling on issue, leaving the
+ * cmd-comp notifier registered for cmd_eq. That arrangement caused VF-
+ * destroy wedges historically. This knob keeps the mdev cleanly in
+ * polling MODE end-to-end and side-steps that dynamic.
+ *
+ * Restricted to restored VFs and read once via READ_ONCE so a
+ * concurrent param write doesn't toggle mid-probe. Default Y; only set
+ * to N if a future firmware revision is verified to no longer exhibit
+ * the post-LOAD slot-0 ghost EQE behavior described above.
+ */
+static bool vfmig_load_skip_cmd_use_events = true;
+module_param_named(vfmig_load_skip_cmd_use_events,
+		   vfmig_load_skip_cmd_use_events, bool, 0644);
+MODULE_PARM_DESC(vfmig_load_skip_cmd_use_events,
+		 "vfmig: on a restored VF, skip the mlx5_cmd_use_events() switch inside mlx5_eq_table_create() (and the matching mlx5_cmd_use_polling() on teardown). Leaves the cmd interface in polling mode for the lifetime of the mdev so every post-LOAD cmd completes via lay->status_own polling on the cmd ring instead of EQ-fed delivery -- mirrors vfio-pci-mlx5's \"VF cmd interface is not host-driven\" property and removes the trigger of the post-LOAD slot-0 ghost EQE failure mode. Default Y; runtime emergency disable only -- set to N only when a FW revision is verified to no longer exhibit the post-LOAD ghost EQE.");
+
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
 static DEFINE_IDA(sw_vhca_ida);
@@ -1505,6 +1571,36 @@ static int mlx5_load(struct mlx5_core_dev *dev)
 	if (err) {
 		mlx5_core_err(dev, "Failed to alloc IRQs\n");
 		goto err_irq_table;
+	}
+
+	/*
+	 * vfmig: on a restored VF, leave the cmd interface in polling mode
+	 * for the lifetime of the mdev. FW post-LOAD_VHCA_STATE
+	 * intermittently emits a stale completion EQE on cmd_eq slot 0
+	 * before producing the legitimate completion for the next cmd
+	 * issued on this VF; running the cmd interface in polling mode for
+	 * restored VFs avoids depending on cmd_eq for completion delivery
+	 * and is what vfio-pci-mlx5 does implicitly because it never
+	 * enables event-mode cmds on the VF.
+	 *
+	 * Mechanically: arm the per-mdev flag that tells create_async_eqs()
+	 * to leave cmd_eq in polling mode (skip mlx5_cmd_use_events()).
+	 * MUST happen before mlx5_eq_table_create() below, since that's
+	 * where create_async_eqs() reads the flag. Symmetric on teardown:
+	 * destroy_async_eqs() reads the same flag to skip the matching
+	 * mlx5_cmd_use_polling(). See the top-of-file comment block for
+	 * vfmig_load_skip_cmd_use_events for the full rationale, the
+	 * mitigations that were tried and discarded, and the trade-offs.
+	 *
+	 * Default Y; the module parameter is a runtime emergency disable.
+	 * Read once via READ_ONCE so a concurrent param write doesn't
+	 * change the decision mid-probe. Restricted to restored VFs.
+	 */
+	if (mlx5_vf_is_restored(dev) &&
+	    READ_ONCE(vfmig_load_skip_cmd_use_events)) {
+		dev->cmd.vfmig_skip_cmd_use_events = true;
+		mlx5_core_info(dev,
+			       "vfmig: post-LOAD cmd interface staying in polling mode (skip mlx5_cmd_use_events)\n");
 	}
 
 	err = mlx5_eq_table_create(dev);
