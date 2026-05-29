@@ -635,49 +635,85 @@ struct cq_args {
 	uint32_t	comp_vector;
 	uint32_t	cq_target_handle;
 	/*
-	 * Destination-side anonymous mappings that back the RESTORE_CQ
-	 * call's buf_addr / db_addr arguments. Same rationale as
-	 * mr_restore's local_addr (see its docstring): the kernel
-	 * (post-Stage-3 D4) calls ib_umem_pin(current->mm, addr, len)
-	 * inside mlx5_ib_restore_cq's bind helpers, so a probe-side
-	 * VA is required.
+	 * Destination-side mappings that back the RESTORE_CQ call's
+	 * buf_addr / db_addr arguments. The kernel pins user pages
+	 * from current->mm at these VAs inside mlx5_ib_restore_cq's
+	 * bind helpers, so a probe-side mapping is required.
 	 *
 	 * In a real CRIU restore these slots are populated by CRIU's
 	 * mm replay (the destination process mmaps the source's VA
 	 * range with MAP_FIXED and seeds the bytes from the
-	 * checkpoint). The probe is not a full CRIU restore, so we
-	 * fake the mappings with fresh anonymous mmaps and pass those
-	 * VAs instead -- the bytes themselves don't matter for kernel-
-	 * side validation (no FW WQE data path). What matters is that
+	 * checkpoint). The probe is not a full CRIU restore but it
+	 * has to simulate the relevant invariants:
+	 *
+	 *   - @local_buf_addr (CQE ring): can be ANY VA in the
+	 *     probe's mm. mlx5_vfmig_bind_user_cq's placeholder is
+	 *     keyed by (KIND_CQ, cqn) -- the user VA is not part of
+	 *     the lookup key, just the pinning target. We therefore
+	 *     allocate this with a normal anonymous mmap (mr_restore
+	 *     uses the same pattern with mkey_index-keyed lookup).
+	 *
+	 *   - @local_db_addr (doorbell record): MUST equal the
+	 *     source's pre-SAVE user VA at PAGE_MASK granularity.
+	 *     mlx5_vfmig_bind_user_dbr's placeholder is keyed by
+	 *     (KIND_DBR, virt & PAGE_MASK). The DBR placeholder has
+	 *     no FW-allocated id (no FW resource owns "the doorbell
+	 *     page"); the only stable cross-mm key is the user VA.
+	 *     mlx5_ib_db_map_user_restore therefore uses a single
+	 *     'virt' argument both for ib_umem_pin (current->mm) AND
+	 *     for the placeholder lookup. CRIU's MAP_FIXED replay
+	 *     makes those equal naturally; the probe simulates that
+	 *     with mmap(src_db_addr & PAGE_MASK, MAP_FIXED_NOREPLACE).
+	 *
+	 *     If MAP_FIXED_NOREPLACE collides with the probe's own
+	 *     address space (e.g. heap extended into 0x55... range),
+	 *     cq_args_mmap_local() reports a clear diagnostic and
+	 *     returns -EADDRINUSE; the user can re-run since the
+	 *     source's libmlx5 mmap VA is randomized per run.
+	 *
+	 * The bytes themselves don't matter for kernel-side validation
+	 * (v0 holds the CQ but never arms it / writes a CQE), so the
+	 * mappings can be anonymous-zero-filled. What matters is that
 	 * ib_umem_pin succeeds, the resulting sg_table has total
 	 * length matching the placeholder len so
 	 * mlx5_vfmig_bind_user_cq's length check accepts it, and the
 	 * doorbell mapping is exactly PAGE_SIZE so
 	 * mlx5_vfmig_bind_user_dbr's single-page invariant holds.
-	 *
-	 * @local_buf_addr is the CQE ring mmap return (page-aligned,
-	 * length == src_cqe * src_cqe_size rounded up to PAGE_SIZE).
-	 * @local_db_addr is the doorbell page mmap return + a 64-byte
-	 * offset so the unaligned-VA path through the kernel
-	 * (db->dma = sg_dma_address + (virt & ~PAGE_MASK)) is
-	 * exercised symmetrically with how mlx5dv_cq.dbrec is
-	 * normally laid out (mid-page).
 	 */
 	uint64_t	local_buf_addr;
 	uint64_t	local_db_addr;
 };
 
 /*
- * Allocate two anonymous mappings backing local_buf_addr (CQE ring)
- * and local_db_addr (doorbell page). Returns 0 on success, -errno
- * on mmap failure. The mappings leak at probe exit, which is fine
- * for a test binary.
+ * Allocate the destination-side mappings backing local_buf_addr
+ * (CQE ring) and local_db_addr (doorbell page). Returns 0 on
+ * success, -errno on mmap failure. The mappings leak at probe
+ * exit, which is fine for a test binary.
+ *
+ * The CQE-ring mmap is anonymous (any VA in the probe's mm; the
+ * placeholder is cqn-keyed, not VA-keyed -- see struct cq_args
+ * docstring). The doorbell mmap is MAP_FIXED_NOREPLACE at
+ * src_db_addr & PAGE_MASK to satisfy mlx5_vfmig_bind_user_dbr's
+ * (KIND_DBR, virt & PAGE_MASK) lookup invariant. If the source's
+ * VA collides with the probe's own address space we report a clear
+ * diagnostic and return -EADDRINUSE; the user can re-run, since
+ * the source's libmlx5 anonymous mmap VA is randomized per run.
+ *
+ * The full src_db_addr (with its in-page offset preserved verbatim)
+ * is then used as the db_addr argument to RESTORE_CQ. The kernel
+ * masks to PAGE_MASK for the placeholder lookup but preserves the
+ * offset for cq->db.dma = sg_dma_address + (virt & ~PAGE_MASK).
+ * libmlx5 normally lays out mlx5dv_cq.dbrec at a 64-byte-aligned
+ * offset within a shared doorbell page (multiple 8-byte records
+ * packed per page across QPs/SRQs/CQs in the same ucontext), so a
+ * non-zero in-page offset is the realistic case.
  */
 static int cq_args_mmap_local(struct cq_args *a)
 {
 	long page_size = sysconf(_SC_PAGESIZE);
 	size_t cqe_buf_bytes = (size_t)a->src_cqe * a->src_cqe_size;
 	size_t cqe_buf_aligned;
+	uint64_t db_page_addr;
 	void *cqe_p, *db_p;
 
 	if (page_size <= 0)
@@ -696,35 +732,62 @@ static int cq_args_mmap_local(struct cq_args *a)
 			cqe_buf_aligned, strerror(errno));
 		return -errno;
 	}
-	db_p = mmap(NULL, page_size,
-		    PROT_READ | PROT_WRITE,
-		    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (db_p == MAP_FAILED) {
-		fprintf(stderr,
-			"cq_restore_mlx5: mmap(dbrec %ld) failed: %s\n",
-			page_size, strerror(errno));
-		munmap(cqe_p, cqe_buf_aligned);
-		return -errno;
-	}
-
 	a->local_buf_addr = (uint64_t)(uintptr_t)cqe_p;
+
 	/*
-	 * 64-byte offset within the doorbell page: matches what
-	 * mlx5dv_cq.dbrec normally points at (libmlx5 packs multiple
-	 * 8-byte doorbell records inside a shared page; offsets are
-	 * 64-byte-aligned in practice). The kernel masks to PAGE_MASK
-	 * for the placeholder lookup but preserves the offset for
-	 * cq->db.dma computation, so passing an unaligned VA exercises
-	 * that path.
+	 * MAP_FIXED_NOREPLACE at the source's page-aligned doorbell
+	 * VA. This simulates what CRIU's mm-replay step would do for
+	 * the destination process: mmap the same VAs with MAP_FIXED so
+	 * the user-virt -> umem mapping matches across save/load.
+	 *
+	 * If the probe's own address space (heap, .bss, libc mmaps,
+	 * stack-guard, ...) already occupies that VA, MAP_FIXED_NOREPLACE
+	 * fails with EEXIST without unmapping the existing range; we
+	 * propagate that as -EADDRINUSE so the harness sees a clear
+	 * "ASLR collision" failure rather than a silent succeed-then-
+	 * fail-during-bind path.
 	 */
-	a->local_db_addr = (uint64_t)(uintptr_t)db_p + 64;
-	printf("cq_restore_mlx5: local_buf_addr=0x%llx (anonymous mmap, %zu bytes)\n"
-	       "                 local_db_addr=0x%llx (anonymous mmap, %ld bytes + 64B offset)\n"
-	       "                 src_buf_addr=0x%llx src_db_addr=0x%llx kept for identity logging only\n",
+	db_page_addr = a->src_db_addr & ~(uint64_t)(page_size - 1);
+	db_p = mmap((void *)(uintptr_t)db_page_addr, page_size,
+		    PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+		    -1, 0);
+	if (db_p == MAP_FAILED) {
+		int err = errno;
+		fprintf(stderr,
+			"cq_restore_mlx5: MAP_FIXED_NOREPLACE(0x%llx, %ld) for src DBR\n"
+			"                 page failed: %s. The source's libmlx5\n"
+			"                 doorbell mmap VA collides with this probe's\n"
+			"                 own address space. Re-run -- the source's\n"
+			"                 ASLR-randomized VA will likely land elsewhere.\n",
+			(unsigned long long)db_page_addr, page_size, strerror(err));
+		munmap(cqe_p, cqe_buf_aligned);
+		return -EADDRINUSE;
+	}
+	if ((uint64_t)(uintptr_t)db_p != db_page_addr) {
+		fprintf(stderr,
+			"cq_restore_mlx5: MAP_FIXED_NOREPLACE returned 0x%llx instead of\n"
+			"                 the requested 0x%llx (kernel ignored the hint?)\n",
+			(unsigned long long)(uintptr_t)db_p,
+			(unsigned long long)db_page_addr);
+		munmap(db_p, page_size);
+		munmap(cqe_p, cqe_buf_aligned);
+		return -EFAULT;
+	}
+	/* Preserve the source's full in-page offset for the db_addr arg. */
+	a->local_db_addr = a->src_db_addr;
+
+	printf("cq_restore_mlx5: local_buf_addr=0x%llx (anonymous mmap, %zu bytes;\n"
+	       "                                       cqn-keyed lookup, VA arbitrary)\n"
+	       "                 local_db_addr=0x%llx (MAP_FIXED_NOREPLACE @ src page\n"
+	       "                                      0x%llx; %ld bytes; in-page offset\n"
+	       "                                      0x%llx preserved verbatim)\n"
+	       "                 src_buf_addr=0x%llx kept for identity logging only\n",
 	       (unsigned long long)a->local_buf_addr, cqe_buf_aligned,
-	       (unsigned long long)a->local_db_addr, page_size,
-	       (unsigned long long)a->src_buf_addr,
-	       (unsigned long long)a->src_db_addr);
+	       (unsigned long long)a->local_db_addr,
+	       (unsigned long long)db_page_addr, page_size,
+	       (unsigned long long)(a->src_db_addr & (uint64_t)(page_size - 1)),
+	       (unsigned long long)a->src_buf_addr);
 	return 0;
 }
 
