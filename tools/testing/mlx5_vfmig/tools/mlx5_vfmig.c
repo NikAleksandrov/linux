@@ -215,6 +215,58 @@ static int do_probe_mkey(int fd, unsigned int vf_id,
 }
 
 /*
+ * EXPERIMENTAL: §S5b empirical -- "is the source's FW CQ at cqn=N
+ * still alive on the destination after LOAD_VHCA_STATE, and does
+ * its (eqn, log_cq_size, log_page_size, page_offset, status, oi)
+ * match the source's pre-SAVE view?". See
+ * include/uapi/linux/mlx5_vfmig.h's MLX5_VFMIG_IOC_PROBE_CQN block
+ * for the full methodology.
+ *
+ * Output is one key=value per line so the shell harness can
+ * capture it into named variables (mirror of probe_mkey).
+ */
+static int do_probe_cqn(int fd, unsigned int vf_id, unsigned int cqn)
+{
+	struct mlx5_vfmig_probe_cqn arg = {
+		.vf_id = vf_id,
+		.cqn   = cqn,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_CQN, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(PROBE_CQN requires the VF mdev to be "
+				"interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"PROBE_CQN: invalid arg "
+				"(vf_id=%u cqn=0x%x). "
+				"cqn must fit in 24 bits.\n",
+				vf_id, cqn);
+		else
+			perror("PROBE_CQN");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("cqn=0x%06x\n", cqn);
+	printf("fw_syndrome=0x%08x\n", arg.fw_syndrome);
+	printf("fw_accept=%u\n", arg.fw_syndrome == 0 ? 1 : 0);
+	printf("fw_eqn=0x%08x\n", arg.fw_eqn);
+	printf("fw_status=%u\n", arg.fw_status);
+	printf("fw_log_cq_size=%u\n", arg.fw_log_cq_size);
+	printf("fw_log_page_size=%u\n", arg.fw_log_page_size);
+	printf("fw_page_offset=%u\n", arg.fw_page_offset);
+	printf("fw_oi=%u\n", arg.fw_oi);
+	printf("fw_cqe_sz=%u\n", arg.fw_cqe_sz);
+	printf("fw_apu_cq=%u\n", arg.fw_apu_cq);
+	printf("fw_uar_page=0x%06x\n", arg.fw_uar_page);
+	printf("fw_dbr_addr=0x%016llx\n",
+	       (unsigned long long)arg.fw_dbr_addr);
+	return 0;
+}
+
+/*
  * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND CLI wrapper. user_mr_dma
  * stage-2 success-criterion accessor: post-LOAD, asks the PF how
  * many awaiting_bind placeholders landed in the VF's
@@ -593,6 +645,7 @@ static void usage(const char *argv0)
 		"  query_qp          <vf_id> <qpn>  (experimental)\n"
 		"  probe_pd          <vf_id> <pdn> [<uid_hint=0>]  (experimental)\n"
 		"  probe_mkey        <vf_id> <mkey_index>  (experimental)\n"
+		"  probe_cqn         <vf_id> <cqn>  (experimental)\n"
 		"  query_awaiting_bind <vf_id>  (user_mr_dma stage-2)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
@@ -689,6 +742,11 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_probe_mkey(fd, strtoul(argv[3], NULL, 0),
 				    strtoul(argv[4], NULL, 0));
+	} else if (verb_eq(verb, "probe_cqn")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_probe_cqn(fd, strtoul(argv[3], NULL, 0),
+				   strtoul(argv[4], NULL, 0));
 	} else if (verb_eq(verb, "query_awaiting_bind")) {
 		if (argc != 4)
 			goto badargs;
