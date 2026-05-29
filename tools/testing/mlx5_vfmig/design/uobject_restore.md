@@ -2104,7 +2104,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   | B1 | UAPI `mlx5_ib_restore_cq_req` (32B; `buf_addr` / `db_addr` / `cqn` / `cqe_size` / reserved) | yes | compiles, no abi churn |
   | B2 | `mlx5_ib_restore_cq` handler + `dev_ops.restore_cq` slot, `mlx5_core_adopt_cq` EQ-tree register helper, `mlx5_ib_set_user_cq_callbacks` cq.c export | yes | compiles, no regressions in mlx5_core / mlx5_ib build |
   | B3 | bind helpers (`mlx5_vfmig_bind_user_cq` / `_user_dbr` mlx5_core, `mlx5_ib_umem_restore_cq` mlx5_ib mem.c, `mlx5_ib_db_map_user_restore` mlx5_ib doorbell.c) | yes | compiles |
-  | B4 | live verb path adopts cqn cleanly | pending | 8/8 subtests + Phase G |
+  | B4 | live verb path adopts cqn cleanly (`cq_restore_probe_mlx5_vfmig` + `test_cq_restore_mlx5_vfmig.sh`: 10 subtests -- gate, 4 UAPI rejects, bad comp_vector, COMP_CHANNEL rejection, happy path, EBUSY collision, Phase-G PROBE_CQN byte-equal vs. source pre-SAVE, post-quit v0 dealloc rejection) | pending kernel run | 10/10 subtests + Phase G |
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
   to RTR per ?6.3 option (b). Fini-pass transitions to RTS. **First
   passing `rdma_test_agent` round-trip on a restored ucontext --
