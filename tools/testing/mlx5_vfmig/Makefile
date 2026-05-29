@@ -21,6 +21,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig		\
 	uobject_restore/cq_restore/cq_restore_probe_rxe		\
 	uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig	\
+	uobject_restore/cq_query/cq_query_probe_mlx5_vfmig	\
 	save_load/user_object_replay/user_object_replay_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
@@ -131,6 +132,19 @@ uobject_restore/cq_restore/cq_restore_probe_rxe: \
 uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig: \
 		uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# QUERY_CQ + mlx5_ib QUERY_CQ dump-side probe
+# (design/uobject_restore.md §5.2.4). Single-process byte-equality
+# validator: libibverbs+libmlx5 to create a real CQ and read the
+# (A) "calling-process VA" view via mlx5dv_init_obj, then raw uverbs
+# ioctl to drive MLX5_IB_METHOD_VFMIG_QUERY_CQ for the (B) kernel
+# view. Asserts strict equality across cqn / cqe_size / buf_addr /
+# (db_addr & PAGE_MASK) / cqe / comp_vector / flags so a CRIU dumper
+# can substitute the QUERY_CQ ioctl for mlx5dv_init_obj across the
+# process boundary.
+uobject_restore/cq_query/cq_query_probe_mlx5_vfmig: \
+		uobject_restore/cq_query/cq_query_probe_mlx5_vfmig.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
 
 # user_mr_dma stage-2 success-criterion probe
 # (design/user_mr_dma.md section 6.4). Allocates a configurable set of
