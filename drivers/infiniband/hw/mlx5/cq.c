@@ -1007,6 +1007,18 @@ int mlx5_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		goto err_cqb;
 
 	cq->cqe_size = cqe_size;
+	/*
+	 * Mirror the comp_vector hint onto cq->mcq.vector so post-create
+	 * introspection paths (MLX5_IB_METHOD_VFMIG_QUERY_CQ, the
+	 * mlx5_core_adopt_cq caller-contract documented in
+	 * mlx5/core/cq.c::mlx5_core_adopt_cq, future debug helpers) all
+	 * read the same value the user passed at create time.
+	 * mlx5_ib_restore_cq already sets this field equivalently for
+	 * the adoption path; without this assignment the create path
+	 * leaves mcq.vector at its zalloc-zero default and QUERY_CQ
+	 * would echo 0 regardless of the user's @vector.
+	 */
+	cq->mcq.vector = vector;
 
 	cqc = MLX5_ADDR_OF(create_cq_in, cqb, cq_context);
 	MLX5_SET(cqc, cqc, cqe_sz,
