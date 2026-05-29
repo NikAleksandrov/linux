@@ -33,7 +33,7 @@ end-to-end correctness, not initial scaffolding.
 |---|---|---|---|---|
 | K6 | **v0 gate.** FW-identity-continuity experiment: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id reservations the way it provably does for UARs? Mirrors `uar_restore.md` ?3. Outcome decides whether K3/K4 mlx5 handlers are a small alloc-with-hint extension (best case) or require new "pre-reserve id N" FW commands (worst case, possibly FW patch). Run this first. | ?8.2, ?10 | **very high** | empirical experiment + small probe ioctl |
 | K2 | **Already exists upstream as `UVERBS_METHOD_INFO_HANDLES` on `UVERBS_OBJECT_DEVICE`** (drivers/infiniband/core/uverbs_std_types_device.c). Takes a `UVERBS_ATTR_INFO_OBJECT_ID` (u16 -- accepts ANY core or driver-namespace object id via `uapi_key_obj()`), walks `ufile->uobjects` under `uobjects_lock` filtered by `obj->uapi_object`, returns `UVERBS_ATTR_INFO_HANDLES_LIST` (u32[]) and `UVERBS_ATTR_INFO_TOTAL_HANDLES` (filled count). Covers AH and every other non-restracked uobject. Drives the pre-suspend coverage check (DEVX/MW/FLOW/XRCD rejection) by enumerating those types and failing the dump if any are present. Validated end-to-end by `info_handles_probe` -- see ?7.2 | ?6.2 | done | zero kernel work |
-| K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive ˇˇˇ XA-insert at caller-specified handle, return `-EBUSY` if taken ˇˇˇ is already proven by the UAR restore path; this is plumbing, not new core | ?7.3 | medium | reuse existing helper |
+| K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive ùùù XA-insert at caller-specified handle, return `-EBUSY` if taken ùùù is already proven by the UAR restore path; this is plumbing, not new core | ?7.3 | medium | reuse existing helper |
 | K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new opt-in `ib_device_ops.ucontext_is_restore_mode` predicate that each driver implements over its own per-ucontext sticky bool (mlx5: `mlx5_ib_ucontext.vfmig_restore_mode`, set when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE`; rxe: `rxe_ucontext.restore_mode`, set when opened with `RXE_ALLOC_UCTX_RESTORE_MODE`). Generic dispatch treats missing callback as "no ucontext on this device may restore", so adding RESTORE_* support is strictly opt-in and the `ib_ucontext` core struct stays lean | ?7.1, ?7.2 | high | medium per type |
 | K4 | `ib_device_ops` extended with `restore_pd`, `restore_cq`, `restore_qp`, `restore_mr`, `restore_srq`, `restore_ah`, `restore_comp_channel`, `restore_async_event`. Each driver installs its restore-mode ops vector once, at VF/device **probe** time, when the device is entering VFMIG_RESTORE state (i.e. before any uverbs cdev opens against it). No mid-life ops swapping | ?7.3, ?7.4 | high | one ops vector + per-driver impl |
 | K8 | **Landed as `0601c496b413` (K8a NLDEV emit).** Per-uobject `ufile_handle` (== `obj->id` from `ufile->uobjects`) now emitted alongside the existing restrack-id attr from every `fill_res_<type>_entry` whose resource is user-created (PD/CQ/QP/MR/SRQ), gated by `!rdma_is_kernel_res(res)`. New UAPI attr `RDMA_NLDEV_ATTR_RES_HANDLE`. Validated end-to-end by `nldev_res_handle_probe` (asserts both presence and exact `obj->handle` equality, plus the kernel-only "MUST NOT carry" contract). Lets a CRIU dump plugin join NLDEV's restrack-id view (parent-edge encoding) with the uverbs `INFO_HANDLES` ufile-handle view (`target_handle` install) without an extra cross-reference dispatch. K8b alternative (extend `INFO_HANDLES` with a paired restrack list) recorded in ?7.5 as the rejected-but-considered shape | ?7.5 | done | -- |
@@ -987,8 +987,8 @@ Handler walks `ufile->uobjects` under `uobjects_lock`, filtered by
 `uapi_get_object()` lookup goes through `uapi_key_obj()` which already
 encodes the namespace bit, so the same ioctl path accepts both core
 (`UVERBS_OBJECT_AH`, `UVERBS_OBJECT_ASYNC_EVENT`, `UVERBS_OBJECT_XRCD`,
-ˇˇˇ) and driver-namespace object ids (`MLX5_IB_OBJECT_UAR`,
-`MLX5_IB_OBJECT_DEVX_*`, ˇˇˇ) uniformly. That's exactly the surface CRIU
+ùùù) and driver-namespace object ids (`MLX5_IB_OBJECT_UAR`,
+`MLX5_IB_OBJECT_DEVX_*`, ùùù) uniformly. That's exactly the surface CRIU
 needs for both the per-type enumeration and the DEVX/MW/FLOW/XRCD
 coverage check.
 
@@ -1965,16 +1965,52 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   1. **K6 / `test_fw_id_continuity.sh`** -- already PASS for cqn
      (PARTIAL PASS, +3..+5 deltas explained by destination internal
      allocations, no missing high-water mark).
-  2. **B0 / `MLX5_VFMIG_IOC_PROBE_CQN`** (pending) -- raw
-     `QUERY_CQ` against the source's cqn on the destination VF
-     post-LOAD, asserting `(cqn, eqn, log_cq_size, log_page_size,
-     page_offset, status, oi)` byte-equal to the source's pre-SAVE
-     view. The `eqn` field is the load-bearing one CQ adds over
-     mkey: a CQ's events flow through an event queue (EQ), and the
-     EQ binding must survive `LOAD_VHCA_STATE` for adopted CQs to
-     deliver completions. Mirrors `MLX5_VFMIG_IOC_PROBE_MKEY`'s
-     shape (B3 in S4b); the Phase G out-of-band check inside
-     `cq_restore_probe_mlx5_vfmig`.
+  2. **B0 / `MLX5_VFMIG_IOC_PROBE_CQN`** -- LANDED, **STRONG PASS**
+     on first run. Raw `QUERY_CQ` against the source's cqn on the
+     destination VF post-LOAD, asserting `(cqn, eqn, log_cq_size,
+     log_page_size, page_offset, status, oi)` byte-equal to the
+     source's pre-SAVE view. The `eqn` field is the load-bearing
+     one CQ adds over mkey: a CQ's events flow through an event
+     queue (EQ), and the EQ binding must survive `LOAD_VHCA_STATE`
+     for adopted CQs to deliver completions. Mirrors
+     `MLX5_VFMIG_IOC_PROBE_MKEY`'s shape (B3 in S4b); the Phase G
+     out-of-band check inside `cq_restore_probe_mlx5_vfmig`.
+
+     **B0 ioctl shape, opcode 0x0d in `MLX5_VFMIG_IOC_MAGIC` space.**
+     `struct mlx5_vfmig_probe_cqn { vf_id; cqn; reserved_in[8];
+     fw_syndrome; fw_eqn; fw_status; fw_log_cq_size;
+     fw_log_page_size; fw_page_offset; fw_oi; fw_cqe_sz; fw_apu_cq;
+     fw_uar_page; fw_dbr_addr; reserved_out[..]; }`. Locking shape
+     copied from PROBE_MKEY: resolve VF pci_dev from PF + vf_id,
+     `device_lock` to pin `->driver` / drvdata, match driver by
+     `KBUILD_MODNAME`, require `MLX5_INTERFACE_STATE_UP`. The cmd
+     runs on the VF mdev's cmdif (cmdif-uid=0); like PROBE_MKEY,
+     this ioctl tests FW-side existence with zero side effects --
+     destination-ucontext usability is left to B4. Symmetric
+     usage: the `test_cq_adopt.sh` harness calls it on the source
+     VF pre-SAVE *and* the destination VF post-LOAD, then byte-
+     compares the two FW snapshots. Stronger assertion than
+     `test_mr_adopt.sh` does (which only knows source-side
+     `mr_addr` / `mr_length` from userspace), made possible
+     because the cqc fields aren't exposed by libibverbs/libmlx5
+     so the FW-of-truth path is the only path.
+
+     **B0 first-run evidence (single-host, same-PF SAVE/LOAD,
+     `test_cq_adopt.sh`):** src cqn=2596 (=0xa24); pre-SAVE source
+     PROBE_CQN: eqn=6, status=0, log_cq_size=5, log_page_size=0,
+     page_offset=0, oi=0, cqe_sz=0, apu_cq=0, uar_page=0x16,
+     dbr_addr=0x21f201000; post-LOAD destination PROBE_CQN: every
+     field byte-equal. Negative control with cqn=0xffff00:
+     `fw_accept=0, fw_syndrome=0x001fb6ec` (FW gates QUERY_CQ on
+     existence -> the positive accept wasn't a host-priv
+     permissiveness artifact). Verdict: STRONG PASS for Model A
+     `mlx5_ib_restore_cq` -- adopting the source's `(cqn, eqn)`
+     pair into a destination kernel-side `mlx5_ib_cq` is sound,
+     no destination FW round-trip needed, the EQ binding survives
+     verbatim. Forensic fields (`uar_page`, `dbr_addr`) also
+     byte-equal -- pre-evidence that B3's KIND_DBR doorbell-page
+     bind helper will land cleanly because the source's user-VA
+     for the dbr ring survives in cqc unchanged.
   3. **B4 / `cq_restore_probe_mlx5_vfmig`** (pending) -- end-to-end
      verb-path probe with the live adopted CQ, gated by
      `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` and walking subtests 1-7
@@ -2025,7 +2061,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   | step | what | landed | output |
   |------|------|--------|--------|
   | K6 | LOAD_VHCA_STATE preserves cqn high-water mark | yes (?10 #1) | PARTIAL PASS |
-  | B0 | PROBE_CQN raw QUERY_CQ post-LOAD | pending | byte-equal cqc |
+  | B0 | PROBE_CQN raw QUERY_CQ post-LOAD | yes (`test_cq_adopt.sh`) | **STRONG PASS** -- src/dst byte-equal across (cqn, eqn=6, log_cq_size=5, log_page_size=0, page_offset=0, status=0, oi=0); negative control rejected with FW syndrome 0x001fb6ec |
   | B4 | live verb path adopts cqn cleanly | pending | 8/8 subtests + Phase G |
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
   to RTR per ?6.3 option (b). Fini-pass transitions to RTS. **First
