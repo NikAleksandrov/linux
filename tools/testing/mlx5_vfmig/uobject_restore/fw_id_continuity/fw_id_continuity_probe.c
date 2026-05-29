@@ -100,7 +100,41 @@ static int extract_pdn(struct ibv_pd *pd, uint32_t *out)
 	return 0;
 }
 
-static int extract_cqn(struct ibv_cq *cq, uint32_t *out)
+struct cq_context_emit {
+	uint32_t cqn;
+	uint32_t cqe_cnt;
+	uint32_t cqe_size;
+	uint64_t buf_addr;	/* user VA of CQE ring buffer (mlx5dv_cq.buf) */
+	uint64_t db_addr;	/* user VA of doorbell record (mlx5dv_cq.dbrec)
+				 * -- not page-aligned; the kernel applies
+				 * & PAGE_MASK on its side. Passed verbatim
+				 * to mlx5_ib_restore_cq_req.db_addr where
+				 * the unaligned offset within the page is
+				 * preserved for the destination's
+				 * cq->db.dma computation. */
+};
+
+/*
+ * Capture every cqc-derivable field the S5b RESTORE_CQ verb body
+ * needs from the source-side mlx5_ib_create_cq landing -- the cqn
+ * (FW resource id), the userspace VAs of the CQE ring buffer and
+ * doorbell record (which the destination kernel will rebind into
+ * the LOAD_VHCA_STATE-replayed (KIND_CQ, cqn) and
+ * (KIND_DBR, dbrec & PAGE_MASK) placeholders, respectively), the
+ * user-visible cqe count (which the dispatcher copies into
+ * attr->cqe and the handler stores at cq->ibcq.cqe), and cqe_size
+ * (which the destination kernel needs to parse the adopted CQE
+ * ring at poll time).
+ *
+ * mlx5dv_init_obj(MLX5DV_OBJ_CQ) reads these out of the
+ * libmlx5-internal struct mlx5_cq -- they are not exposed by stock
+ * libibverbs because there is no need to surface them at create
+ * time (only the userspace polling code under the same libmlx5
+ * library consumes them). For CRIU R3 they become wire-visible
+ * input to RESTORE_CQ on the destination, hence this helper.
+ */
+static int extract_cq_context(struct ibv_cq *cq,
+			      struct cq_context_emit *out)
 {
 	struct mlx5dv_cq dvcq = {};
 	struct mlx5dv_obj obj = {
@@ -111,7 +145,11 @@ static int extract_cqn(struct ibv_cq *cq, uint32_t *out)
 		fprintf(stderr, "k6: mlx5dv_init_obj(CQ) failed: %d\n", err);
 		return -1;
 	}
-	*out = dvcq.cqn;
+	out->cqn = dvcq.cqn;
+	out->cqe_cnt = dvcq.cqe_cnt;
+	out->cqe_size = dvcq.cqe_size;
+	out->buf_addr = (uint64_t)(uintptr_t)dvcq.buf;
+	out->db_addr  = (uint64_t)(uintptr_t)dvcq.dbrec;
 	return 0;
 }
 
@@ -146,7 +184,8 @@ int main(int argc, char **argv)
 	struct ibv_srq *srq = NULL;
 	void *mr_buf = NULL;
 	const size_t mr_len = 4096;
-	uint32_t pdn = 0, cqn = 0, qpn = 0, lkey = 0, rkey = 0, srqn = 0;
+	uint32_t pdn = 0, qpn = 0, lkey = 0, rkey = 0, srqn = 0;
+	struct cq_context_emit cqc = {};
 	int rc = 1;
 
 	if (argc < 2) {
@@ -192,7 +231,7 @@ int main(int argc, char **argv)
 			strerror(errno));
 		goto out;
 	}
-	if (extract_cqn(cq, &cqn))
+	if (extract_cq_context(cq, &cqc))
 		goto out;
 
 	mr_buf = aligned_alloc(4096, mr_len);
@@ -330,7 +369,20 @@ int main(int argc, char **argv)
 	 * each line of the form "key=value" suitable for `eval src_$line`. */
 	printf("ibdev=%s\n", ibdev_name);
 	printf("pdn=%u\n", pdn);
-	printf("cqn=%u\n", cqn);
+	printf("cqn=%u\n", cqc.cqn);
+	/*
+	 * cqe / cqe_size / cq_buf_addr / cq_db_addr feed the
+	 * S5b RESTORE_CQ verb body on the destination side via
+	 * struct mlx5_ib_restore_cq_req.{cqn, cqe_size, buf_addr,
+	 * db_addr}. The dispatcher's UVERBS_ATTR_RESTORE_CQ_CQE
+	 * core attr carries the cqe number. mlx5dv exposes the
+	 * libmlx5-internal struct mlx5_cq fields via
+	 * mlx5dv_init_obj(MLX5DV_OBJ_CQ); see extract_cq_context().
+	 */
+	printf("cqe=%u\n", cqc.cqe_cnt);
+	printf("cqe_size=%u\n", cqc.cqe_size);
+	printf("cq_buf_addr=0x%016llx\n", (unsigned long long)cqc.buf_addr);
+	printf("cq_db_addr=0x%016llx\n", (unsigned long long)cqc.db_addr);
 	printf("qpn=%u\n", qpn);
 	printf("lkey=0x%08x\n", lkey);
 	printf("rkey=0x%08x\n", rkey);
