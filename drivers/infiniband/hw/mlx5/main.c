@@ -3263,6 +3263,232 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	return &mr->ibmr;
 }
 
+/*
+ * mlx5_ib_restore_cq: CRIU-managed CQ restore, Model A (FW cqn
+ * adoption). The destination VHCA inherits the source's user-mode
+ * CQ context across LOAD_VHCA_STATE; this handler builds a fresh
+ * kernel-side mlx5_ib_cq that wraps the adopted (cqn, cqc) state
+ * without re-issuing FW CREATE_CQ.
+ *
+ * Empirical justification of cqn adoption is the chain
+ *   K6 (uobject_restore/fw_id_continuity/) -- cqn allocator
+ *      high-water survives LOAD_VHCA_STATE.
+ *   S5b B0 (uobject_restore/cq_adopt/) -- QUERY_CQ confirms the
+ *      source's cqn is still alive in destination FW with cqc.{eqn,
+ *      log_cq_size, log_page_size, page_offset, status, oi}
+ *      byte-equal to the source's pre-SAVE view; negative-control
+ *      unknown cqns reject with FW syndrome (gating works).
+ * Both empirically PASS on FW 28.48.1000; see
+ * tools/testing/mlx5_vfmig/design/uobject_restore.md §S5b.
+ *
+ * The dispatcher in uverbs_std_types_restore.c has already:
+ *   - gated on mlx5_ib_ucontext_is_restore_mode
+ *     (context->vfmig_restore_mode is true);
+ *   - reserved target_handle in the ufile idr via
+ *     rdma_alloc_begin_uobject_at_handle();
+ *   - populated cq->ibcq.{device, uobject, comp_handler,
+ *     event_handler, cq_context (NULL for v0; no comp_channel)};
+ *   - rejected attr->comp_vector >= num_comp_vectors;
+ *   - rejected RESTORE_CQ_COMP_CHANNEL (S5c deferred to S10);
+ *   - validated attr->flags is in the allowed CQ-create flags set;
+ *   - allocated the rdma_restrack_new entry.
+ * After we return, the dispatcher will rdma_restrack_add() and
+ * rdma_alloc_commit_uobject() and echo cq->cqe back to userspace
+ * via RESP_CQE.
+ *
+ * Wire-visible identity (cqn) MUST come from the @udata UHW
+ * (mlx5_ib_restore_cq_req.cqn). Unlike RESTORE_MR we do NOT have
+ * a core "cqn_hint" attribute to cross-check against; CQs do not
+ * have lkey/rkey-style core hints. The handler enforces only
+ * @cqn != 0 && (@cqn & ~0xffffff) == 0 (FW resource-id range).
+ *
+ * v0 simplifications:
+ *   - cq->buf.umem is real, populated by mlx5_ib_umem_restore_cq()
+ *     which composes ib_umem_pin() (pins the source userspace's
+ *     CQE-ring backing pages without dma_map_sgtable) with
+ *     mlx5_vfmig_bind_user_cq() (iommu_maps each sg at the
+ *     placeholder's IOVA range and populates sg_dma_address). This
+ *     is the Stage-3 D3 destination-side bind chain
+ *     (user_mr_dma.md §A.D). The cqn adoption + CQE-ring binding
+ *     together close the data-path gap: FW CQE writes against this
+ *     cqn reach the same IOVAs the SAVE-side Stage-2 retag
+ *     installed, which now map to destination-side pinned pages.
+ *   - cq->db is bound via mlx5_ib_db_map_user_restore() which is
+ *     the parallel restore variant of mlx5_ib_db_map_user. Cache
+ *     hits (a previously-restored uobject in this ucontext already
+ *     pinned this DBR page) refcount++ and reuse db->dma; cache
+ *     misses ib_umem_pin + mlx5_vfmig_bind_user_dbr the placeholder.
+ *   - cq->resize_buf = NULL, cq->resize_umem = NULL: resize is not
+ *     a v0 concern for adopted CQs.
+ *   - cqe_comp / CQE_128_PAD / REAL_TIME_TS adoption is deferred:
+ *     v0 does not surface @cqe_comp_en / @flags via UHW, and the
+ *     FW-side bits (already set in the adopted cqc) are honoured by
+ *     the FW data path regardless of cq->private_flags. The kernel-
+ *     side cq->private_flags is only consulted by mlx5_ib_create_cq's
+ *     own create_cq_in mailbox composition, which we never run on
+ *     adopted CQs.
+ *
+ * v0 dealloc invariant (parallel to S3b's PD invariant): if userspace
+ * tries to DESTROY_CQ before all dependents (QPs/SRQs that hold this
+ * cqn in their qpc/srqc) have been restored or torn down, FW
+ * DESTROY_CQ returns BAD_RES_STATE which propagates as -EINVAL. The
+ * cq stays parked at target_handle until restore is complete or the
+ * ucontext is destroyed. (See design/uobject_restore.md §S5b for the
+ * BAD_RES_STATE plugin-policy contract.)
+ *
+ * Returns 0 with a fully-wired cq, or a negative errno on validation
+ * failure / umem-pin / bind / EQ-tree register failure (all unwound).
+ */
+static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
+			      const struct ib_cq_init_attr *attr,
+			      struct ib_udata *udata)
+{
+	struct mlx5_ib_dev *dev = to_mdev(ibcq->device);
+	struct mlx5_ib_cq *cq = to_mcq(ibcq);
+	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
+		udata, struct mlx5_ib_ucontext, ibucontext);
+	struct mlx5_ib_restore_cq_req req = {};
+	struct ib_umem *umem;
+	int eqn;
+	int err;
+
+	if (!context)
+		return -EINVAL;
+
+	/*
+	 * Belt & suspenders: the generic dispatcher already gated on
+	 * mlx5_ib_ucontext_is_restore_mode, but a driver-direct caller
+	 * (devx fast path, future test harnesses) cannot bypass the
+	 * per-ucontext sticky bool here.
+	 */
+	if (!context->vfmig_restore_mode)
+		return -EPERM;
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return -EINVAL;
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return err;
+	if (req.reserved || req.reserved2)
+		return -EINVAL;
+	/* FW cqn is a 24-bit field (PRM "create_cq_out"); 0 reserved. */
+	if (req.cqn == 0 || (req.cqn & ~0xffffffU))
+		return -EINVAL;
+	if (req.cqe_size != 64 && req.cqe_size != 128)
+		return -EINVAL;
+	/* attr->cqe was validated by the dispatcher. */
+	if (attr->cqe < 0)
+		return -EINVAL;
+
+	/*
+	 * v0 dispatcher already rejected attr->flags it doesn't
+	 * understand; we accept the same set the create-time path does
+	 * for the kernel-side cq->create_flags book-keeping. The FW
+	 * cqc bits (oi, real_time_ts) are already set in the adopted
+	 * context per S5b B0 readback and are not touched here.
+	 */
+	if (attr->flags & ~(IB_UVERBS_CQ_FLAGS_TIMESTAMP_COMPLETION |
+			    IB_UVERBS_CQ_FLAGS_IGNORE_OVERRUN))
+		return -EOPNOTSUPP;
+
+	/* Mirror mlx5_ib_create_cq's "early" kernel-side init. */
+	cq->ibcq.cqe = attr->cqe;
+	mutex_init(&cq->resize_mutex);
+	spin_lock_init(&cq->lock);
+	cq->resize_buf = NULL;
+	cq->resize_umem = NULL;
+	cq->create_flags = attr->flags;
+	INIT_LIST_HEAD(&cq->list_send_qp);
+	INIT_LIST_HEAD(&cq->list_recv_qp);
+	INIT_LIST_HEAD(&cq->wc_list);
+	cq->cqe_size = req.cqe_size;
+	cq->private_flags = 0;
+	cq->mcq.cqe_sz = cqe_sz_to_mlx_sz(cq->cqe_size, 0);
+	cq->mcq.vector = attr->comp_vector;
+
+	/*
+	 * Wire the cq->mcq callbacks BEFORE mlx5_core_adopt_cq registers
+	 * with the comp eq tree -- the registration immediately enables
+	 * EQE dispatch, and mlx5_create_cq's "if (!cq->comp) cq->comp =
+	 * mlx5_core_cq_dummy_cb" fallback would silently land us on the
+	 * "Completion event for bogus CQ" warning lane otherwise.
+	 *
+	 * udata-path comp / tasklet_ctx.comp / event mirrors
+	 * mlx5_ib_create_cq's user-mode arm exactly, so nothing about
+	 * the adopted CQ's event handling diverges from a fresh-create.
+	 */
+	mlx5_ib_set_user_cq_callbacks(cq);
+
+	/*
+	 * Resolve the destination-side eqn for the source's
+	 * comp_vector. K6 + S5b B0 establish that this lookup yields
+	 * the same eqn the source's adopted cqc.c_eqn_or_apu_element
+	 * already encodes (the eqn allocator high-water survives LOAD,
+	 * and the cqc readback was byte-equal). We therefore do not
+	 * separately QUERY_CQ here -- the adoption is empirically
+	 * sound and a redundant QUERY_CQ would just add cmd-ring
+	 * round-trips on the restore path.
+	 */
+	err = mlx5_comp_eqn_get(dev->mdev, attr->comp_vector, &eqn);
+	if (err)
+		return err;
+
+	/*
+	 * Stage-3 D3 destination-side CQE-ring umem bind. Pins user
+	 * pages (entries * cqe_size bytes; the dispatcher hands us
+	 * attr->cqe == source's reported ibcq.cqe so the byte length
+	 * matches the source's pre-SAVE umem) and iommu_maps each sg
+	 * at the placeholder IOVA range that LOAD_VHCA_STATE installed
+	 * for (KIND_CQ, cqn). On failure the helper has already
+	 * unwound any pin + partial bind via ib_umem_release().
+	 */
+	umem = mlx5_ib_umem_restore_cq(dev, req.cqn, req.buf_addr,
+				       (size_t)attr->cqe * req.cqe_size);
+	if (IS_ERR(umem))
+		return PTR_ERR(umem);
+	cq->buf.umem = umem;
+
+	/*
+	 * Stage-3 D3 destination-side DBR-page umem bind (or refcount-
+	 * up if a previously-restored uobject in this ucontext already
+	 * bound the same DBR page; the dedup logic mirrors create-time
+	 * mlx5_ib_db_map_user). Populates cq->db.{u.user_page, dma}.
+	 */
+	err = mlx5_ib_db_map_user_restore(context, req.db_addr, &cq->db);
+	if (err)
+		goto err_buf;
+
+	/*
+	 * Adopt the FW CQ state. We do not issue any FW command here
+	 * -- the cqn was alive in destination FW post-LOAD per the
+	 * S5b B0 empirical chain. mlx5_core_adopt_cq registers the
+	 * kernel-side mlx5_core_cq with the comp + async eq trees so
+	 * EQE dispatch and ARM doorbells route through cq->mcq.
+	 *
+	 * uid: 0 for v0 (DEVX is out of scope per design §S5b).
+	 */
+	err = mlx5_core_adopt_cq(dev->mdev, &cq->mcq, req.cqn, eqn,
+				 context->devx_uid);
+	if (err)
+		goto err_db;
+
+	mlx5_ib_dbg(dev,
+		    "vfmig_cq_dbg: restore_cq ibdev=%s cqn=0x%x eqn=%d uid=%u target_handle=0x%x cqe=%d cqe_size=%u umem_npages=%zu db_user_virt=0x%lx\n",
+		    dev_name(&ibcq->device->dev), req.cqn, eqn,
+		    context->devx_uid, target_handle, attr->cqe,
+		    req.cqe_size, ib_umem_num_pages(umem),
+		    (unsigned long)(req.db_addr & PAGE_MASK));
+
+	return 0;
+
+err_db:
+	mlx5_ib_db_unmap_user(context, &cq->db);
+err_buf:
+	ib_umem_release(cq->buf.umem);
+	cq->buf.umem = NULL;
+	return err;
+}
+
 static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
@@ -5101,6 +5327,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.req_notify_cq = mlx5_ib_arm_cq,
 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
 	.resize_cq = mlx5_ib_resize_cq,
+	.restore_cq = mlx5_ib_restore_cq,
 	.restore_mr = mlx5_ib_restore_mr,
 	.restore_pd = mlx5_ib_restore_pd,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
