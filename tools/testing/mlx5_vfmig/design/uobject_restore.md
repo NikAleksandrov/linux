@@ -1957,10 +1957,10 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   below; the asymmetry mirrors the PD-vs-MR axis of ?10.8 and is
   recorded explicitly there now that CQ has landed.)
 
-* **S5b: CQ restore on mlx5_vfmig (pending).** Will implement
-  `mlx5_ib_restore_cq` via Model A -- adopt the source's FW `cqn`
-  into a fresh kernel-side `mlx5_ib_cq` with no destination FW
-  round-trip. Empirical chain to anchor before the handler lands:
+* **S5b: CQ restore on mlx5_vfmig (B1+B2+B3 LANDED, B4 pending).**
+  Implements `mlx5_ib_restore_cq` via Model A -- adopt the source's
+  FW `cqn` into a fresh kernel-side `mlx5_ib_cq` with no destination
+  FW round-trip. Empirical chain anchoring the handler:
 
   1. **K6 / `test_fw_id_continuity.sh`** -- already PASS for cqn
      (PARTIAL PASS, +3..+5 deltas explained by destination internal
@@ -2023,29 +2023,68 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
      source's cqn-using QPCs are still alive in destination FW until
      S6 lands).
 
-  **UAPI shape** (`include/uapi/rdma/mlx5-abi.h`, B1):
+  **UAPI shape** (`include/uapi/rdma/mlx5-abi.h`, B1, LANDED):
   ```c
   struct mlx5_ib_restore_cq_req {
-      __u32  cqn;            /* 24 bits significant */
-      __u32  reserved;       /* must be 0 */
-      __aligned_u64 reserved2; /* must be 0 */
+      __aligned_u64 buf_addr;  /* user VA of CQE ring buffer */
+      __aligned_u64 db_addr;   /* user VA of doorbell page */
+      __u32  cqn;              /* 24 bits significant */
+      __u32  cqe_size;         /* 64 or 128 */
+      __u32  reserved;         /* must be 0 */
+      __u32  reserved2;        /* must be 0 */
   };
   ```
-  16-byte UHW payload, identical pattern to `mlx5_ib_restore_pd_req`
-  / `mlx5_ib_restore_mr_req`. Handler enforces:
-  `req.reserved == 0 && req.reserved2 == 0` (forward-compat),
-  `req.cqn != 0 && (req.cqn & ~0xffffff) == 0` (24-bit FW cqn, 0
-  reserved sentinel). No `lkey/rkey`-style cross-check against a
-  core hint because there is no core `cqn_hint` (see ?7.3) -- cqn
-  identity travels only through the UHW payload.
+  32-byte UHW payload (above the 8-byte inline-UHW threshold, so
+  `ib_copy_from_udata()` takes the userspace-pointer path the same
+  way `mlx5_ib_restore_pd_req` / `mlx5_ib_restore_mr_req` already
+  do). Handler enforces: `req.reserved == 0 && req.reserved2 == 0`
+  (forward-compat), `req.cqn != 0 && (req.cqn & ~0xffffff) == 0`
+  (24-bit FW cqn, 0 reserved sentinel), `req.cqe_size in {64, 128}`,
+  `attr->cqe >= 0`, `attr->flags` in
+  `{TIMESTAMP_COMPLETION, IGNORE_OVERRUN}`. No `lkey/rkey`-style
+  cross-check against a core hint because there is no core
+  `cqn_hint` (see ?7.3) -- cqn identity travels only through this
+  UHW payload.
 
-  **Bind helpers (S5 B3, pending).** Mirrors S4b's
+  Note vs original sketch (revision 1, 16-byte cqn-only): the
+  smaller shape was insufficient because `RESTORE_CQ` does NOT
+  carry `buf_addr` / `db_addr` / `cqe_size` in its core attrs
+  (which only carry `cqe` / `comp_vector` / `flags`), and the
+  destination kernel needs all three: `buf_addr` / `cqe_size` to
+  bind the CQE ring umem and parse CQEs at poll time, `db_addr`
+  to bind the doorbell-page umem. The 32-byte shape mirrors
+  `mlx5_ib_create_cq` UHW exactly modulo the absence of
+  `cqe_comp_*` and `flags` (deferred to a future restore-time
+  layout-adoption knob; FW already has the source's
+  `cqe_comp_en` / pad / RTS bits set in the adopted cqc and the
+  data path honours them).
+
+  **Bind helpers (S5 B3, LANDED).** Mirrors S4b's
   `mlx5_ib_umem_restore_mr` / `mlx5_vfmig_bind_user_mr`. Handler
   composes `mlx5_ib_umem_restore_cq` (KIND_CQ buffer) and
   `mlx5_ib_db_map_user_restore` (KIND_DBR doorbell page) before
-  populating mmkey-equivalent state. Both wrappers call
+  registering with the comp + async EQ trees via
+  `mlx5_core_adopt_cq()` (a sibling of `mlx5_core_create_cq` that
+  skips FW CREATE_CQ and only does the kernel-side mlx5_core_cq
+  registration). Both umem wrappers compose `ib_umem_pin()` with a
+  thin mlx5_core entrypoint -- `mlx5_vfmig_bind_user_cq()` for
+  KIND_CQ keyed by `cqn`, `mlx5_vfmig_bind_user_dbr()` for
+  KIND_DBR keyed by `user_virt & PAGE_MASK` -- which call
   `vfmig_iova_bind_user_object()` (Stage-3 D2) against the
   placeholder records emitted by Stage-2 C8/C7 source retags.
+
+  **Handler kernel-side init (S5 B2, LANDED).** Mirrors
+  `mlx5_ib_create_cq`'s post-FW-cmd tail except no FW round-trip
+  is issued. Sets `cq->ibcq.cqe = attr->cqe`, `cq->cqe_size =
+  req.cqe_size`, the standard list-head + spin/mutex + private-
+  flags init, the user-mode CQ callback trio (via
+  `mlx5_ib_set_user_cq_callbacks()`, a new exported helper that
+  decouples main.c from cq.c's file-static comp/event functions),
+  and `mlx5_core_adopt_cq()` for the EQ-tree registration. The
+  destination-side eqn is resolved via
+  `mlx5_comp_eqn_get(comp_vector)`; we trust the K6 + B0 chain
+  that this is the same eqn the source's cqc encodes (validated
+  byte-equal at B0). No redundant QUERY_CQ at restore time.
 
 * **S5c: COMP_CHANNEL restore (deferred to event-mode milestone).**
   Lives with S8 (RESTORE_ASYNC_EVENT) -- both share fd-table
@@ -2062,6 +2101,9 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   |------|------|--------|--------|
   | K6 | LOAD_VHCA_STATE preserves cqn high-water mark | yes (?10 #1) | PARTIAL PASS |
   | B0 | PROBE_CQN raw QUERY_CQ post-LOAD | yes (`test_cq_adopt.sh`) | **STRONG PASS** -- src/dst byte-equal across (cqn, eqn=6, log_cq_size=5, log_page_size=0, page_offset=0, status=0, oi=0); negative control rejected with FW syndrome 0x001fb6ec |
+  | B1 | UAPI `mlx5_ib_restore_cq_req` (32B; `buf_addr` / `db_addr` / `cqn` / `cqe_size` / reserved) | yes | compiles, no abi churn |
+  | B2 | `mlx5_ib_restore_cq` handler + `dev_ops.restore_cq` slot, `mlx5_core_adopt_cq` EQ-tree register helper, `mlx5_ib_set_user_cq_callbacks` cq.c export | yes | compiles, no regressions in mlx5_core / mlx5_ib build |
+  | B3 | bind helpers (`mlx5_vfmig_bind_user_cq` / `_user_dbr` mlx5_core, `mlx5_ib_umem_restore_cq` mlx5_ib mem.c, `mlx5_ib_db_map_user_restore` mlx5_ib doorbell.c) | yes | compiles |
   | B4 | live verb path adopts cqn cleanly | pending | 8/8 subtests + Phase G |
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
   to RTR per ?6.3 option (b). Fini-pass transitions to RTS. **First
