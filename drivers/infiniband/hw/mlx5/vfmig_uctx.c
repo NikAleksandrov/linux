@@ -13,10 +13,29 @@
  *                              on a ucontext that was opened with
  *                              MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE.
  *
+ * Per-uobject dump-side helpers also live here:
+ *
+ *   QUERY_CQ         dump-side counterpart to UVERBS_METHOD_RESTORE_CQ.
+ *                    Reads kernel-stored source userspace VAs (from
+ *                    cq->buf.umem->address and cq->db.u.user_page->
+ *                    user_virt) plus FW cqn / cqe_size, packs them
+ *                    into a payload byte-equal to mlx5_ib_restore_cq_req,
+ *                    and returns the per-CQ inputs RESTORE_CQ takes
+ *                    as core attrs (cqe / comp_vector / flags). Solves
+ *                    the cross-process problem that mlx5dv_init_obj()
+ *                    cannot: CRIU runs in its own address space, so
+ *                    libmlx5 introspection from CRIU returns CRIU's
+ *                    VAs rather than the dumpee's.
+ *
  * See tools/testing/mlx5_vfmig/design/uar_restore.md for the full
- * design, including the rationale for living on the uverbs fd vs the
- * /dev/mlx5_vfmig PF cdev, and the empirical foundation that the
- * snapshotted FW UAR ids stay valid after LOAD_VHCA_STATE.
+ * design of the per-ucontext save/restore path, including the
+ * rationale for living on the uverbs fd vs the /dev/mlx5_vfmig PF
+ * cdev, and the empirical foundation that the snapshotted FW UAR
+ * ids stay valid after LOAD_VHCA_STATE.
+ *
+ * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.2.4 for
+ * the QUERY_CQ rationale (why driver-private vs core QUERY_CQ, why
+ * the byte-equal payload contract, and the security boundary).
  */
 
 #include <rdma/uverbs_ioctl.h>
@@ -673,12 +692,135 @@ DECLARE_UVERBS_NAMED_METHOD(
 			   UA_MANDATORY,
 			   UA_ALLOC_AND_COPY));
 
+/*
+ * MLX5_IB_METHOD_VFMIG_QUERY_CQ -- emit, for the CQ resolved through
+ * UVERBS_OBJECT_CQ on the calling fd's ufile, the bytes a CRIU plugin
+ * needs to drive UVERBS_METHOD_RESTORE_CQ on the destination side.
+ *
+ * Three-part output:
+ *   RESP_BLOB         struct mlx5_ib_restore_cq_req, byte-equal to
+ *                     what RESTORE_CQ's UHW will consume. The handler
+ *                     leaves req.reserved / req.reserved2 zero so the
+ *                     restore path's "must be 0" checks pass round-trip.
+ *   RESP_CQE          ibcq->cqe, the ring-size-minus-one in verbs
+ *                     convention. Goes into UVERBS_ATTR_RESTORE_CQ_CQE.
+ *   RESP_COMP_VECTOR  mcq->mcq.vector, the source's comp_vector index.
+ *   RESP_FLAGS        cq->create_flags (the IB_UVERBS_CQ_FLAGS_*
+ *                     bits the source-side CREATE_CQ recorded).
+ *
+ * Precondition: the CQ must be a user-mode CQ. Kernel-mode CQs
+ * (mcq->buf.umem == NULL, mcq->db.u.pgdir != NULL) reject with
+ * -ENXIO -- there are no source userspace VAs to emit.
+ *
+ * The IDR lookup for HANDLE goes through the calling fd's ufile and
+ * grabs UVERBS_ACCESS_READ on the CQ uobject for the duration of
+ * the call, so a concurrent DESTROY_CQ on the same fd cannot race.
+ */
+static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_CQ)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_cq *ibcq = uverbs_attr_get_obj(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE);
+	struct mlx5_ib_cq *mcq;
+	struct mlx5_ib_restore_cq_req blob = {};
+	u32 cqe;
+	u32 comp_vector;
+	u32 flags;
+	int err;
+
+	if (IS_ERR(ibcq))
+		return PTR_ERR(ibcq);
+
+	mcq = to_mcq(ibcq);
+
+	/*
+	 * Reject kernel-mode CQs: no source userspace state to emit.
+	 * mcq->buf.umem is NULL iff the CQ took the create_cq_kernel
+	 * path; mlx5_ib_db_user_virt returns 0 iff db->u is the pgdir
+	 * (kernel) branch of the union. ibcq->uobject is non-NULL
+	 * here by construction (the IDR lookup came through the user
+	 * ufile) but we don't lean on that for clarity.
+	 */
+	if (!mcq->buf.umem || mlx5_ib_db_user_virt(&mcq->db) == 0)
+		return -ENXIO;
+
+	/*
+	 * Fields that round-trip into mlx5_ib_restore_cq_req:
+	 *
+	 *  cqn        -- mcq->mcq.cqn is a 24-bit FW resource id; non-zero
+	 *                for any live CQ. RESTORE_CQ rejects 0 + sentinels
+	 *                with -EINVAL, so emitting our value here is
+	 *                always restore-acceptable.
+	 *  cqe_size   -- mcq->cqe_size is set in mlx5_ib_create_cq /
+	 *                mlx5_ib_restore_cq to 64 or 128. RESTORE_CQ
+	 *                gates on exactly that set.
+	 *  buf_addr   -- mcq->buf.umem->address was set verbatim by
+	 *                ib_umem_get(@ucmd.buf_addr) at create time.
+	 *                That's the source userspace VA RESTORE_CQ
+	 *                needs to look up the LOAD_VHCA_STATE-installed
+	 *                KIND_CQ-tagged placeholder.
+	 *  db_addr    -- mcq->db.u.user_page->user_virt is the page-
+	 *                aligned doorbell user-virt that
+	 *                mlx5_ib_db_map_user dedup-keyed on. The byte
+	 *                offset into the page survives via FW
+	 *                cqc.dbr_addr, per the comment on
+	 *                mlx5_ib_restore_cq_req.db_addr; the
+	 *                page-aligned form is what the restore-side
+	 *                placeholder lookup keys on.
+	 */
+	blob.cqn = mcq->mcq.cqn;
+	blob.cqe_size = mcq->cqe_size;
+	blob.buf_addr = mcq->buf.umem->address;
+	blob.db_addr = mlx5_ib_db_user_virt(&mcq->db);
+
+	cqe = ibcq->cqe;
+	comp_vector = mcq->mcq.vector;
+	flags = mcq->create_flags;
+
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB, &blob, sizeof(blob));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE, &cqe, sizeof(cqe));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
+		&comp_vector, sizeof(comp_vector));
+	if (err)
+		return err;
+	return uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
+		&flags, sizeof(flags));
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	MLX5_IB_METHOD_VFMIG_QUERY_CQ,
+	UVERBS_ATTR_IDR(MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE,
+			UVERBS_OBJECT_CQ,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_restore_cq_req),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS),
-	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS));
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS),
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_CQ));
 
 const struct uapi_definition mlx5_ib_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(MLX5_IB_OBJECT_VFMIG),
