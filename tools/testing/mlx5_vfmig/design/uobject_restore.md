@@ -33,7 +33,7 @@ end-to-end correctness, not initial scaffolding.
 |---|---|---|---|---|
 | K6 | **v0 gate.** FW-identity-continuity experiment: does `LOAD_VHCA_STATE` preserve PD/CQ/QP/SRQ/MKEY id reservations the way it provably does for UARs? Mirrors `uar_restore.md` ?3. Outcome decides whether K3/K4 mlx5 handlers are a small alloc-with-hint extension (best case) or require new "pre-reserve id N" FW commands (worst case, possibly FW patch). Run this first. | ?8.2, ?10 | **very high** | empirical experiment + small probe ioctl |
 | K2 | **Already exists upstream as `UVERBS_METHOD_INFO_HANDLES` on `UVERBS_OBJECT_DEVICE`** (drivers/infiniband/core/uverbs_std_types_device.c). Takes a `UVERBS_ATTR_INFO_OBJECT_ID` (u16 -- accepts ANY core or driver-namespace object id via `uapi_key_obj()`), walks `ufile->uobjects` under `uobjects_lock` filtered by `obj->uapi_object`, returns `UVERBS_ATTR_INFO_HANDLES_LIST` (u32[]) and `UVERBS_ATTR_INFO_TOTAL_HANDLES` (filled count). Covers AH and every other non-restracked uobject. Drives the pre-suspend coverage check (DEVX/MW/FLOW/XRCD rejection) by enumerating those types and failing the dump if any are present. Validated end-to-end by `info_handles_probe` -- see ?7.2 | ?6.2 | done | zero kernel work |
-| K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive ùùù XA-insert at caller-specified handle, return `-EBUSY` if taken ùùù is already proven by the UAR restore path; this is plumbing, not new core | ?7.3 | medium | reuse existing helper |
+| K2.5 | Wire up the **existing** `rdma_alloc_begin_uobject_at_handle()` helper (already in `drivers/infiniband/core/rdma_core.c`, added by the UAR restore work) into every K3 `RESTORE_<TYPE>` method. The primitive ??? XA-insert at caller-specified handle, return `-EBUSY` if taken ??? is already proven by the UAR restore path; this is plumbing, not new core | ?7.3 | medium | reuse existing helper |
 | K3 | New generic uverbs method namespace `UVERBS_OBJECT_RESTORE` with one method per uobject class: `RESTORE_PD`, `RESTORE_CQ`, `RESTORE_COMP_CHANNEL`, `RESTORE_SRQ`, `RESTORE_QP`, `RESTORE_MR`, `RESTORE_AH`, `RESTORE_ASYNC_EVENT`. Each takes (target user_handle, hw-agnostic attrs, opaque blob, parent_handle xrefs). Dispatches through new `ib_device_ops.restore_<type>` callbacks. Gated by a new opt-in `ib_device_ops.ucontext_is_restore_mode` predicate that each driver implements over its own per-ucontext sticky bool (mlx5: `mlx5_ib_ucontext.vfmig_restore_mode`, set when the ucontext was opened with `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE`; rxe: `rxe_ucontext.restore_mode`, set when opened with `RXE_ALLOC_UCTX_RESTORE_MODE`). Generic dispatch treats missing callback as "no ucontext on this device may restore", so adding RESTORE_* support is strictly opt-in and the `ib_ucontext` core struct stays lean | ?7.1, ?7.2 | high | medium per type |
 | K4 | `ib_device_ops` extended with `restore_pd`, `restore_cq`, `restore_qp`, `restore_mr`, `restore_srq`, `restore_ah`, `restore_comp_channel`, `restore_async_event`. Each driver installs its restore-mode ops vector once, at VF/device **probe** time, when the device is entering VFMIG_RESTORE state (i.e. before any uverbs cdev opens against it). No mid-life ops swapping | ?7.3, ?7.4 | high | one ops vector + per-driver impl |
 | K8 | **Landed as `0601c496b413` (K8a NLDEV emit).** Per-uobject `ufile_handle` (== `obj->id` from `ufile->uobjects`) now emitted alongside the existing restrack-id attr from every `fill_res_<type>_entry` whose resource is user-created (PD/CQ/QP/MR/SRQ), gated by `!rdma_is_kernel_res(res)`. New UAPI attr `RDMA_NLDEV_ATTR_RES_HANDLE`. Validated end-to-end by `nldev_res_handle_probe` (asserts both presence and exact `obj->handle` equality, plus the kernel-only "MUST NOT carry" contract). Lets a CRIU dump plugin join NLDEV's restrack-id view (parent-edge encoding) with the uverbs `INFO_HANDLES` ufile-handle view (`target_handle` install) without an extra cross-reference dispatch. K8b alternative (extend `INFO_HANDLES` with a paired restrack list) recorded in ?7.5 as the rejected-but-considered shape | ?7.5 | done | -- |
@@ -987,8 +987,8 @@ Handler walks `ufile->uobjects` under `uobjects_lock`, filtered by
 `uapi_get_object()` lookup goes through `uapi_key_obj()` which already
 encodes the namespace bit, so the same ioctl path accepts both core
 (`UVERBS_OBJECT_AH`, `UVERBS_OBJECT_ASYNC_EVENT`, `UVERBS_OBJECT_XRCD`,
-ùùù) and driver-namespace object ids (`MLX5_IB_OBJECT_UAR`,
-`MLX5_IB_OBJECT_DEVX_*`, ùùù) uniformly. That's exactly the surface CRIU
+???) and driver-namespace object ids (`MLX5_IB_OBJECT_UAR`,
+`MLX5_IB_OBJECT_DEVX_*`, ???) uniformly. That's exactly the surface CRIU
 needs for both the per-type enumeration and the DEVX/MW/FLOW/XRCD
 coverage check.
 
@@ -2104,7 +2104,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   | B1 | UAPI `mlx5_ib_restore_cq_req` (32B; `buf_addr` / `db_addr` / `cqn` / `cqe_size` / reserved) | yes | compiles, no abi churn |
   | B2 | `mlx5_ib_restore_cq` handler + `dev_ops.restore_cq` slot, `mlx5_core_adopt_cq` EQ-tree register helper, `mlx5_ib_set_user_cq_callbacks` cq.c export | yes | compiles, no regressions in mlx5_core / mlx5_ib build |
   | B3 | bind helpers (`mlx5_vfmig_bind_user_cq` / `_user_dbr` mlx5_core, `mlx5_ib_umem_restore_cq` mlx5_ib mem.c, `mlx5_ib_db_map_user_restore` mlx5_ib doorbell.c) | yes | compiles |
-  | B4 | live verb path adopts cqn cleanly (`cq_restore_probe_mlx5_vfmig` + `test_cq_restore_mlx5_vfmig.sh`: 10 subtests -- gate, 4 UAPI rejects, bad comp_vector, COMP_CHANNEL rejection, happy path, EBUSY collision, Phase-G PROBE_CQN byte-equal vs. source pre-SAVE, post-quit v0 dealloc rejection) | pending kernel run | 10/10 subtests + Phase G |
+  | B4 | live verb path adopts cqn cleanly (`cq_restore_probe_mlx5_vfmig` + `test_cq_restore_mlx5_vfmig.sh`: 10 subtests -- gate, 4 UAPI rejects, bad comp_vector, COMP_CHANNEL rejection, happy path, EBUSY collision, Phase-G PROBE_CQN byte-equal vs. source pre-SAVE, post-quit v0 dealloc rejection) | yes (2026-05-29) | **STRONG PASS** -- 10/10 subtests + Phase G byte-equal across (eqn=6, log_cq_size=5, log_page_size=0, page_offset=0, status=0, oi=0); subtest 10 confirmed orphan `DESTROY_CQ` -> `-EINVAL` via FW BAD_RES_STATE while QPC dependents still alive; LOAD-side dmesg shows 5 user_page placeholders replayed (CQE-ring + DBR + MR + QP + SRQ), residue of `total - (cmd_ring+fw_page+dma_coherent+eq_buf+frag_buf+db_page) = 218 - 213 = 5`. DBR-VA-keyed lookup invariant locked in by `MAP_FIXED_NOREPLACE` in the probe's `cq_args_mmap_local` (commit `da4dd37ac8bc`) -- without it the fresh-anon-mmap shim would mismatch the (KIND_DBR, src_db_addr & PAGE_MASK) placeholder. |
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
   to RTR per ?6.3 option (b). Fini-pass transitions to RTS. **First
   passing `rdma_test_agent` round-trip on a restored ucontext --
@@ -2485,8 +2485,11 @@ Failure modes the probe explicitly distinguishes (mirrors ?9.4 and
    re-establishes on top. Follow-on if needed.
 8. **Per-class dealloc semantics asymmetry under v0 -- the FW
    resource-graph axis**:
-   **Discovered (2026-05-17) for PD/MR; extended (2026-05-20) for
-   CQ as S5 lands. Recorded, not blocking.**
+   **Discovered (2026-05-17) for PD/MR; CQ row validated
+   (2026-05-29) by `cq_restore_probe_mlx5_vfmig` subtest 10 on
+   FW 28.48.1000 -- orphan `DESTROY_CQ` rejected with
+   BAD_RES_STATE -> `-EINVAL` while LOAD_VHCA_STATE'd QPC/SRQC
+   dependents remain. Recorded, not blocking.**
 
    The axis is "is this resource a *parent* in the FW resource
    graph (i.e. does FW track other resources as children that
@@ -2499,7 +2502,7 @@ Failure modes the probe explicitly distinguishes (mirrors ?9.4 and
    |-------|---------------------|----------------|---------------|
    | PD | parent (CQ/QP/MR/SRQ children reference pdn) | rejected `BAD_RES_STATE` -> `-EINVAL` | `pd_restore_probe_mlx5_vfmig` subtest 7 |
    | MR | leaf (QPs reference by wire (l/r)key, not tracked) | accepts `DESTROY_MKEY` -> 0 | `mr_restore_probe_mlx5_vfmig` subtest 8 |
-   | CQ | parent (QPCs reference cqn_snd/cqn_rcv as tracked dep; SRQ context too) | will reject `BAD_RES_STATE` -> `-EINVAL` until S6 drains the source's cqn-using QPs | S5b `cq_restore_probe_mlx5_vfmig` subtest 8 (pending) |
+   | CQ | parent (QPCs reference cqn_snd/cqn_rcv as tracked dep; SRQ context too) | rejects `BAD_RES_STATE` -> `-EINVAL` until S6 drains the source's cqn-using QPs | `cq_restore_probe_mlx5_vfmig` subtest 10 (validated 2026-05-29) |
 
    **MR side** (the original surprise): in the FW resource graph
    mkey is a leaf under PD; QPs reference an mkey by its
@@ -2507,14 +2510,15 @@ Failure modes the probe explicitly distinguishes (mirrors ?9.4 and
    dependency, so FW has nothing to refuse against. Empirically
    established by `mr_restore_probe_mlx5_vfmig`'s subtest 8.
 
-   **CQ side** (S5 prediction): cqn IS a tracked dep --
-   `qpc.cqn_snd`/`cqn_rcv` and SRQ context all carry cqn as a FW
-   reference. So the orphan adopted CQ behaves like an orphan
-   adopted PD: FW rejects until the source's cqn-using QPs/SRQs
-   are themselves drained, which doesn't happen until S6/S7. v0
-   dealloc-ordering invariant for CQ inherits the PD shape.
-   Locked in by S5b `cq_restore_probe_mlx5_vfmig`'s subtest 8
-   when it lands.
+   **CQ side** (validated 2026-05-29 with B4 STRONG PASS): cqn
+   IS a tracked dep -- `qpc.cqn_snd`/`cqn_rcv` and SRQ context
+   all carry cqn as a FW reference. So the orphan adopted CQ
+   behaves like an orphan adopted PD: FW rejects with
+   BAD_RES_STATE -> `-EINVAL` until the source's cqn-using
+   QPs/SRQs are themselves drained, which doesn't happen until
+   S6/S7. v0 dealloc-ordering invariant for CQ inherits the PD
+   shape exactly, as locked in by `cq_restore_probe_mlx5_vfmig`'s
+   subtest 10 against FW 28.48.1000.
 
    **rxe is uniformly on the leaf side** (no FW graph at all):
    rxe `destroy_<class>` returns `-EINVAL` only when kernel-side
@@ -2541,6 +2545,44 @@ Failure modes the probe explicitly distinguishes (mirrors ?9.4 and
    QP/SRQ rows fill in with S6/S7 -- both expected on the parent
    side (QPs are referenced by the source's CM_ID / QPC graph;
    SRQs are referenced by QPCs).
+
+9. **TODO: drop unused `MLX5_IB_ALLOC_UCTX_DEVX` symbol from the
+   pd_restore + mr_restore probes' inlined enums**:
+   **Recorded (2026-05-29). Pure documentation hygiene; deferred
+   intentionally to keep B4 series focused on CQ.**
+
+   `cq_restore_probe_mlx5_vfmig.c` deliberately does NOT inline
+   `MLX5_IB_ALLOC_UCTX_DEVX`/`ADOPT_DEVX_UID` next to
+   `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE` (commit `43cb650ab55c`):
+   the v0 RESTORE path lives exclusively on the `devx_uid = 0`
+   lane per ?9.1 S3b "DEVX-adoption blind spot", and leaking the
+   symbol into a probe's enum invites accidental
+   `DEVX | VFMIG_RESTORE` usage that would silently undermine
+   Model A by allocating a fresh devx_uid for the destination
+   ucontext.
+
+   The pre-existing `pd_restore_probe_mlx5_vfmig.c` (line 119)
+   and `mr_restore_probe_mlx5_vfmig.c` (line 168) still inline
+   `MLX5_IB_ALLOC_UCTX_DEVX = 1u << 0` next to the VFMIG flag.
+   The symbol is defined but never referenced anywhere in those
+   files; the only `do_get_context()` flags arguments are `0`
+   (gate-negative subtest) or `MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE`
+   (happy path). So dropping the enum entry is functionally a
+   pure no-op -- verified by `grep MLX5_IB_ALLOC_UCTX_DEVX` in
+   each probe.
+
+   When picked up, mirror the multi-paragraph comment from
+   `cq_restore_probe_mlx5_vfmig.c`'s enum that explains:
+     - why DEVX (bit 0) is omitted (would allocate fresh uid)
+     - why ADOPT_DEVX_UID (bit 2) is omitted (uctx-registry
+       wipe blind spot)
+     - the v0 mitigation (`devx_uid = 0` lane proven by the
+       P_zero / N_zero cells of the pd_adopt matrix)
+     - how to re-introduce the bits if a future test needs the
+       DEVX-aware lane
+
+   Two atomic commits (one per probe) keep the diff trivially
+   reviewable.
 
 ## 11. Sequencing relative to other work
 
