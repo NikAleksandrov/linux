@@ -581,9 +581,14 @@ plugin contribution.
 ### 5.2 CQ + comp channel fd
 
 * **Discovery (CQ)**: NLDEV `RES_CQ_GET` (CTXN already emitted). Yields
-  cqe count, dim flag, comp_vector (if exposed), poll_ctx for kernel CQs.
-  Plugin adds FW cqn + per-cqe-buffer iova map via
-  `MLX5_IB_METHOD_VFMIG_QUERY_CQ(handle)`.
+  cqe count, dim flag, poll_ctx for kernel CQs. Plugin adds the
+  source-side userspace VAs of the CQE-ring buffer + DBR page, plus
+  the FW cqn and `cqe_size` and the user's `comp_vector`/`flags`,
+  via the **landed** `MLX5_IB_METHOD_VFMIG_QUERY_CQ(handle)` (see
+  ?5.2.4 for full rationale). The QUERY emits a 32-byte payload
+  byte-equal to `struct mlx5_ib_restore_cq_req` so the CRIU plugin
+  can `memcpy` it into protobuf at dump and back into the
+  `RESTORE_CQ` UHW tail at restore with no field-level marshaling.
 * **Discovery (CC)**: `LIST_UOBJS(UVERBS_OBJECT_COMP_CHANNEL)` (K2).
   Returns handles only.
 * **Xref**: CQ -> CC via `XR_COMP_CHANNEL` if the CQ was created with a
@@ -616,6 +621,185 @@ plugin contribution.
   resolves via `ib_uverbs_get_async_event()` -> ufile default
   `async_file` when absent (the v0 path; S8 will let it resolve to an
   explicit restored async-event uobject without a UAPI bump).
+
+#### 5.2.4 CQ dump-side discovery: `MLX5_IB_METHOD_VFMIG_QUERY_CQ`
+
+CRIU's CQ dump phase needs five fields the destination's
+`RESTORE_CQ` will consume (`buf_addr`, `db_addr`, `cqn`,
+`cqe_size`, plus the per-CQ core inputs `cqe`/`comp_vector`/
+`flags`). Three are FW properties (`cqn`, `cqe_size`,
+`cqe`/`cqe_cnt`) and are process-independent. Two -- `buf_addr`
+and `db_addr` -- are the **source userspace VAs** that the
+destination kernel uses to look up the LOAD_VHCA_STATE-installed
+KIND_CQ / KIND_DBR placeholders.
+
+**Why neither library introspection nor netlink works**
+
+* `mlx5dv_init_obj(MLX5DV_OBJ_CQ)` reads `dvcq.{buf, dbrec}` out of
+  libmlx5's struct `mlx5_cq` -- but those are the **calling
+  process's** userspace VAs. CRIU runs in its own address space;
+  the libmlx5 struct it could reach via dlsym holds CRIU's VAs,
+  not the dumpee's. The fields are useful only when the caller
+  *is* the dumpee (as in `fw_id_continuity_probe`,
+  `cq_query_probe_mlx5_vfmig` -- single-process probes).
+* `ibv_import_cq` does not exist in upstream rdma-core. There is
+  no public verb to manufacture an `ibv_cq*` in CRIU's address
+  space against the dumpee's underlying kernel CQ, so we cannot
+  even feed `mlx5dv_init_obj` a handle resolved from CRIU.
+  Compare to `ibv_import_pd` / `ibv_import_mr`, which exist but
+  whose man pages explicitly call out that imported objects carry
+  no userspace mapping (`addr` field is documented as "NULL value
+  is expected").
+* Extending NLDEV with `user_addr` TLVs would scope the leak too
+  widely: NLDEV is `CAP_NET_ADMIN`-gated and visible across every
+  netns. CRIU is the only known consumer and it already holds the
+  dumpee's `uverbsfd` (the same fd it uses for `INFO_HANDLES` /
+  K8a `RES_HANDLE` joins), so a uverbs ioctl gives the right
+  security boundary: "if you can see the ucontext, you can read
+  its metadata." Same argument ?7.7 made for not extending NLDEV
+  with the analogous MR fields.
+* Parasite-injected `mlx5dv_init_obj` inside the dumpee
+  (compel-style) is technically possible but brittle (libmlx5
+  internal struct ABI is not stable) and adds parasite-side
+  library plumbing CRIU does not currently carry; rejected as a
+  v0 path. `process_vm_readv` against libmlx5's `struct mlx5_cq`
+  is even more brittle (libmlx5 internal, not part of rdma-core
+  ABI) and is rejected outright.
+
+**Why driver-private under VFMIG, not core `QUERY_CQ`**
+
+?7.7 extended core `UVERBS_METHOD_QUERY_MR` with two new
+`UA_OPTIONAL` outs (`USER_ADDR`, `ACCESS_FLAGS`) backed by two
+new fields on `struct ib_mr` itself. That worked because
+`user_addr` and `access_flags` are *core* properties of every
+user MR, present on every provider. CQ is structurally
+different: of the five fields we need to round-trip,
+
+| field | kernel storage | scope |
+|-------|----------------|-------|
+| `cqe` (entries-1) | `struct ib_cq.cqe` | core |
+| `cqe_size` | `mlx5_ib_cq.cqe_size` | mlx5-only |
+| FW `cqn` | `mcq->mcq.cqn` | mlx5-only |
+| `buf_addr` | `mcq->buf.umem->address` | mlx5-only (rxe has no user umem) |
+| `db_addr` | `mcq->db.u.user_page->user_virt` | mlx5-only |
+
+four of five live on `mlx5_ib_cq`, and rxe's CQ has no source
+userspace VA at all (rxe queues are kernel-allocated and exposed
+via `vm_ops`; the rxe `RESTORE_CQ` UHW carries `vm_pgoff` not
+`buf_addr` -- see `drivers/infiniband/sw/rxe/rxe_mmap.c:118`).
+Promoting `buf_addr`/`db_addr`/`cqe_size` to `struct ib_cq` would
+either misuse the abstraction (rxe writes 0s) or require a
+per-driver hook anyway. The clean shape is therefore a
+**driver-private** method under `MLX5_IB_OBJECT_VFMIG`, with rxe
+landing its own `RXE_METHOD_VFMIG_QUERY_CQ` (out of v0 scope --
+rxe restore doesn't consume source VAs the same way) when the
+CRIU plugin grows rxe support.
+
+**Landed shape**
+
+`include/uapi/rdma/mlx5_user_ioctl_cmds.h`:
+
+```c
+enum mlx5_ib_vfmig_methods {
+    MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT = (1U << UVERBS_ID_NS_SHIFT),
+    MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT,
+    MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS,
+    MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS,
+    MLX5_IB_METHOD_VFMIG_QUERY_CQ,    /* new */
+};
+
+enum mlx5_ib_vfmig_query_cq_attrs {
+    MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+    MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,        /* mlx5_ib_restore_cq_req, 32B */
+    MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,         /* u32, ibcq->cqe */
+    MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR, /* u32, mcq->mcq.vector */
+    MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,       /* u32, cq->create_flags */
+};
+```
+
+The HANDLE is `UVERBS_ATTR_IDR(UVERBS_OBJECT_CQ,
+UVERBS_ACCESS_READ)` -- the calling fd's ufile-idr must own this
+CQ, the IDR pins the uobject for the duration of the call. Same
+security boundary as `INFO_HANDLES(UVERBS_OBJECT_CQ)`.
+
+**Byte-equal payload contract.** `RESP_BLOB` is byte-equal to
+`struct mlx5_ib_restore_cq_req` (32 bytes). The kernel handler
+zeroes `reserved`/`reserved2` so the round-trip into RESTORE_CQ's
+"must be 0" guards passes verbatim. CRIU plugin code at the
+seam reduces to:
+
+```c
+/* dump phase */
+ioctl(uverbsfd, RDMA_VERBS_IOCTL, &query_cq_cmd);
+img.cq[i].blob        = blob;          /* 32B verbatim */
+img.cq[i].cqe         = resp_cqe;
+img.cq[i].comp_vector = resp_comp_vector;
+img.cq[i].flags       = resp_flags;
+
+/* restore phase */
+restore_cq_cmd.uhw_in.data = (uintptr_t)&img.cq[i].blob;
+restore_cq_cmd.uhw_in.len  = sizeof(img.cq[i].blob);
+restore_cq_cmd.cqe         = img.cq[i].cqe;
+restore_cq_cmd.comp_vector = img.cq[i].comp_vector;
+restore_cq_cmd.flags       = img.cq[i].flags;
+ioctl(dst_uverbsfd, RDMA_VERBS_IOCTL, &restore_cq_cmd);
+```
+
+No field-level marshaling, no `mlx5dv` anywhere.
+
+**Kernel-mode CQ rejection.** The handler rejects kernel-mode
+CQs with `-ENXIO` (`mcq->buf.umem == NULL` or
+`mlx5_ib_db_user_virt(&mcq->db) == 0`). Kernel-mode CQs have no
+source userspace state to emit; CRIU does not own them and
+should not see them in `INFO_HANDLES(CQ)` anyway (kernel CQs are
+not in any user ufile's idr). The check is defensive belt &
+suspenders.
+
+**`mlx5_ib_db_user_virt` accessor.** `struct mlx5_ib_user_db_page`
+is private to `drivers/infiniband/hw/mlx5/doorbell.c`. The
+QUERY_CQ handler reaches the doorbell user-virt via a small
+read-only accessor (`u64 mlx5_ib_db_user_virt(const struct
+mlx5_db *db)`) declared in `mlx5_ib.h` and implemented in
+`doorbell.c`. The accessor returns 0 for kernel-mode db slots
+(union's `pgdir` branch). Returning `u64` (not `unsigned long`)
+matches the UAPI seam (`db_addr` is `__aligned_u64`); the
+kernel-internal `page->user_virt` stays `unsigned long` to match
+the rest of the doorbell pipeline (`mlx5_ib_db_map_user`'s
+`virt`, `ib_umem.address`, the doorbell-page-list dedup key).
+Designed to also serve future `MLX5_IB_METHOD_VFMIG_QUERY_QP`
+and `_QUERY_SRQ`, which both have a DBR-page round-trip.
+
+**`mcq.vector` symmetry fix in create path.** Pre-existing
+asymmetry: `mlx5_ib_create_cq` did not set `cq->mcq.vector` after
+calling `mlx5_comp_eqn_get(vector, &eqn)` -- the FW got the
+right `cqc.c_eqn_or_apu_element` but the kernel-side bookkeeping
+field stayed zero. `mlx5_ib_restore_cq` already set it on the
+adoption path, and a comment in
+`drivers/net/ethernet/mellanox/mlx5/core/cq.c::mlx5_core_adopt_cq`
+explicitly called the create-side gap "we mirror" (i.e. neither
+path sets it). QUERY_CQ needs it set to faithfully echo the
+user's source-side `comp_vector`, so we close the gap with a
+one-line `cq->mcq.vector = vector;` after the eqn lookup. Side
+effect: any other introspection path that reads `mcq.vector`
+post-create now sees the user's hint instead of 0; the fix is
+purely additive and aligns the create path with the restore
+path's existing semantics.
+
+**Validator.** `tools/testing/mlx5_vfmig/uobject_restore/cq_query/
+cq_query_probe_mlx5_vfmig.c` is the single-process byte-equality
+probe. It creates real CQs via `ibv_create_cq`, reads view (A)
+via `mlx5dv_init_obj(MLX5DV_OBJ_CQ)`, reads view (B) via
+`MLX5_IB_METHOD_VFMIG_QUERY_CQ`, and asserts strict equality
+across `cqn`, `cqe_size`, `buf_addr`, `(db_addr & PAGE_MASK)`,
+`cqe`, `comp_vector`, `flags`, plus the two reserved-zero
+contracts. Subtests cover happy path, invalid-handle (-ENOENT),
+multi-CQ disambiguation, and `comp_vector=1` echo (gates the
+create-path symmetry fix above). Empirically **STRONG PASS** on
+ConnectX (mlx5_2, FW 28.48.1000) -- once the byte-equal contract
+holds, a CRIU dumper that cannot run `mlx5dv_init_obj` from its
+own address space (because `dvcq.{buf, dbrec}` would be CRIU's
+VAs) substitutes the QUERY_CQ ioctl on the dumpee's `uverbsfd`
+and gets the same bytes.
 
 ### 5.3 QP
 
@@ -2105,6 +2289,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   | B2 | `mlx5_ib_restore_cq` handler + `dev_ops.restore_cq` slot, `mlx5_core_adopt_cq` EQ-tree register helper, `mlx5_ib_set_user_cq_callbacks` cq.c export | yes | compiles, no regressions in mlx5_core / mlx5_ib build |
   | B3 | bind helpers (`mlx5_vfmig_bind_user_cq` / `_user_dbr` mlx5_core, `mlx5_ib_umem_restore_cq` mlx5_ib mem.c, `mlx5_ib_db_map_user_restore` mlx5_ib doorbell.c) | yes | compiles |
   | B4 | live verb path adopts cqn cleanly (`cq_restore_probe_mlx5_vfmig` + `test_cq_restore_mlx5_vfmig.sh`: 10 subtests -- gate, 4 UAPI rejects, bad comp_vector, COMP_CHANNEL rejection, happy path, EBUSY collision, Phase-G PROBE_CQN byte-equal vs. source pre-SAVE, post-quit v0 dealloc rejection) | yes (2026-05-29) | **STRONG PASS** -- 10/10 subtests + Phase G byte-equal across (eqn=6, log_cq_size=5, log_page_size=0, page_offset=0, status=0, oi=0); subtest 10 confirmed orphan `DESTROY_CQ` -> `-EINVAL` via FW BAD_RES_STATE while QPC dependents still alive; LOAD-side dmesg shows 5 user_page placeholders replayed (CQE-ring + DBR + MR + QP + SRQ), residue of `total - (cmd_ring+fw_page+dma_coherent+eq_buf+frag_buf+db_page) = 218 - 213 = 5`. DBR-VA-keyed lookup invariant locked in by `MAP_FIXED_NOREPLACE` in the probe's `cq_args_mmap_local` (commit `da4dd37ac8bc`) -- without it the fresh-anon-mmap shim would mismatch the (KIND_DBR, src_db_addr & PAGE_MASK) placeholder. |
+  | B5 | dump-side verb (`MLX5_IB_METHOD_VFMIG_QUERY_CQ` + `cq_query_probe_mlx5_vfmig`): kernel reads `mcq->mcq.cqn` / `ibcq->cqe` / `mcq->cqe_size` / `mcq->buf.umem->address` / `mlx5_ib_db_user_virt(&mcq->db)` / `mcq->mcq.vector` / `mcq->create_flags` and emits a 32-byte payload byte-equal to `mlx5_ib_restore_cq_req` plus three scalar outs (cqe / comp_vector / flags). Closes the cross-process gap that motivated this verb: CRIU runs in its own address space and `mlx5dv_init_obj` from CRIU returns CRIU's VAs, not the dumpee's; `ibv_import_cq` does not exist in upstream rdma-core (see ?5.2.4 for the full design-space rejection of mlx5dv-import / NLDEV-extension / parasite-injection alternatives). Includes an `mlx5_ib_create_cq` symmetry fix (`cq->mcq.vector = vector;` after `mlx5_comp_eqn_get`) so QUERY_CQ echoes the user's source-side comp_vector instead of zalloc-zero -- pre-existing asymmetry called out in `mlx5_core_adopt_cq`'s docstring as "we mirror"; QUERY_CQ flips it. | yes (2026-05-30) | **STRONG PASS** -- `cq_query_probe_mlx5_vfmig mlx5_2 16 0`: subtests 1 (happy: cqn=0xa27 / buf_addr=0x55cb2a0e0000 / db_addr=0x55cb2a0e4000 / cqe=31 / comp_vector=0 / flags=0x0), 2 (invalid handle -> -ENOENT), 3 (multi-CQ disambiguation across two distinct cqn / buf_addr), 4 (`comp_vector=1` echoes correctly post-symmetry-fix). Round-trip pin len = cqe(31) * cqe_size(64) = 1984 bytes, sane vs. the 2048-byte ring-with-padding. byte-equal contract holds across all three ring-buffer / DBR-page / FW-id fields against `mlx5dv_init_obj` view (A). |
 * **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
   to RTR per ?6.3 option (b). Fini-pass transitions to RTS. **First
   passing `rdma_test_agent` round-trip on a restored ucontext --
