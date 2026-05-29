@@ -1470,6 +1470,156 @@ out_free:
 }
 
 /*
+ * MLX5_VFMIG_IOC_PROBE_CQN handler -- experimental, §S5b empirical.
+ *
+ * Issues a single QUERY_CQ(cqn) on the bound VF mdev's cmdif and --
+ * on FW accept -- reads back the cqc fields the §S5b byte-equality
+ * assertion checks (status, oi, log_cq_size, log_page_size,
+ * page_offset, c_eqn_or_apu_element). The whole point is to answer
+ * the §S5b existence question that mr_restore_probe asks for mkeys:
+ * "Does the source's user-mode CQ at cqn=N survive LOAD_VHCA_STATE
+ * intact, with the same eqn binding and shape parameters the source
+ * had at SAVE time?" If yes, Model A for mlx5_ib_restore_cq is sound:
+ * a destination kernel-side mlx5_ib_cq can wrap the adopted (cqn,
+ * eqn) pair without first issuing a fresh CREATE_CQ against the
+ * destination VHCA.
+ *
+ * Locking: same shape as vfmig_ioc_probe_pd / vfmig_ioc_probe_mkey.
+ * Resolve the VF pci_dev from PF + vf_id, take device_lock to pin
+ * ->driver and drvdata, match driver by KBUILD_MODNAME, require
+ * MLX5_INTERFACE_STATE_UP. QUERY_CQ runs on the VF mdev's cmdif
+ * with cmdif-uid=0 (host-privileged). mlx5_ifc_query_cq_in has no
+ * uid field of its own, so the question of "can a uid=N ucontext
+ * use this CQ?" is not addressed here -- see PROBE_CQN UAPI doc.
+ *
+ * Memory layout: query_cq_out is large (PAS payload tail of
+ * 0x600 bits / 192 bytes after the cqc) but we only use the cqc
+ * header at offset 0x80. Reading the entire blob is fine; this is
+ * a debug-only path with no perf concerns. Same shape as the
+ * PROBE_MKEY allocation pattern.
+ */
+static long vfmig_ioc_probe_cqn(struct mlx5_vfmig_pf *vfmig,
+				void __user *uarg)
+{
+	u32 in[MLX5_ST_SZ_DW(query_cq_in)] = {};
+	int outlen = MLX5_ST_SZ_BYTES(query_cq_out);
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_cqn arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	void *out, *cqc;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (memchr_inv(arg.reserved_in, 0, sizeof(arg.reserved_in)))
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.cqn & 0xff000000)		/* cqn is 24 bits */
+		return -EINVAL;
+
+	out = kzalloc(outlen, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev) {
+		err = -ENODEV;
+		goto out_free;
+	}
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_cqn: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_cqn: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	MLX5_SET(query_cq_in, in, opcode, MLX5_CMD_OP_QUERY_CQ);
+	MLX5_SET(query_cq_in, in, cqn, arg.cqn);
+
+	err = mlx5_cmd_exec(vf_mdev, in, sizeof(in), out, outlen);
+	if (err) {
+		/*
+		 * mlx5_cmd_exec converts FW syndromes to negative errnos
+		 * but stamps the original 32-bit syndrome onto the output
+		 * blob. Surface it to userspace so the test matrix can
+		 * distinguish "invalid cqn" / "BAD_RES_STATE" (FW gone)
+		 * from transport errors. All cqc readback fields stay
+		 * zero in the reject lane, matching the UAPI contract.
+		 */
+		arg.fw_syndrome = MLX5_GET(query_cq_out, out, syndrome);
+		arg.fw_eqn = 0;
+		arg.fw_status = 0;
+		arg.fw_log_cq_size = 0;
+		arg.fw_log_page_size = 0;
+		arg.fw_page_offset = 0;
+		arg.fw_oi = 0;
+		arg.fw_cqe_sz = 0;
+		arg.fw_apu_cq = 0;
+		arg.fw_uar_page = 0;
+		arg.fw_dbr_addr = 0;
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: probe_cqn: vf %u cqn 0x%x QUERY_CQ err %d syndrome 0x%x\n",
+			      arg.vf_id, arg.cqn, err, arg.fw_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+
+	arg.fw_syndrome = 0;
+	cqc = MLX5_ADDR_OF(query_cq_out, out, cq_context);
+	arg.fw_eqn = MLX5_GET(cqc, cqc, c_eqn_or_apu_element);
+	arg.fw_status = MLX5_GET(cqc, cqc, status);
+	arg.fw_log_cq_size = MLX5_GET(cqc, cqc, log_cq_size);
+	arg.fw_log_page_size = MLX5_GET(cqc, cqc, log_page_size);
+	arg.fw_page_offset = MLX5_GET(cqc, cqc, page_offset);
+	arg.fw_oi = MLX5_GET(cqc, cqc, oi);
+	arg.fw_cqe_sz = MLX5_GET(cqc, cqc, cqe_sz);
+	arg.fw_apu_cq = MLX5_GET(cqc, cqc, apu_cq);
+	arg.fw_uar_page = MLX5_GET(cqc, cqc, uar_page);
+	arg.fw_dbr_addr = MLX5_GET64(cqc, cqc, dbr_addr);
+
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: probe_cqn: vf %u cqn 0x%x ok eqn=0x%x status=%u log_cq_size=%u log_page_size=%u page_offset=%u oi=%u cqe_sz=%u apu_cq=%u uar_page=0x%x dbr_addr=0x%llx\n",
+		      arg.vf_id, arg.cqn, arg.fw_eqn, arg.fw_status,
+		      arg.fw_log_cq_size, arg.fw_log_page_size,
+		      arg.fw_page_offset, arg.fw_oi, arg.fw_cqe_sz,
+		      arg.fw_apu_cq, arg.fw_uar_page,
+		      (unsigned long long)arg.fw_dbr_addr);
+
+out_copy:
+	arg.reserved_out0 = 0;
+	arg.reserved_out1 = 0;
+	memset(arg.reserved_out2, 0, sizeof(arg.reserved_out2));
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+out_free:
+	kfree(out);
+	return err;
+}
+
+/*
  * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND handler -- user_mr_dma stage-2
  * success-criterion accessor.
  *
@@ -4215,6 +4365,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_QUERY_AWAITING_BIND:
 		ret = vfmig_ioc_query_awaiting_bind(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_PROBE_CQN:
+		ret = vfmig_ioc_probe_cqn(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

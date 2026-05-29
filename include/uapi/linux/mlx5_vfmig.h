@@ -681,4 +681,141 @@ struct mlx5_vfmig_query_awaiting_bind {
 #define MLX5_VFMIG_IOC_QUERY_AWAITING_BIND \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0c, struct mlx5_vfmig_query_awaiting_bind)
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_CQN:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_PD / PROBE_MKEY /
+ *       PROBE_UID / QUERY_QP, NOT part of the M2/M3 contract. ***
+ *
+ *   Drives the §S5b empirical question: "After LOAD_VHCA_STATE the
+ *   firmware should still have the source's user-mode CQ at index N
+ *   alive on the destination VF -- is it actually still there, and
+ *   does its cqc context match what the source had at SAVE time
+ *   (cqn, eqn, log_cq_size, log_page_size, page_offset, status,
+ *   oi)?"
+ *
+ *   This is the CQ analogue of PROBE_MKEY, with the same FW-side
+ *   primitive shape: a pure QUERY_CQ(cqn) (opcode 0x402) with no
+ *   side effects, and on FW accept the handler reads back the cqc
+ *   header so the userspace test can byte-compare with the source's
+ *   pre-SAVE view.
+ *
+ *   The load-bearing field over PROBE_MKEY is @fw_eqn -- a CQ's
+ *   completions flow through an event queue, and the EQ binding
+ *   must survive LOAD_VHCA_STATE for adopted CQs to deliver
+ *   completions on the destination side. K6 already shows
+ *   LOAD_VHCA_STATE preserves the cqn high-water mark; PROBE_CQN
+ *   adds the byte-equality check that the cqc *contents* (and in
+ *   particular the eqn binding) are also preserved.
+ *
+ *   The "can a destination ucontext at uid=0 actually USE this
+ *   adopted CQ?" question -- the analogue of PROBE_PD's uid_hint
+ *   gating test, and PROBE_MKEY's split with mr_restore_probe_*
+ *   -- is NOT covered by this ioctl. That part is tested
+ *   empirically by the end-to-end S5b probe
+ *   (cq_restore_probe_mlx5_vfmig) once it lands. The split is
+ *   intentional: PROBE_CQN tests FW-side existence with zero side
+ *   effects (so it can run freely in test harnesses); the
+ *   userspace probe tests destination-ucontext usability with
+ *   mlx5_ib in the loop.
+ *
+ *   Use:
+ *     - On dst, AFTER LOAD_VHCA_STATE has been applied (typically
+ *       AFTER MLX5_VFMIG_IOC_MARK_RESTORED but BEFORE any user
+ *       ucontext binds to the restored VF):
+ *         ioctl(PROBE_CQN, dst_vf, cqn=src_cqn)
+ *       Expected: 0 (and @fw_syndrome == 0). The output @fw_eqn /
+ *       @fw_log_cq_size / @fw_log_page_size / @fw_page_offset /
+ *       @fw_status / @fw_oi should match the source's per-CQ
+ *       snapshot CRIU captured pre-SAVE. A mismatch is a kernel/FW
+ *       SAVE-LOAD bug, not a usage bug.
+ *     - Negative control: same call with a bogus cqn (e.g. one
+ *       above the source's high-water mark, or 0x00ffffff).
+ *       Expected: non-zero @fw_syndrome with the FW's "BAD_RES_STATE"
+ *       / "invalid cqn" code; all @fw_* output fields zeroed.
+ *
+ *   The VF must currently be bound to mlx5_core and its mdev must
+ *   be MLX5_INTERFACE_STATE_UP, same constraint as PROBE_UID /
+ *   PROBE_PD / PROBE_MKEY. The command is issued on the VF mdev's
+ *   cmdif.
+ *
+ *   Errors: -EFAULT on copy_{from,to}_user; -EINVAL if @cqn exceeds
+ *   its 24-bit range, or any reserved field is non-zero; -ENODEV
+ *   if the VF is unbound or its mdev interface is down; any
+ *   negative kernel/FW err code on cmdif transport failure.
+ */
+struct mlx5_vfmig_probe_cqn {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 cqn;			/* in:  FW cqn to query
+					 *      (24 bits significant)
+					 */
+	__u8  reserved_in[8];		/* in:  must be 0 */
+
+	__u32 fw_syndrome;		/* out: 0 on FW accept, else
+					 *      the firmware syndrome
+					 *      returned by QUERY_CQ
+					 *      (a 32-bit FW error code).
+					 */
+	__u32 fw_eqn;			/* out: cqc.c_eqn_or_apu_element
+					 *      (32 bits). When @fw_apu_cq
+					 *      is 0 (the only case at v0
+					 *      of S5b) this is the
+					 *      destination-side EQ id the
+					 *      adopted CQ delivers
+					 *      completions on. Must equal
+					 *      the source's eqn for the
+					 *      §S5b byte-equality
+					 *      assertion.  0 on reject.
+					 */
+	__u8  fw_status;		/* out: cqc.status (4 bits).
+					 *      0 = OK; nonzero means the
+					 *      saved CQ was already in an
+					 *      error state. 0 on reject.
+					 */
+	__u8  fw_log_cq_size;		/* out: cqc.log_cq_size (5 bits).
+					 *      0 on reject.
+					 */
+	__u8  fw_log_page_size;		/* out: cqc.log_page_size
+					 *      (5 bits). 0 on reject.
+					 */
+	__u8  fw_page_offset;		/* out: cqc.page_offset (6 bits).
+					 *      0 on reject.
+					 */
+	__u8  fw_oi;			/* out: cqc.oi (1 bit) --
+					 *      overrun-ignore. 0 on reject.
+					 */
+	__u8  fw_cqe_sz;		/* out: cqc.cqe_sz (3 bits).
+					 *      0=64B 1=128B 2=256B 3=512B.
+					 *      Forensic only -- not part
+					 *      of the byte-equality
+					 *      assertion. 0 on reject.
+					 */
+	__u8  fw_apu_cq;		/* out: cqc.apu_cq (1 bit).
+					 *      v0 of S5b expects 0; if 1,
+					 *      @fw_eqn is an APU element
+					 *      id rather than an eqn and
+					 *      adoption is unsupported.
+					 *      0 on reject.
+					 */
+	__u8  reserved_out0;		/* out: zeroed */
+
+	__u32 fw_uar_page;		/* out: cqc.uar_page (24 bits).
+					 *      Forensic only -- KIND_DBR
+					 *      doorbell-page binding will
+					 *      sanity-check this against
+					 *      the source's uar_page in B3.
+					 *      0 on reject.
+					 */
+	__u32 reserved_out1;		/* out: zeroed */
+	__u64 fw_dbr_addr;		/* out: cqc.dbr_addr (64 bits)
+					 *      -- user-VA of the doorbell
+					 *      ring in the source ucontext.
+					 *      Forensic only at B0; will
+					 *      be the input to KIND_DBR
+					 *      umem-bind in B3. 0 on reject.
+					 */
+	__u8  reserved_out2[16];	/* out: zeroed */
+};
+#define MLX5_VFMIG_IOC_PROBE_CQN \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0d, struct mlx5_vfmig_probe_cqn)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
