@@ -414,6 +414,94 @@ enum mlx5_ib_vfmig_methods {
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS,
 	MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS,
+	/*
+	 * QUERY_CQ: dump-side counterpart to UVERBS_METHOD_RESTORE_CQ.
+	 * The CRIU dumper holds the dumpee's uverbs fd (same fd it uses
+	 * for INFO_HANDLES / NLDEV joins) and runs in its own address
+	 * space, so it cannot derive the source userspace VAs of the
+	 * CQE-ring buffer / doorbell page from libmlx5's mlx5dv_init_obj
+	 * (whose @buf, @dbrec are the CALLING process's VAs -- here
+	 * CRIU's, not the dumpee's). Likewise libibverbs has no
+	 * ibv_import_cq verb, so manufacturing an ibv_cq* in CRIU's
+	 * address space to feed mlx5dv_init_obj is not an option.
+	 *
+	 * QUERY_CQ closes that loop by reading the kernel's own copy of
+	 * the source-side state. The kernel knows all five fields
+	 * trivially: cqn = mcq->mcq.cqn, cqe = ibcq->cqe, cqe_size =
+	 * mcq->cqe_size, buf_addr = mcq->buf.umem->address (set by
+	 * ib_umem_get(@ucmd.buf_addr) at original CREATE_CQ),
+	 * db_addr = mcq->db.u.user_page->user_virt (page-aligned at
+	 * mlx5_ib_db_map_user). The 32-byte BLOB is byte-equal to
+	 * struct mlx5_ib_restore_cq_req so the CRIU plugin can copy it
+	 * verbatim into protobuf at dump and feed it back into the UHW
+	 * tail of UVERBS_METHOD_RESTORE_CQ at restore. The companion
+	 * outs (CQE / COMP_VECTOR / FLAGS) carry the per-CQ inputs
+	 * RESTORE_CQ takes as core attrs (not in the UHW blob).
+	 *
+	 * Security boundary: the calling fd must own the CQ uobject
+	 * referenced by HANDLE -- the IDR lookup against UVERBS_OBJECT_CQ
+	 * resolves through ufile->idr, which is per-uverbs-fd. Same
+	 * "if you can see the ucontext, you can read its metadata"
+	 * boundary as UVERBS_METHOD_QUERY_MR (see core/uverbs_std_types_mr.c
+	 * + tools/testing/mlx5_vfmig/design/uobject_restore.md §7.7).
+	 *
+	 * Kernel-mode CQs (no udata at create time -- mcq->buf.umem is
+	 * NULL and mcq->db.u.pgdir is the kernel-allocated lane) reject
+	 * with -ENXIO: there are no source userspace VAs to emit, and
+	 * RESTORE_CQ would have nothing to consume even if we synthesised
+	 * zeros.
+	 *
+	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.2.4.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_CQ,
+};
+
+/*
+ * Attrs for MLX5_IB_METHOD_VFMIG_QUERY_CQ.
+ *
+ * The HANDLE is resolved via UVERBS_ATTR_IDR(UVERBS_OBJECT_CQ,
+ * UVERBS_ACCESS_READ): the calling fd's ufile-idr must own this CQ.
+ *
+ * The four RESP_* outs together provide everything UVERBS_METHOD_RESTORE_CQ
+ * consumes for an mlx5 CQ that was created from userspace:
+ *
+ *   RESP_BLOB         struct mlx5_ib_restore_cq_req (32 bytes; goes
+ *                     verbatim into UVERBS_ATTR_RESTORE_CQ_UHW_IN /
+ *                     attrs->driver_udata at restore time). Carries
+ *                     buf_addr, db_addr, cqn, cqe_size, two reserved
+ *                     u32s left zero by the handler. The byte-equal
+ *                     contract is the v0 design's whole reason for
+ *                     existing -- CRIU plugin code is memcpy in,
+ *                     memcpy out.
+ *
+ *   RESP_CQE          u32, the source's ibcq->cqe (entries-1 in the
+ *                     verbs convention; mlx5_ib_restore_cq's umem-pin
+ *                     length math = (size_t)attr->cqe * cqe_size).
+ *                     Goes into UVERBS_ATTR_RESTORE_CQ_CQE.
+ *
+ *   RESP_COMP_VECTOR  u32, the source's mcq->mcq.vector. Goes into
+ *                     UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR. The
+ *                     destination's mlx5_comp_eqn_get(comp_vector)
+ *                     yields the destination-side eqn for that
+ *                     vector index, which K6 + S5b B0 establish
+ *                     matches the source-side eqn baked into the
+ *                     adopted cqc.c_eqn_or_apu_element across
+ *                     LOAD_VHCA_STATE.
+ *
+ *   RESP_FLAGS        u32, the source's cq->create_flags (mask of
+ *                     IB_UVERBS_CQ_FLAGS_TIMESTAMP_COMPLETION /
+ *                     IB_UVERBS_CQ_FLAGS_IGNORE_OVERRUN). Goes into
+ *                     UVERBS_ATTR_RESTORE_CQ_FLAGS.
+ *
+ * All four outs are MANDATORY: a CRIU plugin that ignores any of
+ * them at dump time will produce an unrestorable image.
+ */
+enum mlx5_ib_vfmig_query_cq_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
 };
 
 /*
