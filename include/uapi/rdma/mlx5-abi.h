@@ -316,6 +316,84 @@ struct mlx5_ib_restore_mr_req {
 				  * future DEVX-uid / flags. */
 };
 
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_CQ on
+ * mlx5. CRIU-managed restore passes the source's FW cqn here so
+ * mlx5_ib_restore_cq can adopt the existing destination-side CQ
+ * (preserved across LOAD_VHCA_STATE) into a fresh kernel-side
+ * mlx5_ib_cq without re-issuing FW CREATE_CQ.
+ *
+ * The wire-visible identity of the CQ is carried by @cqn -- there
+ * is no core "cqn_hint" attribute on the verb (CQs do not have
+ * lkey/rkey-style core hints; cqn is a strictly mlx5-private
+ * concept that travels only through this UHW). The handler
+ * enforces @cqn != 0 and @cqn fits in 24 bits (FW resource id
+ * range), and rejects 0 as a documented sentinel.
+ *
+ * @cqe_size, @buf_addr, @db_addr capture the source-side
+ * userspace state that mlx5_ib_create_cq's create_cq_user normally
+ * derives from struct mlx5_ib_create_cq.{cqe_size,buf_addr,db_addr}
+ * at fresh-CQ time. We carry them via the restore UHW because they
+ * are NOT representable in the core RESTORE_CQ attrs (which only
+ * carry cqe / comp_vector / flags), and the kernel needs them to:
+ *
+ *   - parse the destination-side CQE ring at poll time
+ *     (cqe_size: 64 or 128)
+ *   - bind the CQE ring umem onto the destination-side
+ *     KIND_CQ-tagged placeholder LOAD_VHCA_STATE installed
+ *     (buf_addr: source userspace VA; the wider mlx5_ib_cq
+ *     adopts the source's IOVA via the placeholder)
+ *   - bind the doorbell-page umem onto the destination-side
+ *     KIND_DBR-tagged placeholder LOAD_VHCA_STATE installed
+ *     (db_addr: source userspace VA, page-aligned by handler)
+ *
+ * The adopted cqn must come from the source's pre-SAVE state and
+ * is expected to still be reserved in firmware on the destination
+ * VF after LOAD_VHCA_STATE. The empirical chain is:
+ *   - tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/
+ *     (K6 -- cqn allocator high-water survives LOAD);
+ *   - tools/testing/mlx5_vfmig/uobject_restore/cq_adopt/
+ *     (S5b B0 -- QUERY_CQ confirms src_cqn alive on dest post-LOAD
+ *     with cqc.{eqn, log_cq_size, log_page_size, page_offset,
+ *     status, oi} byte-equal to the source pre-SAVE view; STRONG
+ *     PASS on FW 28.48.1000).
+ *
+ * NOTE on size (32 bytes): well above the 8-byte inline-UHW
+ * threshold, so the dispatcher always takes the userspace-pointer
+ * path and ib_copy_from_udata() works as expected on x86_64 with
+ * masked-user-access. Same dodge as mlx5_ib_restore_pd_req /
+ * mlx5_ib_restore_mr_req. The reserved[] tail reserves room for
+ * future per-CQ DEVX-uid hints, CQE compression layout, and
+ * flags without growing the struct.
+ */
+struct mlx5_ib_restore_cq_req {
+	__aligned_u64 buf_addr;	/* source userspace VA of CQE ring buffer
+				 * -- bound on the destination via
+				 * mlx5_ib_umem_restore_cq into the
+				 * KIND_CQ-tagged placeholder
+				 * LOAD_VHCA_STATE installed. */
+	__aligned_u64 db_addr;	/* source userspace VA of doorbell page
+				 * -- bound on the destination via
+				 * mlx5_ib_db_map_user_restore into the
+				 * KIND_DBR-tagged placeholder. Handler
+				 * page-aligns @db_addr before binding;
+				 * the offset within the page survives
+				 * verbatim because cqc.dbr_addr (FW)
+				 * already encodes it. */
+	__u32	cqn;		/* FW cqn to adopt (24 bits significant);
+				 * 0 is reserved as a sentinel. */
+	__u32	cqe_size;	/* 64 or 128. Must match the source
+				 * mkx5_ib_create_cq.cqe_size used at
+				 * source-side CREATE_CQ; mismatched values
+				 * (or any value other than 64/128) reject
+				 * with -EINVAL. */
+	__u32	reserved;	/* must be 0 */
+	__u32	reserved2;	/* must be 0; reserves a 32-bit slot
+				 * for future per-CQ flags (CQE_128_PAD
+				 * adoption, REAL_TIME_TS adoption,
+				 * cqe_comp_en adoption). */
+};
+
 struct mlx5_ib_tso_caps {
 	__u32 max_tso; /* Maximum tso payload size in bytes */
 
