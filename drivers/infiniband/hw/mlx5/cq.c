@@ -1126,6 +1126,27 @@ int mlx5_ib_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 	return 0;
 }
 
+/*
+ * Wire @cq's mlx5_core_cq callbacks for a user-mode CQ created via the
+ * uverbs RESTORE path. Decouples mlx5_ib_restore_cq (in main.c) from
+ * the file-static mlx5_ib_cq_comp / mlx5_ib_cq_event symbols here in
+ * cq.c -- the create-time path sets the same trio inline inside
+ * mlx5_ib_create_cq, but for restore the call lives in main.c next to
+ * the rest of the restore_cq verb body.
+ *
+ * The selection (mlx5_add_cq_to_tasklet vs mlx5_ib_cq_comp directly)
+ * mirrors mlx5_ib_create_cq's "if (udata)" arm exactly: user CQs hop
+ * through the tasklet so the comp_handler runs in process context;
+ * kernel CQs (which RESTORE does not surface) call mlx5_ib_cq_comp
+ * directly from the EQ ISR.
+ */
+void mlx5_ib_set_user_cq_callbacks(struct mlx5_ib_cq *cq)
+{
+	cq->mcq.comp = mlx5_add_cq_to_tasklet;
+	cq->mcq.tasklet_ctx.comp = mlx5_ib_cq_comp;
+	cq->mcq.event = mlx5_ib_cq_event;
+}
+
 static int is_equal_rsn(struct mlx5_cqe64 *cqe64, u32 rsn)
 {
 	return rsn == (ntohl(cqe64->sop_drop_qpn) & 0xffffff);

@@ -97,6 +97,63 @@ struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
 }
 
 /*
+ * Stage-3 D3: pin a user CQ's CQE-buffer pages and bind them to the
+ * Stage-2 placeholder that LOAD_VHCA_STATE-replayed HOST_USER_PAGE
+ * records installed for the source's (KIND_CQ, cqn) tuple.
+ *
+ * Identical composition shape to mlx5_ib_umem_restore_mr modulo the
+ * kind enum:
+ *
+ *   1. ib_umem_pin(&dev->ib_dev, addr, size, IB_ACCESS_LOCAL_WRITE)
+ *      -- pins user pages and builds the sg_append_table without
+ *      DMA-mapping. Access is IB_ACCESS_LOCAL_WRITE because the FW
+ *      writes CQEs into the buffer; matches the source-side
+ *      mlx5_ib_create_cq's ib_umem_get(... IB_ACCESS_LOCAL_WRITE).
+ *   2. mlx5_vfmig_bind_user_cq(dev->mdev, cqn, sgt) -- iommu_maps
+ *      each sg at consecutive IOVAs starting at the placeholder's
+ *      recorded IOVA base, populates sg_dma_address / sg_dma_len so
+ *      subsequent vfmig_dma_ops.unmap_sg under ib_umem_release()
+ *      can match each entry, and transitions placeholder
+ *      awaiting_bind=true -> false.
+ *
+ * On bind failure (-ENOENT placeholder miss / -EBUSY double-bind /
+ * -EINVAL sgt mismatch / iommu_map errno), the umem is unwound via
+ * ib_umem_release(). Per design §A.H L2 the partial-bind unwind is
+ * safe (vfmig_dma_ops.unmap_sg skips zero-iova sgs).
+ *
+ * Caller (mlx5_ib_restore_cq) responsibilities:
+ *   - Gate on context->vfmig_restore_mode + a tracked-VF ucontext
+ *     before calling. A non-tracked VF reaches this helper only via
+ *     direct driver-internal misuse; -ENODEV surfaces from the
+ *     mlx5_vfmig_bind_user_cq fast-path gate so the verb fails
+ *     loudly rather than silently leaking pins.
+ *   - cqn must match what the SAVE-side retag emitted as the
+ *     HOST_USER_PAGE record's fw_id (== source cqn).
+ *
+ * Returns the populated struct ib_umem on success (the caller
+ * stores it in cq->buf.umem); ERR_PTR on any failure with all
+ * resources released.
+ */
+struct ib_umem *mlx5_ib_umem_restore_cq(struct mlx5_ib_dev *dev, u32 cqn,
+					unsigned long addr, size_t size)
+{
+	struct ib_umem *umem;
+	int err;
+
+	umem = ib_umem_pin(&dev->ib_dev, addr, size, IB_ACCESS_LOCAL_WRITE);
+	if (IS_ERR(umem))
+		return umem;
+
+	err = mlx5_vfmig_bind_user_cq(dev->mdev, cqn,
+				      &umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(umem);
+		return ERR_PTR(err);
+	}
+	return umem;
+}
+
+/*
  * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
  * filled in the pas array.
  */

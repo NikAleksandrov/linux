@@ -143,3 +143,100 @@ void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db)
 
 	mutex_unlock(&context->db_page_mutex);
 }
+
+/*
+ * Restore-time variant of mlx5_ib_db_map_user. The fast-path (cache
+ * hit) is identical to mlx5_ib_db_map_user: a previously-restored
+ * uobject in the same ucontext already pinned this DBR page and
+ * bound it to the destination's KIND_DBR placeholder, so we just
+ * refcount up and reuse db->u.user_page / db->dma. The miss-path
+ * differs from the fresh-create variant in two ways:
+ *
+ *   1. It uses ib_umem_pin() (no DMA mapping) instead of
+ *      ib_umem_get() (DMA-mapped via vfmig_dma_ops.map_sg). This is
+ *      the same asymmetry as mlx5_ib_umem_restore_mr vs the create-
+ *      time mlx5_ib_reg_user_mr: at restore time the IOVA must
+ *      match what LOAD_VHCA_STATE installed for the placeholder
+ *      (not a freshly-allocated one), which the explicit
+ *      mlx5_vfmig_bind_user_dbr handles synchronously.
+ *
+ *   2. It calls mlx5_vfmig_bind_user_dbr() instead of relying on
+ *      mlx5_ib_db_map_user's source-side retag. The bind helper
+ *      consumes the awaiting_bind=true placeholder LOAD_VHCA_STATE
+ *      replayed at HOST_USER_PAGE time keyed by
+ *      VFMIG_HUOBJ_KEY(KIND_DBR, virt & PAGE_MASK) -- exactly the
+ *      key the SAVE-side mlx5_vfmig_retag_user_dbr emitted.
+ *
+ * The miss-path bind is a hard prerequisite for FW data-path use of
+ * the doorbell: the FW writes 8-byte doorbell records via the IOVA
+ * encoded in cqc.dbr_addr / qpc.dbr_umem_id; that address points at
+ * the placeholder's IOVA range, and unbound placeholders hard-fail
+ * the Stage-3 D2 invariant. Bind failure here therefore propagates
+ * to the verb body and aborts the restore.
+ *
+ * The dedup machinery (db_page_list per-ucontext list) treats hits
+ * identically to mlx5_ib_db_map_user: refcount++ and reuse the
+ * existing umem + dma. The first restored uobject (CQ / QP / SRQ)
+ * pointing at a given DBR page does the bind; subsequent ones share
+ * the bound umem. No "clear on cache hit" cleanup is needed because
+ * nothing was set in the hit path.
+ *
+ * Lifetime: the resulting db is matched 1-to-1 by mlx5_ib_db_unmap_user
+ * (no parallel restore variant required); the unmap path's
+ * ib_umem_release fires the standard vfmig_dma_ops.unmap_sg unbind
+ * which honours the bound iova range.
+ */
+int mlx5_ib_db_map_user_restore(struct mlx5_ib_ucontext *context,
+				unsigned long virt, struct mlx5_db *db)
+{
+	struct mlx5_ib_user_db_page *page;
+	struct mlx5_ib_dev *dev = to_mdev(context->ibucontext.device);
+	int err = 0;
+
+	mutex_lock(&context->db_page_mutex);
+
+	list_for_each_entry(page, &context->db_page_list, list)
+		if ((current->mm == page->mm) &&
+		    (page->user_virt == (virt & PAGE_MASK)))
+			goto found;
+
+	page = kmalloc(sizeof(*page), GFP_KERNEL);
+	if (!page) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	page->user_virt = (virt & PAGE_MASK);
+	page->refcnt    = 0;
+	page->umem = ib_umem_pin(context->ibucontext.device, virt & PAGE_MASK,
+				 PAGE_SIZE, 0);
+	if (IS_ERR(page->umem)) {
+		err = PTR_ERR(page->umem);
+		kfree(page);
+		goto out;
+	}
+
+	err = mlx5_vfmig_bind_user_dbr(dev->mdev, page->user_virt,
+				       &page->umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(page->umem);
+		kfree(page);
+		goto out;
+	}
+
+	mmgrab(current->mm);
+	page->mm = current->mm;
+
+	list_add(&page->list, &context->db_page_list);
+
+found:
+	db->dma = sg_dma_address(page->umem->sgt_append.sgt.sgl) +
+		  (virt & ~PAGE_MASK);
+	db->u.user_page = page;
+	++page->refcnt;
+
+out:
+	mutex_unlock(&context->db_page_mutex);
+
+	return err;
+}
