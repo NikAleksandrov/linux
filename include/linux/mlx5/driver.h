@@ -1622,6 +1622,80 @@ mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 }
 #endif
 
+/*
+ * Stage-3 D3: destination-side bind for a freshly-pinned user CQ
+ * CQE-buffer umem inside the per-VF vfmig deterministic IOVA domain.
+ *
+ * Mirrors mlx5_vfmig_bind_user_mr modulo the kind enum
+ * (VFMIG_HUOBJ_KIND_CQ) and the FW-id semantics (cqn instead of
+ * mkey_index). The caller is mlx5_ib_umem_restore_cq's ib_umem_pin
+ * -> mlx5_vfmig_bind_user_cq composition (S5b B3), called from
+ * mlx5_ib_restore_cq's verb body once LOAD_VHCA_STATE has installed
+ * the (kind=CQ, fw_id=cqn) placeholder.
+ *
+ * @vf_dev:        this ucontext's underlying mlx5_core_dev. O(1)
+ *                 NULL-load gate on cmd.vfmig_iova_dom.
+ * @cqn:           24-bit FW cqn that identifies the source CQ. Same
+ *                 value the SAVE-side retag emitted on the wire via
+ *                 HOST_USER_PAGE record's instance_key.
+ * @sgt:          umem->sgt_append.sgt from ib_umem_pin().
+ *
+ * Same return-code semantics as mlx5_vfmig_bind_user_mr.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/uobject_restore.md
+ * §S5b and tools/testing/mlx5_vfmig/design/user_mr_dma.md §A.D.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			    struct sg_table *sgt);
+#else
+static inline int
+mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+/*
+ * Stage-3 D3: destination-side bind for a freshly-pinned user
+ * doorbell-page umem inside the per-VF vfmig deterministic IOVA
+ * domain.
+ *
+ * Differs from the MR/CQ variants because DBR is the only kind whose
+ * fw_id is a userspace virtual address rather than an FW-allocated
+ * identifier (no FW resource owns "the doorbell page"; the FW only
+ * ever sees the DMA address of individual 8-byte doorbell records
+ * inside it). mlx5_ib_db_map_user already dedups on
+ * (mm, user_virt & PAGE_MASK), and the SAVE-side retag
+ * (mlx5_vfmig_retag_user_dbr) emits HOST_USER_PAGE records keyed by
+ * VFMIG_HUOBJ_KEY(KIND_DBR, user_virt & PAGE_MASK). This bind helper
+ * uses the same key.
+ *
+ * @vf_dev:        this ucontext's underlying mlx5_core_dev.
+ * @user_virt:     userspace VA of the doorbell record (does not have
+ *                 to be page-aligned; the helper masks to PAGE_MASK
+ *                 internally to compose the instance_key).
+ * @sgt:           umem->sgt_append.sgt from ib_umem_pin(). Must
+ *                 describe exactly one PAGE_SIZE entry; multi-page
+ *                 sgts are rejected with -EINVAL.
+ *
+ * Same return-code semantics as mlx5_vfmig_bind_user_mr.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §A.E.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
+			     unsigned long user_virt, struct sg_table *sgt);
+#else
+static inline int
+mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
+			 unsigned long user_virt, struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {

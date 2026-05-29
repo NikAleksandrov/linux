@@ -4668,6 +4668,86 @@ int mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 EXPORT_SYMBOL(mlx5_vfmig_bind_user_mr);
 
 /*
+ * Public Stage-3 D3 destination-side bind entry point for the mlx5_ib
+ * RESTORE_CQ verb body. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * Identical shape and error semantics as mlx5_vfmig_bind_user_mr
+ * modulo the kind enum. The caller is mlx5_ib_umem_restore_cq's
+ * ib_umem_pin -> mlx5_vfmig_bind_user_cq composition (S5b B3),
+ * mirroring S4b's ib_umem_pin -> mlx5_vfmig_bind_user_mr.
+ *
+ * The instance_key is VFMIG_HUOBJ_KEY(KIND_CQ, cqn). The source-side
+ * retag (mlx5_vfmig_retag_user_cq, fired from mlx5_ib_create_cq
+ * post-FW-create) installed the matching placeholder in the
+ * SAVE-side IOVA domain; LOAD_VHCA_STATE replays it onto the
+ * destination ahead of this bind.
+ */
+int mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			    struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !sgt)
+		return -EINVAL;
+	if (cqn == 0 || (cqn & ~0xffffffU))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_bind_user_object(dom, VFMIG_HUOBJ_KIND_CQ,
+					   (u64)cqn, sgt);
+}
+EXPORT_SYMBOL(mlx5_vfmig_bind_user_cq);
+
+/*
+ * Public Stage-3 D3 destination-side bind entry point for the mlx5_ib
+ * RESTORE_CQ / RESTORE_QP / RESTORE_SRQ verb bodies' doorbell-page
+ * binds. Header docstring lives in include/linux/mlx5/driver.h.
+ *
+ * The instance_key is VFMIG_HUOBJ_KEY(KIND_DBR, user_virt & PAGE_MASK)
+ * -- DBR is the only kind whose fw_id is a userspace virtual address
+ * rather than a FW-allocated identifier (no FW resource owns "the
+ * doorbell page"; the FW only sees the DMA address of individual
+ * 8-byte doorbell records inside it). The destination's Stage-3
+ * bind path needs a stable key that spans the SAVE -> LOAD boundary;
+ * mlx5_ib_db_map_user already dedups on (mm, user_virt & PAGE_MASK),
+ * so we lean on that key, matching the SAVE-side
+ * mlx5_vfmig_retag_user_dbr emission.
+ *
+ * @user_virt does not need to be page-aligned -- this helper masks
+ * to PAGE_MASK before composing the instance_key, just like the
+ * source-side retag does. Callers may pass the raw user VA.
+ *
+ * Same fast-path / error semantics as mlx5_vfmig_bind_user_mr, with
+ * one extra invariant check: @sgt must describe exactly one
+ * PAGE_SIZE entry, since mlx5_ib_db_map_user pins a single page per
+ * doorbell umem. Multi-page sgts are rejected with -EINVAL.
+ */
+int mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
+			     unsigned long user_virt, struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !sgt)
+		return -EINVAL;
+	if (sgt->nents != 1 || sg_dma_len(sgt->sgl) > PAGE_SIZE)
+		return -EINVAL;
+	if (sgt->sgl->length != PAGE_SIZE)
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_bind_user_object(dom, VFMIG_HUOBJ_KIND_DBR,
+					   (u64)(user_virt & PAGE_MASK), sgt);
+}
+EXPORT_SYMBOL(mlx5_vfmig_bind_user_dbr);
+
+/*
  * Public Stage-2 source-side retag entry point for the mlx5_ib user
  * doorbell-page allocation path. Header docstring lives in
  * include/linux/mlx5/driver.h.
