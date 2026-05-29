@@ -145,6 +145,31 @@ void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db)
 }
 
 /*
+ * Read-only accessor for the page-aligned source userspace VA of the
+ * doorbell-page user_page that backs @db. Returns 0 for kernel-mode db
+ * slots (db->u.pgdir branch -- no user_page). Used by
+ * MLX5_IB_METHOD_VFMIG_QUERY_CQ (and future per-uobject QUERY verbs)
+ * to round-trip the source VA into struct mlx5_ib_restore_*_req.db_addr
+ * without exposing struct mlx5_ib_user_db_page across translation units.
+ *
+ * Returns u64 to match the UAPI seam (struct mlx5_ib_restore_*_req
+ * .db_addr is __aligned_u64); page->user_virt is unsigned long for
+ * kernel-internal reasons (mlx5_ib_db_map_user / ib_umem.address /
+ * the doorbell dedup key) and is widened here at the export point.
+ *
+ * No locking: db->u.user_page is set once at uobject create / restore
+ * time and cleared in mlx5_ib_db_unmap_user only after the parent
+ * uobject's destroy verb has already serialised against any other
+ * users. Callers reach @db through a UVERBS_ACCESS_READ-pinned CQ /
+ * QP / SRQ uobject so the parent stays alive for the duration of the
+ * read.
+ */
+u64 mlx5_ib_db_user_virt(const struct mlx5_db *db)
+{
+	return db->u.user_page ? (u64)db->u.user_page->user_virt : 0;
+}
+
+/*
  * Restore-time variant of mlx5_ib_db_map_user. The fast-path (cache
  * hit) is identical to mlx5_ib_db_map_user: a previously-restored
  * uobject in the same ucontext already pinned this DBR page and

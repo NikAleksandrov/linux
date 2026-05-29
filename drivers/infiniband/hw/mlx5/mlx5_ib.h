@@ -1360,6 +1360,27 @@ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
 int mlx5_ib_db_map_user_restore(struct mlx5_ib_ucontext *context,
 				unsigned long virt, struct mlx5_db *db);
 void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db);
+/*
+ * Accessor for the page-aligned source userspace VA stored on the
+ * user_page that backs @db. Returns 0 for kernel-mode db slots (no
+ * user_page) -- callers MUST check for the user-mode case
+ * (mcq->buf.umem != NULL etc.) before treating the value as a
+ * meaningful source VA. The struct mlx5_ib_user_db_page type itself
+ * is private to doorbell.c; expose only the field that
+ * MLX5_IB_METHOD_VFMIG_QUERY_CQ + future QUERY_QP / QUERY_SRQ need
+ * to round-trip into the matching mlx5_ib_restore_*_req payload.
+ *
+ * Returns u64 (not unsigned long) deliberately: every consumer of
+ * this accessor is a UAPI emit path that lands in a __aligned_u64
+ * field (struct mlx5_ib_restore_cq_req.db_addr today, parallel
+ * QUERY_QP / QUERY_SRQ tomorrow). Returning u64 avoids an implicit
+ * widening cast at every call site and makes the "this is a wire
+ * value" intent explicit. The kernel-internal page->user_virt is
+ * still unsigned long (matches mlx5_ib_db_map_user's @virt arg,
+ * ib_umem.address, and the doorbell-page-list dedup key); the
+ * widening to u64 happens here, at the export seam.
+ */
+u64 mlx5_ib_db_user_virt(const struct mlx5_db *db);
 struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
 					u32 mkey_index, unsigned long addr,
 					size_t size, int access);
