@@ -803,25 +803,282 @@ and gets the same bytes.
 
 ### 5.3 QP
 
-* **Discovery**: NLDEV `RES_QP_GET`, ctxn derived via PDN-join against
-  the PD inventory (one-hop after K1). Yields type, port, qp_state,
-  src/dst PSN, src/dst QPN. Hw-agnostic `ib_qp_attr`
-  fields not in NLDEV are recoverable via `IB_USER_VERBS_CMD_QUERY_QP`
-  (existing uverbs command, no kernel change needed). Plugin adds FW qpn
-  context via `MLX5_IB_METHOD_VFMIG_QUERY_QP(handle)` returning
-  `{fw_qpn, fw_uar_idx, fw_resp_buf_iova_map, ...}`.
-* **Xrefs**: PD (XR_PARENT_PD), send_cq (XR_SEND_CQ), recv_cq (XR_RECV_CQ),
-  optionally SRQ (XR_SRQ).
-* **Restore order**: after PD, CQ, SRQ.
-* **Kernel verb**: `UVERBS_METHOD_RESTORE_QP(target_handle, init_attr,
-  attr, attr_mask, blob, pd_handle, send_cq_handle, recv_cq_handle,
-  srq_handle?)`. Honours qp_num as identity hint.
-* **Driver-side (mlx5_vfmig)**: allocates `mlx5_ib_qp`, calls FW
-  `CREATE_QP` with qpn hint, applies `MODIFY_QP` chain through INIT->RTR->RTS
-  to land in the saved state with all PSN/QKEY/AV fields. Activation pass
-  (?4.3 hook 3, or restore-fini per ?6 below) re-posts any RQ WRs.
-* **Driver-side (rxe)**: standard `rxe_create_qp` + identity-hint
-  extension on QPN allocation, plus QP state machine replay.
+#### 5.3.1 v0 state coverage
+
+Each IBTA-defined QP state is handled, deferred, or refused at v0:
+
+| state | v0 status | rationale |
+|------|-----------|-----------|
+| RESET | landed | trivial: create QP at qpn, no attrs |
+| INIT  | landed | create + stamp INIT-set attrs |
+| RTR   | landed | create + stamp RTR-set attrs (subset of RTS path) |
+| **RTS-with-content** | **landed** | the R3 v0 milestone; queue contents preserved, PSNs preserved or captured per-driver |
+| ERR   | landed | create + stamp; all WQEs flushed, no queue replay |
+| SQD   | refused | transient drain state; CRIU plugin must hold a barrier and wait for SQD->RTS or SQD->ERR before checkpoint |
+| SQE   | deferred | UC/UD-only send-error; can land post-v0 as RTS+modify(ERR-like) |
+| unknown | refused | mid-transition or driver-internal-only state; plugin rejects |
+
+Multicast attachments (UD), RD_ATOMIC slot table state, alt-path
+attrs, and AH lifecycle for UD WRs are deferred (see ?5.6 for AH
+which lands at S7 alongside SRQ).
+
+#### 5.3.2 Discovery
+
+* **NLDEV** `RES_QP_GET` + K1 PDN-join: type, port, qp_state,
+  src/dst PSN, src/dst QPN, ctxn. Hw-agnostic `ib_qp_attr` fields
+  not on NLDEV come from the existing `IB_USER_VERBS_CMD_QUERY_QP`
+  (no kernel change).
+* **Plugin** adds the per-driver dump-side blob via
+  `*_METHOD_VFMIG_QUERY_QP(handle)` (?5.3.4). The blob is byte-
+  equal to the matching driver's `*_ib_restore_qp_req` UHW
+  payload, mirroring the QUERY_CQ/RESTORE_CQ contract from
+  ?5.2.4.
+
+* **Xrefs**: PD (XR_PARENT_PD), send_cq (XR_SEND_CQ), recv_cq
+  (XR_RECV_CQ), optionally SRQ (XR_SRQ -- deferred until
+  QP-without-SRQ + `ib_write_bw` is empirically passing).
+* **Restore order**: after PD, CQ, MR. SRQ + SRQ-bound QPs land
+  as a follow-up after the unsharded QP path is proven (?9.1 S6
+  vs S7 sequencing).
+
+#### 5.3.3 Single-shot restore: full attr capture, no `ib_modify_qp` chain
+
+The kernel restore verb does not climb the IBTA state machine.
+The driver handler stamps every captured attr field directly
+onto a fresh `*_ib_qp` and sets `qp->state` to the captured
+final state, exactly like `mlx5_ib_restore_cq` adopts a CQ
+context without ever calling `ib_modify_cq`. Two consequences:
+
+1. SAVE captures the **full current attr set** (`ib_qp_attr`-
+   shaped) plus `qp_init_attr.create_flags` (immutable post-
+   create), plus the captured final `qp_state`. No per-
+   transition mask history is needed -- the static IBTA
+   transition table never enters the picture.
+2. RESTORE applies all captured attrs in one driver call. No
+   `ib_modify_qp(INIT)` -> `(RTR)` -> `(RTS)` chain. The
+   driver bypasses the state-table validation in
+   `core/verbs.c::qp_state_table` because the verb sits below
+   that layer (same liberty `RESTORE_CQ` already takes).
+
+```
+UVERBS_METHOD_RESTORE_QP(target_handle, init_attr,
+                         qp_attr_full, captured_qp_state,
+                         pd_handle, send_cq_handle,
+                         recv_cq_handle, srq_handle?,
+                         uhw_blob /* per-driver */)
+```
+
+The `uhw_blob` carries the wire-format-relevant data the core
+attrs cannot express: source FW qpn, queue umem source VAs
+(mlx5) / queue mmap vm_pgoff (rxe), PSNs / wqe_index (rxe), ECE
+(mlx5).
+
+`qp_init_attr.create_flags` is captured verbatim and replayed
+through `init_attr.create_flags`. v0 policy: if the dst kernel
+does not recognise a flag bit (newer-source-than-dst), reject
+loud rather than silently zero.
+
+#### 5.3.4 CRIU dump-side discovery: `*_METHOD_VFMIG_QUERY_QP`
+
+Mirrors ?5.2.4's QUERY_CQ rationale verbatim, with QP-shaped
+fields. Closes the same CRIU dump-side gap: CRIU runs in its
+own address space, so `mlx5dv_init_obj(MLX5DV_OBJ_QP)` returns
+CRIU's VAs not the dumpee's; `ibv_import_qp` does not exist in
+upstream rdma-core; NLDEV is the wrong scope (CAP_NET_ADMIN-
+gated, cross-netns). The verb is driver-private under
+`MLX5_IB_OBJECT_VFMIG` (and a future `RXE_OBJECT_VFMIG` for
+rxe) because the byte-exact wire format is driver-specific:
+
+* **mlx5** emits `mlx5_ib_restore_qp_req` (FW qpn, send/recv
+  buf source VAs, DBR source VA, source UAR index for the SQ
+  doorbell, ECE bits). Kernel reads `mqp->qpn`,
+  `mqp->buf.umem->address` (or per-queue umem if the driver
+  splits SQ/RQ buffers), `mlx5_ib_db_user_virt(&mqp->db)` (the
+  accessor lifted at S5b B5 already serves QP), `mqp->ece`. The
+  S6 B5 step adds whatever per-mlx5 fields are needed beyond
+  the CQ-extracted set.
+* **rxe** emits `rxe_restore_qp_req` (sq_vm_pgoff, rq_vm_pgoff,
+  req.psn, resp.psn, req.wqe_index, optional pending-completion
+  state -- TBD at A1). All fields are kernel-internal to rxe;
+  there is no userspace parallel of `mlx5dv_init_obj` for rxe,
+  so the verb is the only reasonable path.
+
+Same security boundary as QUERY_CQ -- HANDLE attr is
+`UVERBS_ATTR_IDR(UVERBS_OBJECT_QP, UVERBS_ACCESS_READ)`. Caller
+must own the QP via the ucontext's ufile-idr; dispatcher pins
+the uobject for the call.
+
+#### 5.3.5 PSN preservation: per-driver split
+
+* **mlx5_vfmig**: trust FW. The QPC `next_send_psn`,
+  `next_rcv_psn`, `last_acked_psn`, sq/rq head/tail pointers,
+  WQE buffer MKEY references, and pending-WR state all
+  round-trip losslessly across `SAVE_VHCA_STATE` /
+  `LOAD_VHCA_STATE` -- empirically validated 2026-05-13 by
+  `MLX5_VFMIG_IOC_QUERY_QP` + `test_fw_id_continuity.sh` with
+  `K6_POST_RECV_WRS=N`, all 13 byte-equal QPC subset fields
+  PASS (?6.3 below). No driver-side PSN bookkeeping in the
+  RESTORE_QP handler. The user-mode WQE buffer is preserved by
+  `user_mr_dma` at the IOMMU layer (Stage-2 source-side retag
+  was wired at `c0183184ad82` for the QP umem callsite).
+
+* **rxe**: explicit kernel-stored PSNs go through the UHW.
+  `rxe_qp.req.psn` (next-PSN-to-send), `rxe_qp.resp.psn`
+  (next-PSN-to-receive-and-ACK), and `rxe_qp.req.wqe_index`
+  (the requester's cursor into the SQ ring) are captured at
+  SAVE via the per-driver QUERY_QP verb (?5.3.4) and replayed
+  at RESTORE by directly assigning into the fresh `rxe_qp`
+  before kicking the worker tasks. On restore, the rxe arm of
+  the plugin sends a synthetic ACK to the peer at the saved
+  `resp.psn` so the peer retransmits everything past that PSN
+  -- the same behaviour the peer already exhibits for routine
+  packet loss. To the peer, our restore looks like a momentary
+  network blip. No co-checkpoint requirement on the peer side.
+  In-flight outgoing sends with no captured ACK are
+  re-transmitted by the requester from `req.psn` on its next
+  task tick; the peer dedups via its PSN-window logic.
+
+  Single timer kick (`rxe_run_task(&qp->req.task)` after the
+  synthetic-ACK send is queued) is enough -- no captured
+  retransmit-timer phase.
+
+#### 5.3.6 Queue contents preservation: per-driver split
+
+Both drivers preserve byte-equal queue contents (WQEs, CQEs,
+inline data) across SAVE/RESTORE without a memcpy hook -- but
+through different mechanisms:
+
+* **mlx5_vfmig**: queues are user-allocated umems mapped via
+  the existing user_mr_dma stage-2 retag (KIND_QP for the
+  per-QP umem buffer) + KIND_DBR (for the doorbell page). LOAD-
+  side replay installs placeholders at the source VAs;
+  `mlx5_ib_umem_restore_qp` (analog of `mlx5_ib_umem_restore_cq`
+  from S5b B3) pins user pages and binds them at the
+  placeholder IOVA range. Same shape as MR/CQ.
+
+* **rxe**: queues are kernel-allocated `vmalloc_user` buffers
+  remapped into user via `remap_vmalloc_range`
+  (`rxe_queue.c` + `rxe_mmap.c`). Userspace and kernel read/
+  write the same `rxe_queue_buf` pages, so CRIU's user-VMA
+  snapshot already includes the queue contents and the on-buffer
+  `producer_index`/`consumer_index`. Restore lifts the CQ
+  vm_pgoff round-trip pattern (`forced_offset` parameter on
+  `rxe_create_mmap_info`, landed for CQ at `e48f4e378a55`):
+
+  ```
+  struct rxe_restore_qp_req {
+      u64 sq_vm_pgoff;    /* source's mminfo.offset for SQ */
+      u64 rq_vm_pgoff;    /* source's mminfo.offset for RQ */
+      u32 req_psn;        /* qp->req.psn at SAVE */
+      u32 resp_psn;       /* qp->resp.psn at SAVE */
+      u32 req_wqe_index;  /* qp->req.wqe_index at SAVE */
+      /* ... per-state attrs not on ib_qp_attr ... */
+  };
+  ```
+
+  `rxe_restore_qp` calls `rxe_create_mmap_info(forced_offset=
+  req.sq_vm_pgoff)` for SQ + similar for RQ. CRIU's pie restorer
+  mmaps the user VMA at the original VA -> maps to the fresh
+  vmalloc pages. CRIU's page-restore writes the snapshot bytes
+  -> lands in those pages. Result: the new
+  `rxe_queue_buf.{producer,consumer}_index` and `data[]` are
+  byte-equal to source with no kernel memcpy.
+
+  One small additional sync vs. the CQ pattern: `rxe_queue` has
+  a kernel-private `q->index` (the rxe-owned copy of whichever
+  index the driver advances; see `rxe_queue.h:71` comment). The
+  restore handler propagates `buf->consumer_index` -> `q->index`
+  for `QUEUE_TYPE_FROM_CLIENT` (SQ) and `buf->producer_index`
+  -> `q->index` for `QUEUE_TYPE_TO_CLIENT` (CQ-direction-on-
+  consumer-side; not relevant for QP). Plus
+  `qp->req.wqe_index` from the captured PSN block.
+
+#### 5.3.7 RXE `FREEZE_DATAPATH` verb (rxe-only, ucontext-scope)
+
+Between CRIU's `SIGSTOP` of the dumpee's user threads and the
+user-VMA dump, the rxe kernel worker kthreads (`req`, `resp`,
+`comp` -- see `rxe_qp.c::*->task`) are not paused. They can
+advance `consumer_index`, dispatch retransmits, and update
+kernel-private indices -- racing against the plugin's per-
+uobject QUERY_* calls and against CRIU's VMA snapshot. The fix
+is an explicit, non-destructive pause primitive at the
+ucontext layer:
+
+```
+RXE_METHOD_VFMIG_FREEZE_DATAPATH
+    in:  (none -- ucontext implicit via fd)
+    out: (none)
+```
+
+Kernel impl in `rxe_qp.c`:
+
+```c
+int rxe_qp_pause(struct rxe_qp *qp);     /* sets qp->paused, drains workers */
+int rxe_qp_resume(struct rxe_qp *qp);    /* clears qp->paused, kicks workers */
+```
+
+`qp->paused` is a new flag that the three task workers check
+at the top of their per-iteration loop and, if set, return
+without running. The verb iterates the ucontext's QPs and
+calls `rxe_qp_pause` on each, waiting for in-progress
+iterations to complete via the existing `rxe_task` synch.
+**No state-machine transition** (does not touch
+`qp->attr.qp_state` or `qp->valid`); does not interfere with
+the existing destructive `qp->valid = false` shutdown path or
+the IBTA-state-machine `rxe_qp_drain` path.
+
+Lifecycle in the source-side dump flow:
+
+```
+1. orchestrator: prepare migration
+2. CRIU: SIGSTOP all dumpee threads
+3. CRIU: invoke RDMA plugin per uverbs fd
+4. plugin (rxe arm): RXE_METHOD_VFMIG_FREEZE_DATAPATH    <-- here
+   plugin (mlx5 arm): no-op (FW SAVE_VHCA_STATE freezes)
+5. plugin: INFO_HANDLES + per-uobj QUERY_*
+6. orchestrator: SAVE_VHCA_STATE (mlx5 only)
+7. CRIU: dump user VMAs (now stable)
+8. CRIU: kill source process
+```
+
+There is no thaw verb. The dumpee is killed at step 8; the
+fresh `rxe_qp` allocated at restore time on the destination
+starts unpaused by construction. A standalone `rxe_qp_resume`
+helper exists for testing / future symmetry.
+
+**No symmetric mlx5 verb.** SAVE_VHCA_STATE freezes the FW
+datapath as part of its own contract; mlx5 has no equivalent
+of rxe's worker kthreads racing the user. The CRIU plugin's
+mlx5 arm skips the freeze step entirely (different driver
+namespace -> different ioctl dispatch -> driver-shaped
+plugin). A no-op verb under `MLX5_IB_OBJECT_VFMIG` would be
+API-surface tax for nothing.
+
+#### 5.3.8 Path validity at restore
+
+Assuming the orchestrator preserves IP/GID/MAC continuity per
+?8.1 (symmetric setup or hint-file-driven for mlx5_vfmig;
+`rdma link add ... type rxe netdev <X>` against the original
+IP for rxe), the QP restore handler validates:
+
+* **path_mtu**: AV-stamped `path_mtu` must be <= dst port's
+  `active_mtu`. Reject loud at `RESTORE_QP` if not.
+* **GID type per index**: GID at `sgid_index` must have the
+  same type (RoCE-v1 vs RoCE-v2 vs IB) on src and dst. Mismatch
+  changes UDP sport hashing for RoCE-v2 -> peer drops.
+  Orchestrator hint-file extension; `RESTORE_QP` re-reads the
+  port's GID table type for the captured `sgid_index` and
+  rejects on mismatch.
+* **Resolved peer dmac in AV** (`wr.av.dmac` for rxe; mlx5's
+  AV cache): v0 simplification assumes peer has not moved. If
+  peer also migrated, ARP/neighbor cache will re-resolve on
+  first send. Multi-VM coordinated migration is a follow-up.
+
+Items already covered upstream: AV-stamped dlid/dgid pointing
+at the (unmoved) peer is still valid; src MAC of outgoing
+packet is determined by the dst NIC's HW MAC and is not
+validated by peer for ACK matching (peer matches by QPN+PSN);
+UDP sport hash is determined by QP attrs which are preserved.
 
 ### 5.4 MR
 
@@ -964,9 +1221,17 @@ implicit by the dump tree being one connected unit):
 ```
 For each ufile in image:
     For each QP in ufile (in QP creation order):
-        # Already restored to its saved qp_state via the per-uobj restore
-        # chain (INIT->RTR->RTS). Final transition + CQ re-arm only:
+        # Already restored to its saved qp_state via the per-uobj
+        # single-shot restore (?5.3.3 -- no INIT->RTR->RTS chain;
+        # the driver handler stamps every captured attr field and
+        # sets qp->state to the captured final state in one call).
+        # Fini pass:
         rearm_cqs(qp.recv_cq, qp.send_cq)
+        if device.driver == rxe and qp.qp_state == IB_QPS_RTS:
+            # rxe-only: send synthetic ACK at saved resp.psn so peer
+            # retransmits everything past that PSN. See ?5.3.5.
+            rxe_qp_resume(qp)         # clears qp->paused, kicks workers
+            rxe_send_synthetic_ack(qp, qp.resp_psn)
 ```
 
 Working assumption (now empirically confirmed; see below):
@@ -2290,10 +2555,37 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   | B3 | bind helpers (`mlx5_vfmig_bind_user_cq` / `_user_dbr` mlx5_core, `mlx5_ib_umem_restore_cq` mlx5_ib mem.c, `mlx5_ib_db_map_user_restore` mlx5_ib doorbell.c) | yes | compiles |
   | B4 | live verb path adopts cqn cleanly (`cq_restore_probe_mlx5_vfmig` + `test_cq_restore_mlx5_vfmig.sh`: 10 subtests -- gate, 4 UAPI rejects, bad comp_vector, COMP_CHANNEL rejection, happy path, EBUSY collision, Phase-G PROBE_CQN byte-equal vs. source pre-SAVE, post-quit v0 dealloc rejection) | yes (2026-05-29) | **STRONG PASS** -- 10/10 subtests + Phase G byte-equal across (eqn=6, log_cq_size=5, log_page_size=0, page_offset=0, status=0, oi=0); subtest 10 confirmed orphan `DESTROY_CQ` -> `-EINVAL` via FW BAD_RES_STATE while QPC dependents still alive; LOAD-side dmesg shows 5 user_page placeholders replayed (CQE-ring + DBR + MR + QP + SRQ), residue of `total - (cmd_ring+fw_page+dma_coherent+eq_buf+frag_buf+db_page) = 218 - 213 = 5`. DBR-VA-keyed lookup invariant locked in by `MAP_FIXED_NOREPLACE` in the probe's `cq_args_mmap_local` (commit `da4dd37ac8bc`) -- without it the fresh-anon-mmap shim would mismatch the (KIND_DBR, src_db_addr & PAGE_MASK) placeholder. |
   | B5 | dump-side verb (`MLX5_IB_METHOD_VFMIG_QUERY_CQ` + `cq_query_probe_mlx5_vfmig`): kernel reads `mcq->mcq.cqn` / `ibcq->cqe` / `mcq->cqe_size` / `mcq->buf.umem->address` / `mlx5_ib_db_user_virt(&mcq->db)` / `mcq->mcq.vector` / `mcq->create_flags` and emits a 32-byte payload byte-equal to `mlx5_ib_restore_cq_req` plus three scalar outs (cqe / comp_vector / flags). Closes the cross-process gap that motivated this verb: CRIU runs in its own address space and `mlx5dv_init_obj` from CRIU returns CRIU's VAs, not the dumpee's; `ibv_import_cq` does not exist in upstream rdma-core (see ?5.2.4 for the full design-space rejection of mlx5dv-import / NLDEV-extension / parasite-injection alternatives). Includes an `mlx5_ib_create_cq` symmetry fix (`cq->mcq.vector = vector;` after `mlx5_comp_eqn_get`) so QUERY_CQ echoes the user's source-side comp_vector instead of zalloc-zero -- pre-existing asymmetry called out in `mlx5_core_adopt_cq`'s docstring as "we mirror"; QUERY_CQ flips it. | yes (2026-05-30) | **STRONG PASS** -- `cq_query_probe_mlx5_vfmig mlx5_2 16 0`: subtests 1 (happy: cqn=0xa27 / buf_addr=0x55cb2a0e0000 / db_addr=0x55cb2a0e4000 / cqe=31 / comp_vector=0 / flags=0x0), 2 (invalid handle -> -ENOENT), 3 (multi-CQ disambiguation across two distinct cqn / buf_addr), 4 (`comp_vector=1` echoes correctly post-symmetry-fix). Round-trip pin len = cqe(31) * cqe_size(64) = 1984 bytes, sane vs. the 2048-byte ring-with-padding. byte-equal contract holds across all three ring-buffer / DBR-page / FW-id fields against `mlx5dv_init_obj` view (A). |
-* **S6: QP restore (rxe + mlx5_vfmig together).** State-machine replay
-  to RTR per ?6.3 option (b). Fini-pass transitions to RTS. **First
+* **S6: QP restore (rxe + mlx5_vfmig together).** Single-shot
+  `RESTORE_QP` (no `ib_modify_qp` chain) lands the QP at its captured
+  final state (RESET / INIT / RTR / RTS-with-content / ERR). v0
+  scope per ?5.3.1; SQD/SQE/multicast/RD_ATOMIC deferred. **First
   passing `rdma_test_agent` round-trip on a restored ucontext --
   R3 v0 minimum bar.**
+
+  Sequencing guidance: land **mlx5_vfmig first** (the umem-adoption
+  pattern is mostly mechanical to lift from S5b CQ; FW handles PSN
+  preservation per ?6.3 empirical proof). Land **rxe second** (the
+  vm_pgoff queue pattern is also a CQ-restore lift but the explicit
+  PSN capture + synthetic-ACK kick + `FREEZE_DATAPATH` verb are net-
+  new). Then both together for **`ib_write_bw`** at S9.
+
+  Combined empirical chain table (mirrors S5b's structure; S6a =
+  rxe arm, S6b = mlx5_vfmig arm):
+
+  | step | what | landed | output |
+  |------|------|--------|--------|
+  | K7 | LOAD_VHCA_STATE preserves QPC end-to-end (`MLX5_VFMIG_IOC_QUERY_QP` PF cdev + `test_fw_id_continuity.sh` piggyback driven by `K6_POST_RECV_WRS=N`) | yes (2026-05-13) | **STRONG PASS** -- src/dst byte-equal across all 13 QPC subset fields (state, pd, q_key, cqn_snd, cqn_rcv, srqn_rmpn_xrqn, next_send_psn, next_rcv_psn, last_acked_psn, hw/sw sq_wqebb_counter, hw/sw rq_counter). Means S6b can trust FW to preserve PSNs / pending-WR state without a driver-side replay path. |
+  | S6b B0 | PROBE_QPN raw QUERY_QP post-LOAD on adopted qpn (mirrors S5b B0 for cqn) | pending | -- |
+  | S6b B1 | UAPI `mlx5_ib_restore_qp_req` (FW qpn / send-buf / recv-buf / DBR source VAs / source UAR idx for SQ doorbell / ECE / reserved) | pending | -- |
+  | S6b B2 | `mlx5_ib_restore_qp` handler + `dev_ops.restore_qp` slot, FW-qpn-adopt helper (`mlx5_core_adopt_qp` -- mirrors `mlx5_core_adopt_cq` from S5b B2/B3) | pending | -- |
+  | S6b B3 | bind helpers (`mlx5_ib_umem_restore_qp` for SQ + RQ umems; reuses `mlx5_ib_db_map_user_restore` from S5b B3 for the doorbell page) | pending | -- |
+  | S6b B4 | live verb path adopts qpn cleanly (`qp_restore_probe_mlx5_vfmig` + `test_qp_restore_mlx5_vfmig.sh` -- gate, UAPI rejects, RTS-with-pending-WRs happy path, byte-equal QPC subset vs. source pre-SAVE) | pending | -- |
+  | S6b B5 | dump-side verb (`MLX5_IB_METHOD_VFMIG_QUERY_QP` + `qp_query_probe_mlx5_vfmig`): kernel reads `mqp->qpn` / per-queue `umem->address` / `mlx5_ib_db_user_virt(&mqp->db)` / `mqp->ece`; emits payload byte-equal to `mlx5_ib_restore_qp_req`. Mirror of S5b B5; lifts the `mlx5_ib_db_user_virt` accessor that already serves CQ. | pending | -- |
+  | S6a A1 | UAPI `rxe_restore_qp_req` (sq_vm_pgoff / rq_vm_pgoff / req.psn / resp.psn / req.wqe_index / per-state attrs not on `ib_qp_attr`) | pending | -- |
+  | S6a A2 | `rxe_restore_qp` handler: alloc fresh `rxe_qp` at source qpn, stamp every attr, set `qp->state` to captured final state, propagate `q->index` from buf indices, set `qp->req.psn` / `qp->resp.psn` / `qp->req.wqe_index`. Single-shot, no `ib_modify_qp` | pending | -- |
+  | S6a A3 | `RXE_METHOD_VFMIG_FREEZE_DATAPATH` ucontext-scope verb + `rxe_qp_pause` / `rxe_qp_resume` helpers (?5.3.7). Non-destructive, no IBTA state-machine touch. mlx5_vfmig has no symmetric verb (FW SAVE_VHCA_STATE is the freeze) | pending | -- |
+  | S6a A4 | dump-side verb (`RXE_METHOD_VFMIG_QUERY_QP` + `qp_query_probe_rxe`): kernel reads `qp->sq.queue->ip->info.offset` / `qp->rq.queue->ip->info.offset` / `qp->req.psn` / `qp->resp.psn` / `qp->req.wqe_index`; emits payload byte-equal to `rxe_restore_qp_req` | pending | -- |
+  | S6a A5 | live verb path (`qp_restore_probe_rxe` + `test_qp_restore_rxe.sh`): RTS-with-pending-WRs happy path, FREEZE_DATAPATH lifecycle, synthetic-ACK kick, peer-driven retransmit observation | pending | -- |
 * **S7: SRQ + AH (rxe + mlx5_vfmig together).** AH discovery lands on
   K2 from S2.
 * **S8: Async event (rxe + mlx5_vfmig together).** Covers explicit AEF
