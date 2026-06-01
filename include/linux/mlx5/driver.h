@@ -1696,6 +1696,49 @@ mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
 }
 #endif
 
+/*
+ * Stage-3 D3: destination-side bind for a freshly-pinned user QP
+ * WQ-ring umem inside the per-VF vfmig deterministic IOVA domain.
+ *
+ * Mirrors mlx5_vfmig_bind_user_cq modulo the kind enum
+ * (VFMIG_HUOBJ_KIND_QP) and the FW-id semantics (qpn instead of
+ * cqn). The caller is mlx5_ib_umem_restore_qp's ib_umem_pin ->
+ * mlx5_vfmig_bind_user_qp composition (S6b B3), called from
+ * mlx5_ib_restore_qp's verb body once LOAD_VHCA_STATE has installed
+ * the (kind=QP, fw_id=qpn) placeholder.
+ *
+ * The SAVE-side mlx5_vfmig_retag_user_qp (already exported, fired
+ * from create_user_qp post-FW-create) emits the matching
+ * HOST_USER_PAGE record covering the single contiguous mapping the
+ * user allocates for both SQ and RQ WQE buffers (RQ at offset 0, SQ
+ * at qp->sq.offset within the same umem). One bind covers the whole
+ * WQE footprint; the FW-side qpc.{log_page_size, page_offset} the
+ * source's create_qp_in encoded ride along inside the inherited QPC.
+ *
+ * @vf_dev:        this ucontext's underlying mlx5_core_dev. O(1)
+ *                 NULL-load gate on cmd.vfmig_iova_dom.
+ * @qpn:           24-bit FW qpn that identifies the source QP. Same
+ *                 value the SAVE-side retag emitted on the wire via
+ *                 HOST_USER_PAGE record's instance_key.
+ * @sgt:           umem->sgt_append.sgt from ib_umem_pin().
+ *
+ * Same return-code semantics as mlx5_vfmig_bind_user_mr.
+ *
+ * Recorded in tools/testing/mlx5_vfmig/design/uobject_restore.md
+ * §S6b and tools/testing/mlx5_vfmig/design/user_mr_dma.md §A.D.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_bind_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			    struct sg_table *sgt);
+#else
+static inline int
+mlx5_vfmig_bind_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
 					       const struct mlx5_core_dev *dev2)
 {
