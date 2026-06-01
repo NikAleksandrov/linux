@@ -108,20 +108,57 @@ static int do_query_qp(int fd, unsigned int vf_id, unsigned int qpn)
 	}
 	printf("vf_id=%u\n", vf_id);
 	printf("qpn=%u\n", qpn);
+
+	/* state-independent bookkeeping */
 	printf("qpc_state=%u\n",                  arg.qpc_state);
 	printf("qpc_pd=%u\n",                     arg.qpc_pd);
 	printf("qpc_q_key=0x%08x\n",              arg.qpc_q_key);
+	printf("qpc_uar_page=%u\n",               arg.qpc_uar_page);
+	printf("qpc_log_page_size=%u\n",          arg.qpc_log_page_size);
+	printf("qpc_log_sq_size=%u\n",            arg.qpc_log_sq_size);
+	printf("qpc_log_rq_size=%u\n",            arg.qpc_log_rq_size);
+	printf("qpc_log_msg_max=%u\n",            arg.qpc_log_msg_max);
+	printf("qpc_user_index=%u\n",             arg.qpc_user_index);
+
+	/* cross-references */
 	printf("qpc_remote_qpn=%u\n",             arg.qpc_remote_qpn);
 	printf("qpc_cqn_snd=%u\n",                arg.qpc_cqn_snd);
 	printf("qpc_cqn_rcv=%u\n",                arg.qpc_cqn_rcv);
 	printf("qpc_srqn_rmpn_xrqn=%u\n",         arg.qpc_srqn_rmpn_xrqn);
+
+	/* PSNs */
 	printf("qpc_next_send_psn=0x%06x\n",      arg.qpc_next_send_psn);
 	printf("qpc_next_rcv_psn=0x%06x\n",       arg.qpc_next_rcv_psn);
 	printf("qpc_last_acked_psn=0x%06x\n",     arg.qpc_last_acked_psn);
+
+	/* queue counters */
 	printf("qpc_hw_sq_wqebb_counter=%u\n",    arg.qpc_hw_sq_wqebb_counter);
 	printf("qpc_sw_sq_wqebb_counter=%u\n",    arg.qpc_sw_sq_wqebb_counter);
 	printf("qpc_hw_rq_counter=%u\n",          arg.qpc_hw_rq_counter);
 	printf("qpc_sw_rq_counter=%u\n",          arg.qpc_sw_rq_counter);
+
+	/* RTR-set */
+	printf("qpc_path_mtu=%u\n",               arg.qpc_path_mtu);
+	printf("qpc_min_rnr_nak=%u\n",            arg.qpc_min_rnr_nak);
+	printf("qpc_log_rra_max=%u\n",            arg.qpc_log_rra_max);
+	printf("qpc_pkey_index=%u\n",             arg.qpc_pkey_index);
+
+	/* RTS-set */
+	printf("qpc_log_sra_max=%u\n",            arg.qpc_log_sra_max);
+	printf("qpc_retry_count=%u\n",            arg.qpc_retry_count);
+	printf("qpc_rnr_retry=%u\n",              arg.qpc_rnr_retry);
+
+	/*
+	 * AV: emit primary_address_path as a hex blob suitable for byte-
+	 * equal compare across SAVE/LOAD by the harness (single line,
+	 * lowercase hex, no separators). The kernel zero-fills the tail
+	 * past MLX5_FLD_SZ_BYTES(qpc, primary_address_path) so trailing
+	 * bytes are stable on both sides.
+	 */
+	printf("qpc_primary_address_path=");
+	for (size_t i = 0; i < sizeof(arg.qpc_primary_address_path); i++)
+		printf("%02x", arg.qpc_primary_address_path[i]);
+	printf("\n");
 	return 0;
 }
 
