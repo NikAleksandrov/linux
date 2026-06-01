@@ -31,16 +31,31 @@
 #   sudo PF=0000:08:00.0 ./test_fw_id_continuity.sh
 #
 # Optional knobs:
-#   K6_POST_RECV_WRS=N    Post N recv WRs to the source QP for the
-#                         §6.3 RQ-head/tail piggyback. When > 0 the
-#                         script also issues MLX5_VFMIG_IOC_QUERY_QP
-#                         on the source qpn before SAVE and on the
-#                         SAME qpn after LOAD+bind (FW-id continuity
-#                         has already shown the qpn reservation
-#                         survives), and compares the QPC subset that
-#                         matters for pending-WR survival (state,
-#                         sw/hw RQ counters, next_rcv_psn).
-#                         PASS = matching.
+#   K6_QP_STATE={RESET|INIT|RTR|RTS}
+#                         Drive the source QP through the listed
+#                         IBTA state machine via SELF-LOOPBACK before
+#                         SAVE. Default RESET (no modify_qp). When
+#                         >= INIT the script also issues
+#                         MLX5_VFMIG_IOC_QUERY_QP on the source qpn
+#                         before SAVE and on the SAME qpn after
+#                         LOAD+bind (FW-id continuity has already
+#                         shown the qpn reservation survives) and
+#                         byte-compares the QPC subset relevant for
+#                         that state (per §6.3 / S6 of the design):
+#                           INIT: state, pd, q_key, uar_page,
+#                                 log_{page,sq,rq}_size, log_msg_max,
+#                                 cqn_snd, cqn_rcv, queue counters
+#                           RTR : + path_mtu, min_rnr_nak,
+#                                 log_rra_max, pkey_index,
+#                                 remote_qpn, next_rcv_psn,
+#                                 primary_address_path
+#                           RTS : + log_sra_max, retry_count,
+#                                 rnr_retry, next_send_psn,
+#                                 last_acked_psn
+#                         PASS = byte-equal across LOAD.
+#   K6_POST_RECV_WRS=N    Post N recv WRs to the source QP after
+#                         INIT (legacy knob). Setting this implicitly
+#                         promotes K6_QP_STATE to >= INIT.
 #   BLOB                  Path for the SAVE blob (default /tmp/vf_k6.blob).
 #   TOOL                  mlx5_vfmig CLI (default $ROOT_DIR/tools/mlx5_vfmig).
 #   PROBE                 fw_id_continuity_probe binary
@@ -57,6 +72,32 @@ PROBE=${PROBE:-$SCRIPT_DIR/fw_id_continuity_probe}
 BLOB=${BLOB:-/tmp/vf_k6.blob}
 META=${META:-${BLOB}.meta}
 K6_POST_RECV_WRS=${K6_POST_RECV_WRS:-0}
+K6_QP_STATE=${K6_QP_STATE:-RESET}
+
+# Validate K6_QP_STATE early -- the probe will reject anything else
+# but a shell-level check gives a clearer error message, and lets
+# us drive the §6.3 verdict logic from a known-good value.
+case "$K6_QP_STATE" in
+    RESET|INIT|RTR|RTS) ;;
+    *) echo "FAIL: K6_QP_STATE='$K6_QP_STATE' invalid (want RESET/INIT/RTR/RTS)"; exit 1 ;;
+esac
+
+# K6_POST_RECV_WRS implies at least INIT.
+if [ "$K6_POST_RECV_WRS" -gt 0 ] && [ "$K6_QP_STATE" = "RESET" ]; then
+    K6_QP_STATE=INIT
+fi
+
+# Numeric rank for state ordering (matches the QPC.state nibble).
+qp_state_rank() {
+    case "$1" in
+        RESET) echo 0 ;;
+        INIT)  echo 1 ;;
+        RTR)   echo 2 ;;
+        RTS)   echo 3 ;;
+        *)     echo -1 ;;
+    esac
+}
+K6_QP_STATE_RANK=$(qp_state_rank "$K6_QP_STATE")
 
 CDEV="/dev/mlx5_vfmig/$PF"
 [ -x "$TOOL" ]  || { echo "build $TOOL first: make -C $ROOT_DIR";  exit 1; }
@@ -131,6 +172,27 @@ find_ib_dev_for_pci() {
     return 1
 }
 
+# Bring the netdev associated with a bound VF up. Without this, the
+# RDMA GID table is empty (no auto-derived link-local IPv6 GID) and
+# the probe's --qp-state RTR path fails to find a usable sgid_index.
+# The TX-drop policy on tracked VFs is enforced at a separate layer
+# and is unaffected by `ip link set up` -- which is exactly what we
+# want here: we need GID-table population, not actual transmit.
+bring_netdev_up_for_pci() {
+    local bdf=$1
+    local nd_path nd
+    for nd_path in $(vf_path "$bdf")/net/*; do
+        [ -d "$nd_path" ] || continue
+        nd=$(basename "$nd_path")
+        sudo ip link set "$nd" up 2>/dev/null || true
+        # Give the kernel a moment to populate the link-local GID.
+        sleep 0.3
+        return 0
+    done
+    echo "  WARN: no netdev found under $(vf_path $bdf)/net (RoCE probe may fail)"
+    return 1
+}
+
 # Start a fw_id_continuity_probe in the background, hook stdin/stdout via FIFOs.
 # Reads probe output until "READY" sentinel, copying key=value lines
 # into the named prefix dict (eval-form): "${prefix}_pdn=...", etc.
@@ -152,8 +214,13 @@ start_probe() {
 
     mkfifo "$fifo_in" "$fifo_out"
 
-    if [ "$prefix" = "src" ] && [ "$K6_POST_RECV_WRS" -gt 0 ]; then
-        extra_args+=(--post-recv-wrs "$K6_POST_RECV_WRS")
+    if [ "$prefix" = "src" ]; then
+        if [ "$K6_QP_STATE" != "RESET" ]; then
+            extra_args+=(--qp-state "$K6_QP_STATE")
+        fi
+        if [ "$K6_POST_RECV_WRS" -gt 0 ]; then
+            extra_args+=(--post-recv-wrs "$K6_POST_RECV_WRS")
+        fi
     fi
 
     echo "=== K6 $label probe: $PROBE $ibdev ${extra_args[*]:-} ==="
@@ -282,6 +349,13 @@ sleep 1
 SRC_IBDEV=$(find_ib_dev_for_pci "$SRC_VF") || { echo "FAIL: no ibdev for source $SRC_VF"; exit 1; }
 echo "source ibdev: $SRC_IBDEV"
 
+# Bring the netdev up before the probe so its RoCE GID table is
+# populated. Only required when we're going to drive ibv_modify_qp
+# past INIT (the AV references a sgid_index).
+if [ "$K6_QP_STATE_RANK" -ge 2 ]; then
+    bring_netdev_up_for_pci "$SRC_VF"
+fi
+
 # --- Phase B: source probe (resources alive across SAVE) -------------
 
 echo "=== Phase B: K6 source probe (resources stay alive through SAVE) ==="
@@ -297,11 +371,13 @@ echo "  mkey_index = $src_mkey_index"
 echo "  srqn       = $src_srqn"
 echo "  recv_wrs   = $src_recv_wrs_posted"
 
-# §6.3 piggyback: snapshot source QPC before SAVE. We do this only
-# when WRs were posted -- otherwise the QPC has no RQ activity to
-# discriminate against, and the §6.3 question is moot for this run.
+# §6.3 / S6 piggyback: snapshot source QPC before SAVE whenever the
+# QP is at least INIT. Beyond that the comparison set widens at RTR
+# (path_mtu / min_rnr_nak / AV / ...) and at RTS (log_sra_max /
+# retry_count / rnr_retry / ...). At RESET there's nothing to
+# discriminate against and we skip.
 RQ_PIGGYBACK=0
-if [ "$K6_POST_RECV_WRS" -gt 0 ]; then
+if [ "$K6_QP_STATE_RANK" -ge 1 ]; then
     if query_qp_into source 0 "$src_qpn" srcq; then
         RQ_PIGGYBACK=1
     fi
@@ -424,25 +500,58 @@ rq_overall_rc=0
 rq_skipped=0
 if [ "$RQ_PIGGYBACK" = 1 ]; then
     echo
-    echo "================ §6.3 RQ PIGGYBACK RESULTS ================"
-    echo "Question: do FW-side QPC fields (incl. RQ counters) survive"
-    echo "LOAD_VHCA_STATE intrinsically? PASS = src/dst byte-equal."
-    echo "Source qpn $src_qpn, $K6_POST_RECV_WRS receive WR(s) posted in INIT."
+    echo "================ §6.3 / S6 QPC PIGGYBACK RESULTS ================"
+    echo "Question: do FW-side QPC fields survive LOAD_VHCA_STATE"
+    echo "intrinsically?  PASS = src/dst byte-equal."
+    echo "Source qpn $src_qpn, K6_QP_STATE=$K6_QP_STATE,"
+    echo "$K6_POST_RECV_WRS receive WR(s) posted."
     echo
+
+    # Always compared (state-independent / INIT-set / queue counters).
     qpc_verdict state                "${srcq_qpc_state:-}"             "${dstq_qpc_state:-}"
     qpc_verdict pd                   "${srcq_qpc_pd:-}"                "${dstq_qpc_pd:-}"
     qpc_verdict q_key                "${srcq_qpc_q_key:-}"             "${dstq_qpc_q_key:-}"
+    qpc_verdict uar_page             "${srcq_qpc_uar_page:-}"          "${dstq_qpc_uar_page:-}"
+    qpc_verdict log_page_size        "${srcq_qpc_log_page_size:-}"     "${dstq_qpc_log_page_size:-}"
+    qpc_verdict log_sq_size          "${srcq_qpc_log_sq_size:-}"       "${dstq_qpc_log_sq_size:-}"
+    qpc_verdict log_rq_size          "${srcq_qpc_log_rq_size:-}"       "${dstq_qpc_log_rq_size:-}"
+    qpc_verdict log_msg_max          "${srcq_qpc_log_msg_max:-}"       "${dstq_qpc_log_msg_max:-}"
+    qpc_verdict user_index           "${srcq_qpc_user_index:-}"        "${dstq_qpc_user_index:-}"
     qpc_verdict cqn_snd              "${srcq_qpc_cqn_snd:-}"           "${dstq_qpc_cqn_snd:-}"
     qpc_verdict cqn_rcv              "${srcq_qpc_cqn_rcv:-}"           "${dstq_qpc_cqn_rcv:-}"
     qpc_verdict srqn_rmpn_xrqn       "${srcq_qpc_srqn_rmpn_xrqn:-}"    "${dstq_qpc_srqn_rmpn_xrqn:-}"
-    qpc_verdict next_send_psn        "${srcq_qpc_next_send_psn:-}"     "${dstq_qpc_next_send_psn:-}"
-    qpc_verdict next_rcv_psn         "${srcq_qpc_next_rcv_psn:-}"      "${dstq_qpc_next_rcv_psn:-}"
-    qpc_verdict last_acked_psn       "${srcq_qpc_last_acked_psn:-}"    "${dstq_qpc_last_acked_psn:-}"
     qpc_verdict hw_sq_wqebb_counter  "${srcq_qpc_hw_sq_wqebb_counter:-}" "${dstq_qpc_hw_sq_wqebb_counter:-}"
     qpc_verdict sw_sq_wqebb_counter  "${srcq_qpc_sw_sq_wqebb_counter:-}" "${dstq_qpc_sw_sq_wqebb_counter:-}"
     qpc_verdict hw_rq_counter        "${srcq_qpc_hw_rq_counter:-}"     "${dstq_qpc_hw_rq_counter:-}"
     qpc_verdict sw_rq_counter        "${srcq_qpc_sw_rq_counter:-}"     "${dstq_qpc_sw_rq_counter:-}"
-    echo "==========================================================="
+    qpc_verdict next_rcv_psn         "${srcq_qpc_next_rcv_psn:-}"      "${dstq_qpc_next_rcv_psn:-}"
+    qpc_verdict pkey_index           "${srcq_qpc_pkey_index:-}"        "${dstq_qpc_pkey_index:-}"
+
+    # RTR-set: only meaningful once primary_address_path / path_mtu /
+    # remote_qpn / min_rnr_nak / log_rra_max have actually been
+    # written by ibv_modify_qp(RTR).
+    if [ "$K6_QP_STATE_RANK" -ge 2 ]; then
+        echo "  --- RTR-set fields ---"
+        qpc_verdict path_mtu                  "${srcq_qpc_path_mtu:-}"               "${dstq_qpc_path_mtu:-}"
+        qpc_verdict min_rnr_nak               "${srcq_qpc_min_rnr_nak:-}"            "${dstq_qpc_min_rnr_nak:-}"
+        qpc_verdict log_rra_max               "${srcq_qpc_log_rra_max:-}"            "${dstq_qpc_log_rra_max:-}"
+        qpc_verdict remote_qpn                "${srcq_qpc_remote_qpn:-}"             "${dstq_qpc_remote_qpn:-}"
+        qpc_verdict primary_address_path      "${srcq_qpc_primary_address_path:-}"   "${dstq_qpc_primary_address_path:-}"
+    fi
+
+    # RTS-set: written by ibv_modify_qp(RTS). next_send_psn /
+    # last_acked_psn are technically always present in the QPC but
+    # only carry meaningful comparison content once we've stamped
+    # sq_psn at RTS time.
+    if [ "$K6_QP_STATE_RANK" -ge 3 ]; then
+        echo "  --- RTS-set fields ---"
+        qpc_verdict log_sra_max               "${srcq_qpc_log_sra_max:-}"            "${dstq_qpc_log_sra_max:-}"
+        qpc_verdict retry_count               "${srcq_qpc_retry_count:-}"            "${dstq_qpc_retry_count:-}"
+        qpc_verdict rnr_retry                 "${srcq_qpc_rnr_retry:-}"              "${dstq_qpc_rnr_retry:-}"
+        qpc_verdict next_send_psn             "${srcq_qpc_next_send_psn:-}"          "${dstq_qpc_next_send_psn:-}"
+        qpc_verdict last_acked_psn            "${srcq_qpc_last_acked_psn:-}"         "${dstq_qpc_last_acked_psn:-}"
+    fi
+    echo "================================================================="
 fi
 
 # --- manifest write -------------------------------------------------
@@ -477,15 +586,22 @@ rq_overall_rc=$rq_overall_rc
 EOF
 if [ "$RQ_PIGGYBACK" = 1 ]; then
     sudo tee -a "$META" >/dev/null <<EOF
-# §6.3 piggyback (src vs dst QPC at qpn=$src_qpn)
+# §6.3 / S6 piggyback (src vs dst QPC at qpn=$src_qpn, K6_QP_STATE=$K6_QP_STATE)
+k6_qp_state=$K6_QP_STATE
 srcq_qpc_state=${srcq_qpc_state:-}
 srcq_qpc_sw_rq_counter=${srcq_qpc_sw_rq_counter:-}
 srcq_qpc_hw_rq_counter=${srcq_qpc_hw_rq_counter:-}
 srcq_qpc_next_rcv_psn=${srcq_qpc_next_rcv_psn:-}
+srcq_qpc_path_mtu=${srcq_qpc_path_mtu:-}
+srcq_qpc_remote_qpn=${srcq_qpc_remote_qpn:-}
+srcq_qpc_primary_address_path=${srcq_qpc_primary_address_path:-}
 dstq_qpc_state=${dstq_qpc_state:-}
 dstq_qpc_sw_rq_counter=${dstq_qpc_sw_rq_counter:-}
 dstq_qpc_hw_rq_counter=${dstq_qpc_hw_rq_counter:-}
 dstq_qpc_next_rcv_psn=${dstq_qpc_next_rcv_psn:-}
+dstq_qpc_path_mtu=${dstq_qpc_path_mtu:-}
+dstq_qpc_remote_qpn=${dstq_qpc_remote_qpn:-}
+dstq_qpc_primary_address_path=${dstq_qpc_primary_address_path:-}
 EOF
 fi
 sudo chmod 0644 "$META"
@@ -515,20 +631,25 @@ fi
 
 if [ "$RQ_PIGGYBACK" = 1 ]; then
     if [ "$rq_overall_rc" -eq 0 ]; then
-        echo "§6.3 PIGGYBACK: PASS -- QPC (incl. RQ counters, next_rcv_psn) round-trips"
-        echo "                 byte-equal across LOAD_VHCA_STATE. No driver-side"
-        echo "                 QUERY_QP_PENDING_WRS + replay path is required for v0."
-        echo "                 §6.3 of design/uobject_restore.md can be closed out."
+        echo "§6.3 / S6 PIGGYBACK ($K6_QP_STATE): PASS -- QPC subset for this"
+        echo "                  state round-trips byte-equal across LOAD_VHCA_STATE."
+        if [ "$K6_QP_STATE_RANK" -ge 3 ]; then
+            echo "                  RTS-set fields (path_mtu, AV, retry_count,"
+            echo "                  PSNs, ...) are preserved by FW intrinsically."
+            echo "                  S6b mlx5_vfmig RESTORE_QP can stamp the user-"
+            echo "                  visible attrs without a per-field FW replay."
+        elif [ "$K6_QP_STATE_RANK" -ge 2 ]; then
+            echo "                  RTR-set fields (path_mtu, AV, ...) preserved."
+        fi
     else
-        echo "§6.3 PIGGYBACK: FAIL -- one or more QPC fields diverged across LOAD."
-        echo "                 §6.3 of design/uobject_restore.md must add explicit"
-        echo "                 pending-WR plumbing for v0 (likely a new driver"
-        echo "                 ioctl that snapshots+replays the user-RQ via UMR)."
+        echo "§6.3 / S6 PIGGYBACK ($K6_QP_STATE): FAIL -- one or more QPC fields"
+        echo "                  diverged across LOAD. S6b RESTORE_QP must add"
+        echo "                  explicit field plumbing for the divergent set."
     fi
-elif [ "$K6_POST_RECV_WRS" -gt 0 ]; then
-    echo "§6.3 PIGGYBACK: UNAVAILABLE (QUERY_QP failed; see logs above)."
+elif [ "$K6_QP_STATE_RANK" -ge 1 ]; then
+    echo "§6.3 / S6 PIGGYBACK: UNAVAILABLE (QUERY_QP failed; see logs above)."
 else
-    echo "§6.3 PIGGYBACK: skipped (set K6_POST_RECV_WRS to enable)."
+    echo "§6.3 / S6 PIGGYBACK: skipped (set K6_QP_STATE=INIT|RTR|RTS to enable)."
 fi
 
 if [ "$RQ_PIGGYBACK" = 1 ] && [ "$rq_overall_rc" -ne 0 ]; then
