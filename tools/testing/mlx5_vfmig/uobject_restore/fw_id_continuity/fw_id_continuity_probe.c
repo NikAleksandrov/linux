@@ -2,7 +2,7 @@
 /*
  * fw_id_continuity_probe -- empirical probe for
  * design/uobject_restore.md §8.2 ("FW identity continuity") and §6.3
- * (RQ-head/tail preservation piggyback experiment).
+ * (QPC preservation piggyback experiment).
  *
  * Allocates one of each FW-id-bearing user-mode resource class --
  * PD, CQ, QP (RC), MR, SRQ -- against the given ib_device, prints
@@ -31,17 +31,38 @@
  * and the MR's "mkey index" is the lkey/rkey value (lkey == rkey on
  * a standard MR; only the access bits differ between them).
  *
+ * §6.3 / S6 piggyback extension:
+ *   The QP can optionally be transitioned through the IBTA state
+ *   machine RESET -> INIT -> RTR -> RTS via SELF-LOOPBACK (the QP
+ *   targets its own qpn through its own port's GID). This populates
+ *   the RTR/RTS-set QPC fields (path_mtu, min_rnr_nak, log_rra_max,
+ *   primary_address_path, log_sra_max, retry_count, rnr_retry, ...)
+ *   without needing a peer or fabric reachability. The harness then
+ *   uses MLX5_VFMIG_IOC_QUERY_QP (which now returns the wider QPC
+ *   subset) to byte-compare src/dst across SAVE/LOAD.
+ *
+ *   Self-loopback uses the first non-zero GID found in the port's
+ *   GID table (RoCE: typically the link-local IPv6 GID auto-derived
+ *   from the netdev MAC; IB: the SM-assigned GID at index 0). The
+ *   QP never actually transmits anything across the wire because we
+ *   don't post any send WRs; the RTR/RTS transition is enough to
+ *   write the QPC fields we want to test.
+ *
  * Build:
  *   make -C tools/testing/mlx5_vfmig \
  *        uobject_restore/fw_id_continuity/fw_id_continuity_probe
  *
  * Usage:
  *   ./fw_id_continuity_probe <ibdev>
- *   ./fw_id_continuity_probe <ibdev> --post-recv-wrs N   # §6.3 piggyback: also
- *                                              # post N receive WRs to
- *                                              # the RQ so a follow-on
- *                                              # QUERY_QP can compare
- *                                              # head/tail across SAVE.
+ *   ./fw_id_continuity_probe <ibdev> --qp-state {RESET|INIT|RTR|RTS}
+ *                                              # Drive the K6 QP through
+ *                                              # the listed states (default
+ *                                              # RESET; INIT/RTR/RTS use
+ *                                              # self-loopback for AV).
+ *   ./fw_id_continuity_probe <ibdev> --post-recv-wrs N
+ *                                              # Post N receive WRs to the
+ *                                              # RQ for the §6.3 piggyback;
+ *                                              # implies at least INIT.
  */
 
 #include <errno.h>
@@ -153,6 +174,153 @@ static int extract_cq_context(struct ibv_cq *cq,
 	return 0;
 }
 
+/*
+ * Find the first non-zero GID in @ctx's GID table for @port. Returns
+ * the index in *sgid_idx and the GID in *gid; -1 on error / nothing
+ * found.
+ *
+ * Why "first non-zero": the RoCE GID table is sparse (some indices
+ * are unset, encoded as the all-zero GID), and the index of the
+ * link-local IPv6 GID isn't fixed across kernel versions. Scanning
+ * for the first usable entry is robust and matches what other
+ * userspace tools (perftest etc.) do.
+ *
+ * Bound at 256 indices defensively; ibv_query_port returns a
+ * gid_tbl_len which is the real cap on most fabrics, but we don't
+ * trust it for the iteration here.
+ */
+static int find_local_gid(struct ibv_context *ctx, uint8_t port,
+			  union ibv_gid *gid, int *sgid_idx)
+{
+	struct ibv_port_attr pa = {};
+	int err = ibv_query_port(ctx, port, &pa);
+	int n, i;
+
+	if (err) {
+		fprintf(stderr, "k6: ibv_query_port(%u) failed: %s\n",
+			port, strerror(err));
+		return -1;
+	}
+	n = pa.gid_tbl_len > 0 ? pa.gid_tbl_len : 256;
+	if (n > 256)
+		n = 256;
+	for (i = 0; i < n; i++) {
+		union ibv_gid g = {};
+		if (ibv_query_gid(ctx, port, i, &g))
+			continue;
+		if (memcmp(&g, &(union ibv_gid){0}, sizeof(g)) == 0)
+			continue;
+		*gid = g;
+		*sgid_idx = i;
+		return 0;
+	}
+	fprintf(stderr,
+		"k6: no usable GID found on port %u "
+		"(scanned %d entries; check the netdev's IP / GID table)\n",
+		port, n);
+	return -1;
+}
+
+/* RESET -> INIT. Same set as the original --post-recv-wrs path. */
+static int qp_to_init(struct ibv_qp *qp, uint8_t port)
+{
+	struct ibv_qp_attr attr = {
+		.qp_state        = IBV_QPS_INIT,
+		.pkey_index      = 0,
+		.port_num        = port,
+		.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
+				   IBV_ACCESS_REMOTE_WRITE |
+				   IBV_ACCESS_REMOTE_READ,
+	};
+	int mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+		   IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS;
+	int err = ibv_modify_qp(qp, &attr, mask);
+	if (err) {
+		fprintf(stderr, "k6: ibv_modify_qp(INIT) failed: %s\n",
+			strerror(err));
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * INIT -> RTR with self-loopback AV. dest_qpn is the QP's own qpn,
+ * dgid is a local GID from the port's GID table. RoCE link layer
+ * sets is_global=1 / dlid=0; IB sets is_global=0 (or 1 if you want
+ * to test GRH path) / dlid=lid-of-port. We ALWAYS set is_global=1
+ * with the local GID at sgid_index, which works on RoCE (no LID)
+ * and on IB (the GRH carries the GID, kernel resolves through SM).
+ *
+ * The QPC fields written here are exactly the §5.3.5 RTR-set group
+ * we want to validate for byte-equality across SAVE/LOAD:
+ *   path_mtu, min_rnr_nak, log_rra_max, primary_address_path
+ *   (dgid/sgid_idx/sl/port/dmac/hop_limit/tclass/...), remote_qpn,
+ *   rq_psn -> next_rcv_psn.
+ */
+static int qp_to_rtr(struct ibv_qp *qp, struct ibv_context *ctx,
+		     uint8_t port, uint32_t dest_qpn,
+		     const union ibv_gid *dgid, int sgid_idx)
+{
+	struct ibv_qp_attr attr = {
+		.qp_state           = IBV_QPS_RTR,
+		.path_mtu           = IBV_MTU_1024,
+		.dest_qp_num        = dest_qpn,
+		.rq_psn             = 0,
+		.max_dest_rd_atomic = 1,
+		.min_rnr_timer      = 12,
+	};
+	int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+		   IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+		   IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+	int err;
+
+	(void)ctx;
+
+	attr.ah_attr.is_global       = 1;
+	attr.ah_attr.dlid            = 0;
+	attr.ah_attr.sl              = 0;
+	attr.ah_attr.src_path_bits   = 0;
+	attr.ah_attr.port_num        = port;
+	attr.ah_attr.grh.dgid        = *dgid;
+	attr.ah_attr.grh.sgid_index  = (uint8_t)sgid_idx;
+	attr.ah_attr.grh.hop_limit   = 1;
+	attr.ah_attr.grh.traffic_class = 0;
+	attr.ah_attr.grh.flow_label  = 0;
+
+	err = ibv_modify_qp(qp, &attr, mask);
+	if (err) {
+		fprintf(stderr, "k6: ibv_modify_qp(RTR) failed: %s\n",
+			strerror(err));
+		return -1;
+	}
+	return 0;
+}
+
+/* RTR -> RTS. Stamps log_sra_max / retry_count / rnr_retry into the
+ * QPC. We never post send WRs; the QP just sits in RTS with all the
+ * RTR/RTS-set fields populated, ready for QUERY_QP to read them. */
+static int qp_to_rts(struct ibv_qp *qp)
+{
+	struct ibv_qp_attr attr = {
+		.qp_state      = IBV_QPS_RTS,
+		.timeout       = 14,
+		.retry_cnt     = 7,
+		.rnr_retry     = 7,
+		.sq_psn        = 0,
+		.max_rd_atomic = 1,
+	};
+	int mask = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+		   IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+		   IBV_QP_MAX_QP_RD_ATOMIC;
+	int err = ibv_modify_qp(qp, &attr, mask);
+	if (err) {
+		fprintf(stderr, "k6: ibv_modify_qp(RTS) failed: %s\n",
+			strerror(err));
+		return -1;
+	}
+	return 0;
+}
+
 static int extract_srqn(struct ibv_srq *srq, uint32_t *out)
 {
 	/* mlx5dv exposes mlx5dv_obj.srq.out via MLX5DV_OBJ_SRQ. Field
@@ -171,10 +339,39 @@ static int extract_srqn(struct ibv_srq *srq, uint32_t *out)
 	return 0;
 }
 
+enum k6_qp_state {
+	K6_QPS_RESET = 0,
+	K6_QPS_INIT  = 1,
+	K6_QPS_RTR   = 2,
+	K6_QPS_RTS   = 3,
+};
+
+static const char *k6_qp_state_name(enum k6_qp_state s)
+{
+	switch (s) {
+	case K6_QPS_RESET: return "RESET";
+	case K6_QPS_INIT:  return "INIT";
+	case K6_QPS_RTR:   return "RTR";
+	case K6_QPS_RTS:   return "RTS";
+	}
+	return "?";
+}
+
+static int parse_qp_state(const char *s, enum k6_qp_state *out)
+{
+	if (!strcasecmp(s, "RESET")) { *out = K6_QPS_RESET; return 0; }
+	if (!strcasecmp(s, "INIT"))  { *out = K6_QPS_INIT;  return 0; }
+	if (!strcasecmp(s, "RTR"))   { *out = K6_QPS_RTR;   return 0; }
+	if (!strcasecmp(s, "RTS"))   { *out = K6_QPS_RTS;   return 0; }
+	return -1;
+}
+
 int main(int argc, char **argv)
 {
 	const char *ibdev_name;
 	int post_recv_wrs = 0;
+	enum k6_qp_state target_state = K6_QPS_RESET;
+	const uint8_t port = 1;
 	struct ibv_device *dev;
 	struct ibv_context *ctx = NULL;
 	struct ibv_pd *pd = NULL;
@@ -189,7 +386,10 @@ int main(int argc, char **argv)
 	int rc = 1;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <ibdev> [--post-recv-wrs N]\n",
+		fprintf(stderr,
+			"usage: %s <ibdev> "
+			"[--qp-state {RESET|INIT|RTR|RTS}] "
+			"[--post-recv-wrs N]\n",
 			argv[0]);
 		return 2;
 	}
@@ -199,11 +399,28 @@ int main(int argc, char **argv)
 			post_recv_wrs = atoi(argv[++i]);
 			if (post_recv_wrs < 0)
 				post_recv_wrs = 0;
+		} else if (!strcmp(argv[i], "--qp-state") && i + 1 < argc) {
+			if (parse_qp_state(argv[++i], &target_state)) {
+				fprintf(stderr,
+					"k6: invalid --qp-state '%s' "
+					"(want RESET/INIT/RTR/RTS)\n",
+					argv[i]);
+				return 2;
+			}
 		} else {
 			fprintf(stderr, "k6: unknown arg '%s'\n", argv[i]);
 			return 2;
 		}
 	}
+
+	/*
+	 * --post-recv-wrs N implies the QP must be at least in INIT
+	 * (post_recv on RESET is rejected). Auto-promote so callers
+	 * can pass --post-recv-wrs N without thinking about the QP-
+	 * state plumbing.
+	 */
+	if (post_recv_wrs > 0 && target_state < K6_QPS_INIT)
+		target_state = K6_QPS_INIT;
 
 	dev = find_ibdev(ibdev_name);
 	if (!dev)
@@ -308,61 +525,58 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * §6.3 piggyback: post N receive WRs to the QP's RQ. We
-	 * transition the QP to INIT first so:
-	 *   (a) the QPC carries a non-zero state field, which is a
-	 *       more discriminating cross-check than "RESET on both
-	 *       sides" when comparing src and dst QUERY_QP results,
-	 *       and
-	 *   (b) we mirror what a real workload would do before
-	 *       posting receives.
-	 * We never drive RTR/RTS -- the GID/AV plumbing for that
-	 * would couple us to the netdev which is intentionally TX-
-	 * dropping on tracked VFs. INIT is enough for the FW to
-	 * populate the RQ accounting fields we want to compare.
+	 * §6.3 / S6 piggyback: drive the QP through the IBTA state
+	 * machine via SELF-LOOPBACK so the QPC carries the full
+	 * INIT/RTR/RTS-set field group when we (the harness) snapshot
+	 * it via MLX5_VFMIG_IOC_QUERY_QP. Self-loopback means the
+	 * QP's own port-GID becomes both src and dst of the AV; we
+	 * never actually transmit anything (no send WRs are posted),
+	 * so the netdev's TX-drop policy on tracked VFs is irrelevant.
 	 *
-	 * A follow-on QUERY_QP (driven by the PF cdev's
-	 * MLX5_VFMIG_IOC_QUERY_QP) reads the RQ counters before SAVE;
-	 * the dest side compares after LOAD.
+	 * Order matters: post_recv must happen AFTER INIT so the RQ
+	 * is in a state to accept WRs, and BEFORE the higher-level
+	 * transitions so the subsequent QUERY_QP reads them once
+	 * RTR/RTS has stamped its own QPC fields.
 	 */
-	if (post_recv_wrs > 0) {
-		struct ibv_qp_attr attr = {
-			.qp_state        = IBV_QPS_INIT,
-			.pkey_index      = 0,
-			.port_num        = 1,
-			.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
-					   IBV_ACCESS_REMOTE_WRITE |
-					   IBV_ACCESS_REMOTE_READ,
+	if (target_state >= K6_QPS_INIT) {
+		if (qp_to_init(qp, port))
+			goto out;
+	}
+
+	for (int i = 0; i < post_recv_wrs; i++) {
+		struct ibv_sge sge = {
+			.addr   = (uintptr_t)mr_buf,
+			.length = mr_len,
+			.lkey   = lkey,
 		};
-		int mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-			   IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS;
-		int err = ibv_modify_qp(qp, &attr, mask);
+		struct ibv_recv_wr wr = {
+			.wr_id   = 0xCAFE0000u | i,
+			.sg_list = &sge,
+			.num_sge = 1,
+		};
+		struct ibv_recv_wr *bad = NULL;
+		int err = ibv_post_recv(qp, &wr, &bad);
 		if (err) {
 			fprintf(stderr,
-				"k6: ibv_modify_qp(INIT) failed: %s -- "
-				"posting receives in RESET state anyway\n",
-				strerror(err));
+				"k6: ibv_post_recv #%d failed: %s\n",
+				i, strerror(err));
+			goto out;
 		}
-		for (int i = 0; i < post_recv_wrs; i++) {
-			struct ibv_sge sge = {
-				.addr = (uintptr_t)mr_buf,
-				.length = mr_len,
-				.lkey = lkey,
-			};
-			struct ibv_recv_wr wr = {
-				.wr_id = 0xCAFE0000u | i,
-				.sg_list = &sge,
-				.num_sge = 1,
-			};
-			struct ibv_recv_wr *bad = NULL;
-			int err = ibv_post_recv(qp, &wr, &bad);
-			if (err) {
-				fprintf(stderr,
-					"k6: ibv_post_recv #%d failed: %s\n",
-					i, strerror(err));
-				goto out;
-			}
-		}
+	}
+
+	if (target_state >= K6_QPS_RTR) {
+		union ibv_gid local_gid = {};
+		int sgid_idx = 0;
+
+		if (find_local_gid(ctx, port, &local_gid, &sgid_idx))
+			goto out;
+		if (qp_to_rtr(qp, ctx, port, qpn, &local_gid, sgid_idx))
+			goto out;
+	}
+
+	if (target_state >= K6_QPS_RTS) {
+		if (qp_to_rts(qp))
+			goto out;
 	}
 
 	/* Emit the manifest. Format is intentionally shell-eval-able:
@@ -401,6 +615,7 @@ int main(int argc, char **argv)
 	else
 		printf("srqn=SKIPPED\n");
 	printf("recv_wrs_posted=%d\n", post_recv_wrs);
+	printf("qp_state=%s\n", k6_qp_state_name(target_state));
 	printf("READY\n");
 	fflush(stdout);
 
