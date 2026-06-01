@@ -366,17 +366,34 @@ struct mlx5_vfmig_probe_uid {
  *   userspace test compare a QP's state across SAVE_VHCA_STATE +
  *   LOAD_VHCA_STATE without owning a userspace ib_qp handle for it.
  *
- *   Use-case: tools/testing/mlx5_vfmig/design/uobject_restore.md §6.3 piggyback experiment.
- *   On the source, allocate an RC QP, transition it to INIT, post N
- *   receive WRs. Snapshot the QPC via this ioctl (records state,
- *   hw/sw RQ counters, next_rcv_psn, ...). SAVE, then on the
- *   destination LOAD + bind and re-issue the ioctl at the SAME @qpn
- *   (which K6 has already established remains reserved in FW). If
- *   the destination QPC fields match the source's (state, sw_rq
- *   counter -- the FW-visible producer position, next_rcv_psn), the
- *   pending receive WRs intrinsically survived LOAD_VHCA_STATE and
- *   §6.3 of the R3 design needs no kernel work. Mismatch implies a
- *   driver-side QUERY_QP_PENDING_WRS + replay path is necessary.
+ *   Use-case: tools/testing/mlx5_vfmig/design/uobject_restore.md §6.3
+ *   piggyback experiment. On the source, allocate an RC QP, transition
+ *   it through INIT / RTR / RTS via self-loopback (post N receive WRs
+ *   along the way). Snapshot the QPC via this ioctl. SAVE, then on
+ *   the destination LOAD + bind and re-issue the ioctl at the SAME
+ *   @qpn (which K6 has already established remains reserved in FW).
+ *   If the destination QPC fields match the source's byte-for-byte
+ *   across the populated subset for the captured qp_state, the
+ *   pending RX/TX bookkeeping survived LOAD_VHCA_STATE intrinsically
+ *   and §6.3 / S6 of the R3 design need no kernel-side WR-replay
+ *   plumbing. Mismatch implies a driver-side replay path is needed.
+ *
+ *   Field set covers:
+ *
+ *     - state-independent bookkeeping: state, pd, q_key, uar_page
+ *       (the SQ doorbell source UAR id), log_page_size,
+ *       log_{sq,rq}_size, log_msg_max, user_index
+ *     - cross-references: remote_qpn, cqn_snd, cqn_rcv,
+ *       srqn_rmpn_xrqn
+ *     - PSNs: next_send_psn, next_rcv_psn, last_acked_psn
+ *     - queue counters: hw/sw {sq_wqebb,rq}_counter
+ *     - RTR-set: path_mtu, min_rnr_nak, log_rra_max, pkey_index
+ *     - RTS-set: log_sra_max, retry_count, rnr_retry
+ *     - AV: a flat 64-byte snapshot of QPC.primary_address_path
+ *       (struct mlx5_ifc_ads_bits) for byte-equal compare. Includes
+ *       dgid, dlid/mlid, sgid_index, sl, port, dmac, hop_limit,
+ *       tclass, flow_label, udp_sport, ack_timeout, eth_prio, etc.
+ *       The harness compares the raw bytes; no interpretation here.
  *
  *   The VF must currently be bound to mlx5_core and its mdev must be
  *   MLX5_INTERFACE_STATE_UP, same constraint as PROBE_UID. UID gating
@@ -386,43 +403,88 @@ struct mlx5_vfmig_probe_uid {
  *   tightens this, the ioctl will return the FW-error syndrome and
  *   we'll need to add an explicit "as_uid" argument.
  *
- *   Once §6.3 is empirically settled, this ioctl can be removed
+ *   Once §6.3 / S6 is empirically settled, this ioctl can be removed
  *   without breaking any in-tree consumer (or kept around as a debug
- *   surface -- it's a small ~30-LOC wrapper).
+ *   surface -- it's still a relatively small wrapper).
  *
  *   Returns 0 on success with the @qpc_* fields populated; -EINVAL
  *   if vf_id is out of range or reserved fields are non-zero;
  *   -ENODEV if the VF is unbound or its mdev interface is down;
  *   any negative FW-error code if QUERY_QP itself fails (most
  *   commonly "QP doesn't exist on this VHCA").
+ *
+ *   ABI note: this struct grew between kernel revisions to add the
+ *   wider field set above. The encoded ioctl number changes with the
+ *   struct size (sizeof in the _IOWR macro), so old userspace built
+ *   against the smaller struct will get -ENOTTY from a new kernel
+ *   rather than reading a partial / misaligned result. Recompile the
+ *   in-tree tool (tools/testing/mlx5_vfmig) against this header.
  */
 struct mlx5_vfmig_query_qp {
-	__u32 vf_id;			/* in:  target VF on this PF */
-	__u32 qpn;			/* in:  FW qpn to query
-					 *      (24 bits significant)
+	/* --- in --- */
+	__u32 vf_id;			/* target VF on this PF */
+	__u32 qpn;			/* FW qpn (24 bits significant) */
+	__u32 reserved_in[2];		/* must be 0 */
+
+	/* --- out: state-independent bookkeeping --- */
+	__u32 qpc_state;		/* QPC.state nibble
+					 *   (RST=0/INIT=1/RTR=2/RTS=3/...)
 					 */
-	__u32 reserved_in;		/* in:  must be 0 */
-
-	__u32 qpc_state;		/* out: QPC.state nibble
-					 *      (RST=0/INIT=1/RTR=2/RTS=3/...)
+	__u32 qpc_pd;			/* QPC.pd            (24 bits) */
+	__u32 qpc_q_key;		/* QPC.q_key         (32 bits) */
+	__u32 qpc_uar_page;		/* QPC.uar_page      (24 bits)
+					 *   SQ doorbell source UAR id;
+					 *   stale-on-restore would mean
+					 *   the user's mmap'd UAR is bound
+					 *   to a different FW UAR slot.
 					 */
-	__u32 qpc_pd;			/* out: QPC.pd      (24 bits) */
-	__u32 qpc_q_key;		/* out: QPC.q_key   (32 bits) */
-	__u32 qpc_remote_qpn;		/* out: QPC.remote_qpn (24 bits) */
-	__u32 qpc_cqn_snd;		/* out: QPC.cqn_snd (24 bits) */
-	__u32 qpc_cqn_rcv;		/* out: QPC.cqn_rcv (24 bits) */
-	__u32 qpc_srqn_rmpn_xrqn;	/* out: QPC.srqn_rmpn_xrqn (24 bits) */
+	__u32 qpc_log_page_size;	/* QPC.log_page_size  (5 bits) */
+	__u32 qpc_log_sq_size;		/* QPC.log_sq_size    (4 bits) */
+	__u32 qpc_log_rq_size;		/* QPC.log_rq_size    (4 bits) */
+	__u32 qpc_log_msg_max;		/* QPC.log_msg_max    (5 bits) */
+	__u32 qpc_user_index;		/* QPC.user_index    (24 bits)
+					 *   CQE.user_index source */
 
-	__u32 qpc_next_send_psn;	/* out: QPC.next_send_psn (24 bits) */
-	__u32 qpc_next_rcv_psn;		/* out: QPC.next_rcv_psn  (24 bits) */
-	__u32 qpc_last_acked_psn;	/* out: QPC.last_acked_psn(24 bits) */
+	/* --- out: cross-references --- */
+	__u32 qpc_remote_qpn;		/* QPC.remote_qpn      (24 bits;
+					 *                      RTR-set) */
+	__u32 qpc_cqn_snd;		/* QPC.cqn_snd         (24 bits) */
+	__u32 qpc_cqn_rcv;		/* QPC.cqn_rcv         (24 bits) */
+	__u32 qpc_srqn_rmpn_xrqn;	/* QPC.srqn_rmpn_xrqn  (24 bits) */
 
-	__u32 qpc_hw_sq_wqebb_counter;	/* out: QPC.hw_sq_wqebb_counter (16 bits) */
-	__u32 qpc_sw_sq_wqebb_counter;	/* out: QPC.sw_sq_wqebb_counter (16 bits) */
-	__u32 qpc_hw_rq_counter;	/* out: QPC.hw_rq_counter (32 bits) */
-	__u32 qpc_sw_rq_counter;	/* out: QPC.sw_rq_counter (32 bits) */
+	/* --- out: PSNs --- */
+	__u32 qpc_next_send_psn;	/* QPC.next_send_psn   (24 bits) */
+	__u32 qpc_next_rcv_psn;		/* QPC.next_rcv_psn    (24 bits) */
+	__u32 qpc_last_acked_psn;	/* QPC.last_acked_psn  (24 bits) */
 
-	__u8  reserved_out[16];		/* out: zeroed */
+	/* --- out: queue counters --- */
+	__u32 qpc_hw_sq_wqebb_counter;	/* (16 bits) */
+	__u32 qpc_sw_sq_wqebb_counter;	/* (16 bits) */
+	__u32 qpc_hw_rq_counter;	/* (32 bits) */
+	__u32 qpc_sw_rq_counter;	/* (32 bits) */
+
+	/* --- out: RTR-set --- */
+	__u32 qpc_path_mtu;		/* QPC.mtu             (3 bits) */
+	__u32 qpc_min_rnr_nak;		/* QPC.min_rnr_nak     (5 bits) */
+	__u32 qpc_log_rra_max;		/* QPC.log_rra_max     (3 bits) */
+	__u32 qpc_pkey_index;		/* QPC.primary_address_path.pkey_index
+					 *                     (16 bits;
+					 *                      INIT-set) */
+
+	/* --- out: RTS-set --- */
+	__u32 qpc_log_sra_max;		/* QPC.log_sra_max     (3 bits) */
+	__u32 qpc_retry_count;		/* QPC.retry_count     (3 bits) */
+	__u32 qpc_rnr_retry;		/* QPC.rnr_retry       (3 bits) */
+
+	/* --- out: AV (RTR-set; raw 64-byte primary_address_path for
+	 *       byte-equal compare against the QPC's dgid/dlid/sgid_idx/
+	 *       sl/port/dmac/hop_limit/tclass/flow_label/udp_sport/
+	 *       ack_timeout/eth_prio/...). The harness compares as
+	 *       opaque bytes; if anything differs across LOAD, byte-
+	 *       compare fails loud and we drill down post-hoc. */
+	__u8  qpc_primary_address_path[64];
+
+	__u8  reserved_out[16];		/* zeroed */
 };
 #define MLX5_VFMIG_IOC_QUERY_QP \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x09, struct mlx5_vfmig_query_qp)

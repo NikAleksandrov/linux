@@ -1114,7 +1114,7 @@ static long vfmig_ioc_query_qp(struct mlx5_vfmig_pf *vfmig,
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.reserved_in)
+	if (arg.reserved_in[0] || arg.reserved_in[1])
 		return -EINVAL;
 	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
 		return -EINVAL;
@@ -1158,27 +1158,83 @@ static long vfmig_ioc_query_qp(struct mlx5_vfmig_pf *vfmig,
 	}
 
 	qpc = MLX5_ADDR_OF(query_qp_out, out, qpc);
+
+	/* state-independent bookkeeping */
 	arg.qpc_state             = MLX5_GET(qpc, qpc, state);
 	arg.qpc_pd                = MLX5_GET(qpc, qpc, pd);
 	arg.qpc_q_key             = MLX5_GET(qpc, qpc, q_key);
+	arg.qpc_uar_page          = MLX5_GET(qpc, qpc, uar_page);
+	arg.qpc_log_page_size     = MLX5_GET(qpc, qpc, log_page_size);
+	arg.qpc_log_sq_size       = MLX5_GET(qpc, qpc, log_sq_size);
+	arg.qpc_log_rq_size       = MLX5_GET(qpc, qpc, log_rq_size);
+	arg.qpc_log_msg_max       = MLX5_GET(qpc, qpc, log_msg_max);
+	arg.qpc_user_index        = MLX5_GET(qpc, qpc, user_index);
+
+	/* cross-references */
 	arg.qpc_remote_qpn        = MLX5_GET(qpc, qpc, remote_qpn);
 	arg.qpc_cqn_snd           = MLX5_GET(qpc, qpc, cqn_snd);
 	arg.qpc_cqn_rcv           = MLX5_GET(qpc, qpc, cqn_rcv);
 	arg.qpc_srqn_rmpn_xrqn    = MLX5_GET(qpc, qpc, srqn_rmpn_xrqn);
+
+	/* PSNs */
 	arg.qpc_next_send_psn     = MLX5_GET(qpc, qpc, next_send_psn);
 	arg.qpc_next_rcv_psn      = MLX5_GET(qpc, qpc, next_rcv_psn);
 	arg.qpc_last_acked_psn    = MLX5_GET(qpc, qpc, last_acked_psn);
+
+	/* queue counters */
 	arg.qpc_hw_sq_wqebb_counter = MLX5_GET(qpc, qpc, hw_sq_wqebb_counter);
 	arg.qpc_sw_sq_wqebb_counter = MLX5_GET(qpc, qpc, sw_sq_wqebb_counter);
 	arg.qpc_hw_rq_counter     = MLX5_GET(qpc, qpc, hw_rq_counter);
 	arg.qpc_sw_rq_counter     = MLX5_GET(qpc, qpc, sw_rq_counter);
+
+	/* RTR-set */
+	arg.qpc_path_mtu          = MLX5_GET(qpc, qpc, mtu);
+	arg.qpc_min_rnr_nak       = MLX5_GET(qpc, qpc, min_rnr_nak);
+	arg.qpc_log_rra_max       = MLX5_GET(qpc, qpc, log_rra_max);
+	arg.qpc_pkey_index        = MLX5_GET(qpc, qpc,
+					     primary_address_path.pkey_index);
+
+	/* RTS-set */
+	arg.qpc_log_sra_max       = MLX5_GET(qpc, qpc, log_sra_max);
+	arg.qpc_retry_count       = MLX5_GET(qpc, qpc, retry_count);
+	arg.qpc_rnr_retry         = MLX5_GET(qpc, qpc, rnr_retry);
+
+	/*
+	 * AV: copy the raw bytes of QPC.primary_address_path so the
+	 * harness can do a byte-equal compare without tracking each ADS
+	 * subfield individually. This catches regressions in any ADS
+	 * field (dgid, dlid/mlid, sgid_index, sl, port, dmac, hop_limit,
+	 * tclass, flow_label, udp_sport, ack_timeout, eth_prio, ...) at
+	 * the cost of needing post-hoc inspection on a mismatch.
+	 *
+	 * The UAPI buffer is sized at 64 bytes -- rounded up to give
+	 * headroom for any future IFC-level extension to ads_bits while
+	 * keeping the struct nice and 8-byte aligned. We zero the buffer
+	 * and copy exactly MLX5_FLD_SZ_BYTES(qpc, primary_address_path)
+	 * bytes (currently 44 = 11 dwords of struct mlx5_ifc_ads_bits)
+	 * out of the FW QPC; trailing bytes remain zero on both src and
+	 * dst, so byte-equal comparison stays correct.
+	 *
+	 * The BUILD_BUG_ON guards against the IFC growing past our
+	 * UAPI window -- a future ads_bits expansion would require a
+	 * UAPI bump (the ioctl number changes with sizeof(struct ...)).
+	 */
+	BUILD_BUG_ON(MLX5_FLD_SZ_BYTES(qpc, primary_address_path) >
+		     sizeof(arg.qpc_primary_address_path));
+	memset(arg.qpc_primary_address_path, 0,
+	       sizeof(arg.qpc_primary_address_path));
+	memcpy(arg.qpc_primary_address_path,
+	       MLX5_ADDR_OF(qpc, qpc, primary_address_path),
+	       MLX5_FLD_SZ_BYTES(qpc, primary_address_path));
+
 	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
 
 	mlx5_core_dbg(pf_mdev,
-		      "vfmig: query_qp: vf %u qpn 0x%x state=%u sw_rq=%u hw_rq=%u next_rcv_psn=0x%x\n",
+		      "vfmig: query_qp: vf %u qpn 0x%x state=%u sw_rq=%u hw_rq=%u next_rcv_psn=0x%x next_send_psn=0x%x mtu=%u\n",
 		      arg.vf_id, arg.qpn, arg.qpc_state,
 		      arg.qpc_sw_rq_counter, arg.qpc_hw_rq_counter,
-		      arg.qpc_next_rcv_psn);
+		      arg.qpc_next_rcv_psn, arg.qpc_next_send_psn,
+		      arg.qpc_path_mtu);
 
 	if (copy_to_user(uarg, &arg, sizeof(arg)))
 		err = -EFAULT;
