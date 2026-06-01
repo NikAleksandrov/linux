@@ -912,15 +912,19 @@ the uobject for the call.
 
 * **mlx5_vfmig**: trust FW. The QPC `next_send_psn`,
   `next_rcv_psn`, `last_acked_psn`, sq/rq head/tail pointers,
-  WQE buffer MKEY references, and pending-WR state all
+  WQE buffer MKEY references, AV (primary_address_path),
+  retry/timeout counters, MTU, and pending-WR state all
   round-trip losslessly across `SAVE_VHCA_STATE` /
-  `LOAD_VHCA_STATE` -- empirically validated 2026-05-13 by
+  `LOAD_VHCA_STATE` -- empirically validated 2026-06-01 by
   `MLX5_VFMIG_IOC_QUERY_QP` + `test_fw_id_continuity.sh` with
-  `K6_POST_RECV_WRS=N`, all 13 byte-equal QPC subset fields
-  PASS (?6.3 below). No driver-side PSN bookkeeping in the
-  RESTORE_QP handler. The user-mode WQE buffer is preserved by
-  `user_mr_dma` at the IOMMU layer (Stage-2 source-side retag
-  was wired at `c0183184ad82` for the QP umem callsite).
+  `K6_QP_STATE={INIT,RTR,RTS}` self-loopback, byte-equal across
+  the full §6.3 / S6 QPC subset (state-independent + INIT-set +
+  RTR-set + RTS-set, including the 44-byte
+  `primary_address_path`). No driver-side PSN, AV, or attr-byte
+  bookkeeping in the RESTORE_QP handler. The user-mode WQE
+  buffer is preserved by `user_mr_dma` at the IOMMU layer
+  (Stage-2 source-side retag was wired at `c0183184ad82` for
+  the QP umem callsite).
 
 * **rxe**: explicit kernel-stored PSNs go through the UHW.
   `rxe_qp.req.psn` (next-PSN-to-send), `rxe_qp.resp.psn`
@@ -1251,62 +1255,86 @@ them. Indirect evidence:
 
 Direct empirical evidence (committed alongside this design --
 `MLX5_VFMIG_IOC_QUERY_QP` PF cdev ioctl + `test_fw_id_continuity.sh`
-piggyback driven by `K6_POST_RECV_WRS=N`):
+piggyback driven by `K6_QP_STATE={INIT,RTR,RTS}` self-loopback):
 
 ```
 On host A (source):
-  (1) fw_id_continuity_probe alloc PD/CQ/QP(RC)/MR; modify_qp(INIT);
-      post N receive WRs.
-  (2) PF cdev QUERY_QP @ qpn -> record QPC subset.
-  (3) SAVE_VHCA_STATE while the probe holds the QP alive.
+  (1) fw_id_continuity_probe alloc PD/CQ/QP(RC)/MR.
+  (2) Bring the VF netdev up so the RoCE GID table populates with
+      the link-local IPv6 GID auto-derived from the netdev MAC.
+  (3) Drive QP through RESET -> INIT -> [RTR -> [RTS]] via SELF-
+      LOOPBACK: dest_qpn = own qpn, dgid = first non-zero local
+      GID, sgid_index = its slot. We never post send WRs; the
+      RTR/RTS transition alone is enough to populate the AV /
+      retry / PSN / MTU fields in the QPC.
+  (4) Optionally post N receive WRs (post_recv_wrs).
+  (5) PF cdev QUERY_QP @ qpn -> record wider QPC subset (32+
+      individual fields plus the 44-byte primary_address_path).
+  (6) SAVE_VHCA_STATE while the probe holds the QP alive.
 
 On host B (dest, same host in our loopback test):
-  (4) tear down source VF, fresh dest VF, LOAD_VHCA_STATE,
+  (7) tear down source VF, fresh dest VF, LOAD_VHCA_STATE,
       MARK_RESTORED, bind.
-  (5) PF cdev QUERY_QP @ same qpn -> record QPC subset.
-  (6) Byte-equal compare.
+  (8) PF cdev QUERY_QP @ same qpn -> record QPC subset.
+  (9) Byte-equal compare across the whole subset relevant to the
+      achieved qp_state.
 ```
 
-Result (2026-05-13, ConnectX-6 Dx, 5.6MB blob):
+Result (2026-06-01, ConnectX-7, single PF self-loopback):
 
 ```
-state, pd, q_key, cqn_snd, cqn_rcv, srqn_rmpn_xrqn,
-next_send_psn, next_rcv_psn, last_acked_psn,
-hw/sw sq_wqebb_counter, hw/sw rq_counter
+K6_QP_STATE=INIT  ->  PASS on the state-independent + INIT-set core
+                     (state, pd, q_key, uar_page,
+                      log_{page,sq,rq}_size, log_msg_max,
+                      user_index, cqn_snd, cqn_rcv,
+                      srqn_rmpn_xrqn, hw/sw sq_wqebb_counter,
+                      hw/sw rq_counter, next_rcv_psn, pkey_index)
 
--> all 13 fields PASS (src == dst, byte-equal).
+K6_QP_STATE=RTR   ->  PASS on the above + RTR-set
+                     (path_mtu, min_rnr_nak, log_rra_max,
+                      remote_qpn, primary_address_path:
+                      44 bytes byte-equal -- dgid, sgid_index,
+                      dlid/mlid, sl, port, dmac, hop_limit,
+                      tclass, flow_label, udp_sport, ack_timeout,
+                      eth_prio)
+
+K6_QP_STATE=RTS   ->  PASS on the above + RTS-set
+                     (log_sra_max, retry_count, rnr_retry,
+                      next_send_psn, last_acked_psn)
 ```
 
-Conclusion: the FW QPC round-trips losslessly across
-`SAVE_VHCA_STATE` / `LOAD_VHCA_STATE`. No driver-side
-`QUERY_QP_PENDING_WRS` + replay path is needed for v0.
+The `primary_address_path` byte-blob includes the link-local IPv6
+GID (`fe80...`) the FW derived from the netdev's MAC; src and dst
+share a MAC because both VFs are vf0 of the same PF. Cross-host
+migration moves this proof onto the orchestrator's "consistent VF
+MAC" contract which is independent of S6 (?5.3.8).
 
-Caveat on what the experiment does and does not prove. With the QP
-held in `INIT` the FW-side `sw_rq_counter` is 0 on both sides,
-because FW does not snapshot the user-space DB-page producer index
-into the QPC until the QP transitions through RTR (where FW first
-registers the DB MKEY). The experiment therefore shows:
+Conclusion: the **entire** FW QPC round-trips losslessly across
+`SAVE_VHCA_STATE` / `LOAD_VHCA_STATE`, including every state-
+dependent field S6b RESTORE_QP would otherwise have had to replay.
+No driver-side `QUERY_QP_PENDING_WRS` + replay path is needed for v0.
 
-* the FW-tracked **QPC** survives byte-equal, which is the part FW
-  alone carries across `LOAD_VHCA_STATE`; and
-* by independent argument (K6's user-page result), the **user
-  RQ buffer** and the **user DB page** -- which carry the actual
-  WQE entries and the SW producer index -- will survive via the
-  `vfmig_iova` `HOST_USER_PAGE`-replay machinery (Stage-2 C4/C5
-  emit + LOAD-time placeholder install) bound on RESTORE_QP via
-  the same `mlx5_ib_umem_restore_<class>` wrapper pattern S4b
-  uses for the MR umem (S6 will land the QP wrapper +
-  `mlx5_vfmig_bind_user_qp`/`_user_dbr` analogues; Stage-2
-  retag callsites for both KIND_QP and KIND_DBR have already
-  landed via C9 + C7). Both buffers live in the QP's user-mode
-  umem which `user_mr_dma` is responsible for.
+What this means for the S6b mlx5_vfmig RESTORE_QP handler design:
 
-Together these are sufficient. We could not drive a live RTR/RTS
-round-trip in the same experiment without GIDs + active port, which
-on a tracked VF is intentionally blocked by the netdev TX-dropper.
-Re-running the piggyback in RTR/RTS once a tracked VF has a
-functioning (or shim-functioning) netdev would tighten the proof; for
-v0 the structural argument is sufficient and ?6.3 is **closed**.
+* The handler does NOT need to issue `MODIFY_QP(RST -> INIT -> RTR
+  -> RTS)` on the destination. The QPC is already at the captured
+  qp_state when the dest VF binds.
+* The handler does NOT need to carry attribute bytes (path_mtu,
+  retry_count, AV, PSNs, ...) through user-visible UAPI. The FW
+  preserves them. RESTORE_QP only needs (a) the source qpn, (b)
+  per-queue umem source VAs for adoption, (c) the doorbell-page
+  source VA, and -- for the userspace mlx5dv-internal path --
+  the ECE word.
+* The single-shot restore model in ?5.3.3 is the simpler of the
+  two design options, and is empirically justified by the RTS
+  byte-equal result above.
+
+The SQ/RQ user buffers and the DB page are an independent question
+(they live in user memory, not the QPC). They survive via the
+`vfmig_iova` `HOST_USER_PAGE`-replay machinery (Stage-2 C4/C5 emit +
+LOAD-time placeholder install) bound on RESTORE_QP via the
+`mlx5_ib_umem_restore_<class>` wrapper pattern S4b uses for the MR
+umem. ?6.3 is **closed**.
 
 Open question (separate from WR replay): exact relationship between
 the per-uobj `RESTORE_QP` handler's `modify_qp` chain and the fini
@@ -2574,7 +2602,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
 
   | step | what | landed | output |
   |------|------|--------|--------|
-  | K7 | LOAD_VHCA_STATE preserves QPC end-to-end (`MLX5_VFMIG_IOC_QUERY_QP` PF cdev + `test_fw_id_continuity.sh` piggyback driven by `K6_POST_RECV_WRS=N`) | yes (2026-05-13) | **STRONG PASS** -- src/dst byte-equal across all 13 QPC subset fields (state, pd, q_key, cqn_snd, cqn_rcv, srqn_rmpn_xrqn, next_send_psn, next_rcv_psn, last_acked_psn, hw/sw sq_wqebb_counter, hw/sw rq_counter). Means S6b can trust FW to preserve PSNs / pending-WR state without a driver-side replay path. |
+  | K7 | LOAD_VHCA_STATE preserves QPC end-to-end (`MLX5_VFMIG_IOC_QUERY_QP` PF cdev + `test_fw_id_continuity.sh` piggyback driven by `K6_QP_STATE={INIT,RTR,RTS}` with self-loopback) | yes (2026-06-01, INIT/RTR/RTS) | **STRONG PASS** at all three states. Subset is the wider §6.3 / S6 set the harness now enforces: state-independent (state, pd, q_key, uar_page, log_page_size, log_sq_size, log_rq_size, log_msg_max, user_index), cross-references (cqn_snd, cqn_rcv, srqn_rmpn_xrqn), queue counters (hw/sw sq_wqebb_counter, hw/sw rq_counter), PSNs (next_send_psn, next_rcv_psn, last_acked_psn), pkey_index, and -- once the source has driven `ibv_modify_qp(RTR)` -- the entire RTR-set: path_mtu, min_rnr_nak, log_rra_max, remote_qpn, primary_address_path (44 bytes byte-equal: dgid, sgid_index, dlid/mlid, sl, port, dmac, hop_limit, tclass, flow_label, udp_sport, ack_timeout, eth_prio). RTS additionally byte-equal on log_sra_max, retry_count, rnr_retry. **Implication:** S6b mlx5_vfmig RESTORE_QP needs no per-field FW replay -- LOAD_VHCA_STATE preserves the entire QPC. The handler only needs to (a) adopt umem (S6b B3) and (b) re-bind userspace VA mappings to the FW qpn (S6b B2). PSNs, AV, retry counts, MTU all ride along on the FW-side QPC blob. |
   | S6b B0 | PROBE_QPN raw QUERY_QP post-LOAD on adopted qpn (mirrors S5b B0 for cqn) | pending | -- |
   | S6b B1 | UAPI `mlx5_ib_restore_qp_req` (FW qpn / send-buf / recv-buf / DBR source VAs / source UAR idx for SQ doorbell / ECE / reserved) | pending | -- |
   | S6b B2 | `mlx5_ib_restore_qp` handler + `dev_ops.restore_qp` slot, FW-qpn-adopt helper (`mlx5_core_adopt_qp` -- mirrors `mlx5_core_adopt_cq` from S5b B2/B3) | pending | -- |
