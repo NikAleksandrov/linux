@@ -86,6 +86,10 @@ static struct workqueue_struct *mlx5_ib_qp_event_wq;
 static void get_cqs(enum ib_qp_type qp_type,
 		    struct ib_cq *ib_send_cq, struct ib_cq *ib_recv_cq,
 		    struct mlx5_ib_cq **send_cq, struct mlx5_ib_cq **recv_cq);
+static void mlx5_ib_lock_cqs(struct mlx5_ib_cq *send_cq,
+			     struct mlx5_ib_cq *recv_cq);
+static void mlx5_ib_unlock_cqs(struct mlx5_ib_cq *send_cq,
+			       struct mlx5_ib_cq *recv_cq);
 
 static int is_qp0(enum ib_qp_type qp_type)
 {
@@ -428,6 +432,54 @@ static void mlx5_ib_qp_event(struct mlx5_core_qp *qp, int type)
 
 out_no_handler:
 	mlx5_core_res_put(&qp->common);
+}
+
+/*
+ * Wire @qp's mlx5_core_qp event callback for a user-mode QP created
+ * via the uverbs RESTORE path. Decouples mlx5_ib_restore_qp (in
+ * main.c) from the file-static mlx5_ib_qp_event symbol here in qp.c,
+ * mirroring mlx5_ib_set_user_cq_callbacks's S5b B3 split.
+ *
+ * Caller is mlx5_ib_restore_qp post-mlx5_qpc_adopt_qp; the kernel-
+ * side mlx5_core_qp is already in dev->qp_table, so async events
+ * routed through it land on this callback once it's set.
+ */
+void mlx5_ib_set_user_qp_event_callback(struct mlx5_ib_qp *qp)
+{
+	qp->trans_qp.base.mqp.event = mlx5_ib_qp_event;
+}
+
+/*
+ * Register @qp into the reset-flow tracking lists (dev->qp_list and
+ * the send/recv CQ list_send_qp / list_recv_qp lists) under the
+ * usual reset_flow_resource_lock + per-CQ lock chain. Mirror of
+ * the tail of create_user_qp / create_kernel_qp, exported for the
+ * uverbs RESTORE path so mlx5_ib_restore_qp (in main.c) doesn't
+ * have to reach into the file-static mlx5_ib_lock_cqs / get_cqs
+ * helpers here.
+ *
+ * Must run AFTER mlx5_qpc_adopt_qp (qp is in dev->qp_table) and
+ * AFTER ubuffer.umem + qp->db are populated (the destroy path
+ * unwinds via list_del + mlx5_ib_db_unmap_user + ib_umem_release in
+ * that order).
+ */
+void mlx5_ib_register_user_qp_in_dev_lists(struct mlx5_ib_dev *dev,
+					   struct mlx5_ib_qp *qp)
+{
+	struct mlx5_ib_cq *send_cq, *recv_cq;
+	unsigned long flags;
+
+	get_cqs(qp->type, qp->ibqp.send_cq, qp->ibqp.recv_cq,
+		&send_cq, &recv_cq);
+	spin_lock_irqsave(&dev->reset_flow_resource_lock, flags);
+	mlx5_ib_lock_cqs(send_cq, recv_cq);
+	list_add_tail(&qp->qps_list, &dev->qp_list);
+	if (send_cq)
+		list_add_tail(&qp->cq_send_list, &send_cq->list_send_qp);
+	if (recv_cq)
+		list_add_tail(&qp->cq_recv_list, &recv_cq->list_recv_qp);
+	mlx5_ib_unlock_cqs(send_cq, recv_cq);
+	spin_unlock_irqrestore(&dev->reset_flow_resource_lock, flags);
 }
 
 static int set_rq_size(struct mlx5_ib_dev *dev, struct ib_qp_cap *cap,

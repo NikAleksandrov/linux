@@ -3491,11 +3491,11 @@ err_buf:
 
 /*
  * mlx5_ib_restore_qp: CRIU-managed QP restore, Model A (FW qpn
- * adoption) -- B2 stub. The destination VHCA inherits the source's
- * QP context across LOAD_VHCA_STATE; this handler builds a fresh
- * kernel-side mlx5_ib_qp that wraps the adopted (qpn, qpc) state
- * without re-issuing FW CREATE_QP and without driving the
- * RESET->INIT->RTR->RTS chain again.
+ * adoption). The destination VHCA inherits the source's QP context
+ * across LOAD_VHCA_STATE; this handler builds a fresh kernel-side
+ * mlx5_ib_qp that wraps the adopted (qpn, qpc) state without
+ * re-issuing FW CREATE_QP and without driving the RESET->INIT->RTR
+ * ->RTS chain again.
  *
  * Empirical justification for skipping every step that would
  * normally be needed at RESTORE-time is the K7 "wider QPC
@@ -3532,19 +3532,49 @@ err_buf:
  * (mlx5_ib_restore_qp_req.qpn). The handler enforces only
  * @qpn != 0 && (@qpn & ~0xffffff) == 0 (FW resource-id range).
  *
- * v0 (B2) stub scope:
- *   - kernel-side mlx5_ib_qp + mlx5_core_qp registration only;
- *   - WQ-ring umem and DBR umem binding are NOT performed here
- *     and are deferred to S6b B3 (the umem_restore_qp /
- *     db_map_user_restore plumbing). Until B3 lands, RESTORE_QP
- *     is end-to-end testable only at the cmd-ring level
- *     (DESTROY_QP succeeds; QUERY_QP off the adopted qpn returns
- *     the inherited QPC); FW data-path traffic against the
- *     restored qpn requires the umem rings the source allocated
- *     to be re-pinned + iommu-mapped, which only B3 provides.
- *   - We honour qp_state advisorily for v0 -- the dispatcher has
- *     gated valid states; the handler simply stamps qp->state
- *     so DESTROY_QP issues the right state-transition path.
+ * v0 (B3) scope:
+ *   - kernel-side mlx5_ib_qp + mlx5_core_qp registration via
+ *     mlx5_qpc_adopt_qp;
+ *   - WQ-ring umem (RQ + SQ in one contiguous mapping) bound via
+ *     mlx5_ib_umem_restore_qp() which composes ib_umem_pin (pins
+ *     the source userspace's WQE-ring backing pages without
+ *     dma_map_sgtable) with mlx5_vfmig_bind_user_qp() (iommu_maps
+ *     each sg at the placeholder's IOVA range and populates
+ *     sg_dma_address). This is the Stage-3 D3 destination-side
+ *     bind chain (user_mr_dma.md §A.D). The qpn adoption + WQE-
+ *     ring binding together close the data-path gap: FW WQE
+ *     fetches against this qpn reach the same IOVAs the SAVE-
+ *     side Stage-2 retag installed, which now map to destination-
+ *     side pinned pages.
+ *   - DBR-page bind via mlx5_ib_db_map_user_restore() (the
+ *     parallel restore variant of mlx5_ib_db_map_user, lifted
+ *     from S5b B3). Cache hits (a previously-restored uobject in
+ *     this ucontext already pinned this DBR page -- typically the
+ *     send/recv CQ pair sharing the same doorbell page)
+ *     refcount++ and reuse db->dma; cache misses ib_umem_pin +
+ *     mlx5_vfmig_bind_user_dbr the placeholder.
+ *   - Async-event callback wired via mlx5_ib_set_user_qp_event_
+ *     callback so FW QP events are dispatched through the qp_event_wq
+ *     to qp->ibqp.event_handler.
+ *   - dev->qp_list / send_cq->list_send_qp / recv_cq->list_recv_qp
+ *     registration under reset_flow_resource_lock so reset-flow
+ *     handling sees the restored QP.
+ *
+ * v0 simplifications:
+ *   - bfregn = MLX5_IB_INVALID_BFREG: req.bfreg_index is the
+ *     source userspace's UAR-mapping index (encoded in the
+ *     adopted qpc.uar_page), not a kernel-allocator slot.
+ *     Bypassing the kernel bfreg allocator avoids double-booking
+ *     the same UAR page; destroy path's "free only kernel-
+ *     allocated bfregs" guard then correctly skips
+ *     mlx5_ib_free_bfreg.
+ *   - port = 1 (v0 single-port VF). Refresh from the inherited
+ *     qpc.primary_address_path.port if multi-port surfaces.
+ *   - bf.{buf_size, offset, bfreg} = 0: BlueFlame is a kernel-
+ *     QP optimisation; user QPs don't consult it.
+ *   - cqe_comp / inline_data adoption deferred: the FW-side bits
+ *     (already set in the adopted qpc) are honoured by the FW
+ *     data path regardless of qp->private kernel state.
  *
  * v0 dealloc invariant (mirrors S5b's CQ invariant): if
  * userspace tries to DESTROY_QP before all dependents (e.g.
@@ -3554,8 +3584,8 @@ err_buf:
  * -EINVAL. The qp stays parked at target_handle until the
  * restore is complete or the ucontext is destroyed.
  *
- * Returns 0 with a kernel-registered qp, or -errno on
- * validation / adopt-table-insert failure.
+ * Returns 0 with a fully-wired qp, or -errno on validation /
+ * umem-pin / bind / adopt failure (all unwound).
  */
 static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 			      const struct ib_qp_cap *cap,
@@ -3569,6 +3599,8 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		udata, struct mlx5_ib_ucontext, ibucontext);
 	struct mlx5_ib_qp_base *base = &qp->trans_qp.base;
 	struct mlx5_ib_restore_qp_req req = {};
+	struct ib_umem *umem;
+	size_t buf_size;
 	int err;
 
 	if (!context)
@@ -3583,7 +3615,7 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		return -EPERM;
 
 	/*
-	 * v0 (B2): only the IBTA QP types whose mlx5_ib representation
+	 * v0: only the IBTA QP types whose mlx5_ib representation
 	 * lives in trans_qp (RC, UC, UD). Raw packet, XRC, GSI, DCT/DCI
 	 * are dispatcher-rejected anyway; we additionally guard here
 	 * because driver-direct callers can supply any type.
@@ -3610,27 +3642,72 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	if (req.uidx & ~0xffffffU)
 		return -EINVAL;
 
-	/* Kernel-side mlx5_ib_qp init -- minimal subset of
-	 * mlx5_ib_create_qp's pre-_create_kernel_qp / pre-create_user_qp
-	 * stamping. Fields whose meaning depends on the WQ rings
-	 * (rq.{wqe_cnt, wqe_shift, max_post, ...}, sq.{wqe_cnt, ...},
-	 * bf.{buf_size, offset, bfreg}, max_inline_data, has_rq) are
-	 * left zero at B2; B3 will populate them when the WQ-ring
-	 * umem bind happens.
+	/*
+	 * WQ-ring layout. _create_user_qp's set_user_buf_size composes
+	 *   buf_size = (rq_wqe_count << rq_wqe_shift) + (sq_wqe_count
+	 *              << ilog2(MLX5_SEND_WQE_BB))
+	 * for QPC-managed (RC/UC/UD) QPs, with RQ at offset 0 and SQ
+	 * at qp->sq.offset = (rq_wqe_count << rq_wqe_shift). The
+	 * SAVE-side retag emitted exactly that footprint as the
+	 * (KIND_QP, qpn) HOST_USER_PAGE record (see qp.c
+	 * post-mlx5_qpc_create_qp retag block); we MUST pin the same
+	 * byte length on restore so vfmig_iova_bind_user_object's sgt
+	 * length match-check passes.
+	 *
+	 * sq_wqe_count == 0 + rq_wqe_count == 0 -> buf_size 0; treat
+	 * as "no umem to bind" (rare in practice; v0 RC always has
+	 * both queues populated). buf_addr == 0 with non-zero
+	 * buf_size is rejected.
 	 */
+	if (req.rq_wqe_count && (req.rq_wqe_shift < 4 || req.rq_wqe_shift > 16))
+		return -EINVAL;
+	buf_size = ((size_t)req.rq_wqe_count << req.rq_wqe_shift) +
+		   ((size_t)req.sq_wqe_count << ilog2(MLX5_SEND_WQE_BB));
+	if (buf_size && !req.buf_addr)
+		return -EINVAL;
+	if (!buf_size && req.buf_addr)
+		return -EINVAL;
+	if (req.db_addr == 0)
+		return -EINVAL;
+
+	/* Kernel-side mlx5_ib_qp init. */
 	mutex_init(&qp->mutex);
+	spin_lock_init(&qp->sq.lock);
+	spin_lock_init(&qp->rq.lock);
 	qp->type = ibqp->qp_type;
 	qp->state = qp_state;
 	qp->flags = create_flags;
 	qp->flags_en = req.flags;
-	qp->port = 1;	/* v0: single-port VF, refined in B3 if needed */
-	qp->bfregn = req.bfreg_index;
+	qp->port = 1;	/* v0: single-port VF */
+	/*
+	 * bfregn is a kernel-allocator slot; req.bfreg_index is the
+	 * source's UAR-mapping index (encoded in the adopted
+	 * qpc.uar_page). Always treat the restored QP as "userspace
+	 * manages its own BFREG" so destroy_qp's
+	 *   if (qp->bfregn != MLX5_IB_INVALID_BFREG)
+	 *           mlx5_ib_free_bfreg(...);
+	 * skips a slot the kernel never allocated.
+	 */
+	qp->bfregn = MLX5_IB_INVALID_BFREG;
 	qp->has_rq = req.rq_wqe_count > 0;
 	qp->is_rss = false;
 	qp->is_ooo_rq = false;
+	if (create_flags & IB_UVERBS_QP_CREATE_SQ_SIG_ALL)
+		qp->sq_signal_bits = MLX5_WQE_CTRL_CQ_UPDATE;
 	INIT_LIST_HEAD(&qp->qps_list);
 	INIT_LIST_HEAD(&qp->cq_recv_list);
 	INIT_LIST_HEAD(&qp->cq_send_list);
+
+	/* WQ-ring sizing -- mirrors _create_user_qp's offset arithmetic. */
+	qp->rq.wqe_cnt = req.rq_wqe_count;
+	qp->rq.wqe_shift = req.rq_wqe_shift;
+	qp->rq.offset = 0;
+	qp->sq.wqe_cnt = req.sq_wqe_count;
+	qp->sq.wqe_shift = ilog2(MLX5_SEND_WQE_BB);
+	qp->sq.offset = (size_t)req.rq_wqe_count << req.rq_wqe_shift;
+
+	base->ubuffer.buf_addr = req.buf_addr;
+	base->ubuffer.buf_size = buf_size;
 
 	/* mlx5_core_qp identity. uid: source's devx_uid for v0
 	 * (DEVX is out of scope per design §S6b). The user_index
@@ -3655,20 +3732,81 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	if (err)
 		return err;
 
+	/*
+	 * Wire the async-event callback BEFORE we expose the QP to
+	 * the qps_list / cq lists -- once the qp is in dev->qp_table
+	 * (post-mlx5_qpc_adopt_qp) FW-emitted async events route
+	 * through this callback, and a NULL would cause
+	 * mlx5_core_res_put double-decrement on the
+	 * "out_no_handler" path of mlx5_ib_qp_event.
+	 */
+	mlx5_ib_set_user_qp_event_callback(qp);
+
+	/*
+	 * Stage-3 D3 destination-side WQ-ring umem bind. Pins user
+	 * pages (buf_size bytes; the dispatcher hands us req.{rq,sq}_
+	 * wqe_count which match the source's pre-SAVE umem) and
+	 * iommu_maps each sg at the placeholder IOVA range that
+	 * LOAD_VHCA_STATE installed for (KIND_QP, qpn). On failure
+	 * the helper has already unwound any pin + partial bind via
+	 * ib_umem_release().
+	 */
+	if (buf_size) {
+		umem = mlx5_ib_umem_restore_qp(dev, req.qpn, req.buf_addr,
+					       buf_size);
+		if (IS_ERR(umem)) {
+			err = PTR_ERR(umem);
+			goto err_adopt;
+		}
+		base->ubuffer.umem = umem;
+	} else {
+		base->ubuffer.umem = NULL;
+	}
+
+	/*
+	 * Stage-3 D3 destination-side DBR-page umem bind (or
+	 * refcount-up if a previously-restored uobject in this
+	 * ucontext already bound the same DBR page; the dedup logic
+	 * mirrors create-time mlx5_ib_db_map_user). Populates
+	 * qp->db.{u.user_page, dma}.
+	 */
+	err = mlx5_ib_db_map_user_restore(context, req.db_addr, &qp->db);
+	if (err)
+		goto err_buf;
+
+	/*
+	 * Reset-flow accounting: the destroy_qp_common path takes
+	 * dev->reset_flow_resource_lock + per-CQ locks and unlinks
+	 * qp->qps_list / cq_send_list / cq_recv_list unconditionally.
+	 * Mirror create_user_qp's tail so the destroy path finds the
+	 * QP wired into the same lists.
+	 */
+	mlx5_ib_register_user_qp_in_dev_lists(dev, qp);
+
 	/* Stamp the user-visible qpn (the dispatcher will echo it
 	 * back via RESP_QPN). */
 	ibqp->qp_num = req.qpn;
 
 	mlx5_ib_dbg(dev,
-		    "vfmig_qp_dbg: restore_qp ibdev=%s qpn=0x%x type=%d state=%d uid=%u uidx=0x%x bfreg=%u flags_en=0x%x target_handle=0x%x cap={s_wr=%u r_wr=%u s_sge=%u r_sge=%u inl=%u}\n",
+		    "vfmig_qp_dbg: restore_qp ibdev=%s qpn=0x%x type=%d state=%d uid=%u uidx=0x%x flags_en=0x%x target_handle=0x%x cap={s_wr=%u r_wr=%u s_sge=%u r_sge=%u inl=%u} buf_size=%zu db_user_virt=0x%lx\n",
 		    dev_name(&ibqp->device->dev), req.qpn, qp->type,
 		    qp_state, base->mqp.uid, req.uidx,
-		    qp->bfregn, qp->flags_en, target_handle,
+		    qp->flags_en, target_handle,
 		    cap->max_send_wr, cap->max_recv_wr,
 		    cap->max_send_sge, cap->max_recv_sge,
-		    cap->max_inline_data);
+		    cap->max_inline_data, buf_size,
+		    (unsigned long)(req.db_addr & PAGE_MASK));
 
 	return 0;
+
+err_buf:
+	if (base->ubuffer.umem) {
+		ib_umem_release(base->ubuffer.umem);
+		base->ubuffer.umem = NULL;
+	}
+err_adopt:
+	mlx5_core_destroy_qp(dev, &base->mqp);
+	return err;
 }
 
 static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)

@@ -154,6 +154,76 @@ struct ib_umem *mlx5_ib_umem_restore_cq(struct mlx5_ib_dev *dev, u32 cqn,
 }
 
 /*
+ * Stage-3 D3: pin a user QP's WQ-ring (RQ + SQ in one contiguous
+ * mapping) pages and bind them to the Stage-2 placeholder that
+ * LOAD_VHCA_STATE-replayed HOST_USER_PAGE records installed for the
+ * source's (KIND_QP, qpn) tuple.
+ *
+ * Identical composition shape to mlx5_ib_umem_restore_cq modulo the
+ * kind enum (VFMIG_HUOBJ_KIND_QP) and the FW-id semantics (qpn
+ * instead of cqn):
+ *
+ *   1. ib_umem_pin(&dev->ib_dev, addr, size, 0) -- pins user pages
+ *      and builds the sg_append_table without DMA-mapping. Access
+ *      is 0 because the FW reads WQE descriptors out of the buffer
+ *      (matching the source-side mlx5_ib_create_qp's _create_user_qp
+ *      ib_umem_get(... 0)). The SQ doorbell + RQ doorbell mechanism
+ *      writes 8-byte records into the doorbell-page umem (handled
+ *      separately by mlx5_ib_db_map_user_restore), not the WQ-ring
+ *      umem.
+ *   2. mlx5_vfmig_bind_user_qp(dev->mdev, qpn, sgt) -- iommu_maps
+ *      each sg at consecutive IOVAs starting at the placeholder's
+ *      recorded IOVA base, populates sg_dma_address / sg_dma_len so
+ *      subsequent vfmig_dma_ops.unmap_sg under ib_umem_release()
+ *      can match each entry, and transitions placeholder
+ *      awaiting_bind=true -> false.
+ *
+ * The caller (mlx5_ib_restore_qp) supplies @size = (rq_wqe_count <<
+ * rq_wqe_shift) + (sq_wqe_count << ilog2(MLX5_SEND_WQE_BB)), the
+ * same byte length _create_user_qp's set_user_buf_size composes for
+ * QPC-managed (RC / UC / UD) QPs. A future S6c extension that
+ * surfaces RAW_PACKET will need a separate split-SQ helper because
+ * raw_packet QPs live in two umems (qp->raw_packet_qp.{sq,rq}.
+ * ubuffer.umem); this helper is QPC-only by construction.
+ *
+ * On bind failure (-ENOENT placeholder miss / -EBUSY double-bind /
+ * -EINVAL sgt mismatch / iommu_map errno), the umem is unwound via
+ * ib_umem_release(). Per design §A.H L2 the partial-bind unwind is
+ * safe (vfmig_dma_ops.unmap_sg skips zero-iova sgs).
+ *
+ * Caller (mlx5_ib_restore_qp) responsibilities:
+ *   - Gate on context->vfmig_restore_mode + a tracked-VF ucontext
+ *     before calling. A non-tracked VF reaches this helper only via
+ *     direct driver-internal misuse; -ENODEV surfaces from the
+ *     mlx5_vfmig_bind_user_qp fast-path gate so the verb fails
+ *     loudly rather than silently leaking pins.
+ *   - qpn must match what the SAVE-side retag emitted as the
+ *     HOST_USER_PAGE record's fw_id (== source qpn).
+ *
+ * Returns the populated struct ib_umem on success (the caller stores
+ * it in qp->trans_qp.base.ubuffer.umem); ERR_PTR on any failure with
+ * all resources released.
+ */
+struct ib_umem *mlx5_ib_umem_restore_qp(struct mlx5_ib_dev *dev, u32 qpn,
+					unsigned long addr, size_t size)
+{
+	struct ib_umem *umem;
+	int err;
+
+	umem = ib_umem_pin(&dev->ib_dev, addr, size, 0);
+	if (IS_ERR(umem))
+		return umem;
+
+	err = mlx5_vfmig_bind_user_qp(dev->mdev, qpn,
+				      &umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(umem);
+		return ERR_PTR(err);
+	}
+	return umem;
+}
+
+/*
  * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
  * filled in the pas array.
  */
