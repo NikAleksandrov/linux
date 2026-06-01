@@ -394,6 +394,136 @@ struct mlx5_ib_restore_cq_req {
 				 * cqe_comp_en adoption). */
 };
 
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_QP on
+ * mlx5. CRIU-managed restore passes the source's FW qpn here so
+ * mlx5_ib_restore_qp can adopt the existing destination-side QP
+ * (preserved across LOAD_VHCA_STATE) into a fresh kernel-side
+ * mlx5_ib_qp without re-issuing FW CREATE_QP.
+ *
+ * The wire-visible identity of the QP is carried by @qpn -- there
+ * is no core "qpn_hint" attribute on the verb (QPs do not have
+ * lkey/rkey-style core hints; qpn is a strictly mlx5-private
+ * concept that travels only through this UHW). The handler
+ * enforces @qpn != 0 (kernel-mode reservation sentinel) and @qpn
+ * fits in 24 bits (FW resource id range), and rejects 0 as a
+ * documented sentinel.
+ *
+ * Empirical justification (the bulk of what the handler would
+ * otherwise need to replay sits inside the FW QPC and is preserved
+ * by LOAD_VHCA_STATE): test_fw_id_continuity.sh
+ * K6_QP_STATE={INIT,RTR,RTS} self-loopback STRONG PASS on
+ * 2026-06-01 -- the entire FW-side QPC subset round-trips byte-
+ * equal across SAVE/LOAD, including state, pd, q_key, uar_page,
+ * log_{page,sq,rq}_size, log_msg_max, user_index, cqn_snd,
+ * cqn_rcv, srqn_rmpn_xrqn, hw/sw {sq_wqebb,rq}_counter, the PSNs
+ * (next_send_psn, next_rcv_psn, last_acked_psn), the RTR-set
+ * (path_mtu, min_rnr_nak, log_rra_max, primary_address_path:
+ * dgid, sgid_index, dlid/mlid, sl, port, dmac, hop_limit, tclass,
+ * flow_label, udp_sport, ack_timeout, eth_prio), and the RTS-set
+ * (log_sra_max, retry_count, rnr_retry). RESTORE_QP therefore
+ * does NOT carry path_mtu / retry_count / AV / PSNs / etc.
+ * through the UHW -- FW preserves them. The UHW only needs the
+ * userspace-side identity the FW QPC cannot re-derive.
+ *
+ * Field roles -- mirrors mlx5_ib_create_qp's role-by-role:
+ *
+ *   @buf_addr     source userspace VA of the WQ ring buffer (SQ +
+ *                 RQ combined for RC/UC/UD; SQ-only for raw_packet
+ *                 with @sq_buf_addr split). Same value
+ *                 mlx5_ib_create_qp.buf_addr held at fresh-create
+ *                 time on the source. Bound on the destination via
+ *                 mlx5_ib_umem_restore_qp (S6b B3) into the
+ *                 KIND_QP-tagged placeholder LOAD_VHCA_STATE
+ *                 installed via the Stage-2 source-side retag.
+ *
+ *   @db_addr      source userspace VA of the doorbell record (DBR
+ *                 page). Same as mlx5_ib_create_qp.db_addr. Bound
+ *                 via mlx5_ib_db_map_user_restore against the
+ *                 KIND_DBR placeholder, page-aligned by the
+ *                 handler exactly like mlx5_ib_restore_cq's
+ *                 db_addr. The byte offset within the page
+ *                 survives verbatim because qpc.dbr_addr (FW)
+ *                 encodes it.
+ *
+ *   @sq_buf_addr  split-SQ source userspace VA, RAW_PACKET-only.
+ *                 For v0 (RC scope) this MUST be 0; the handler
+ *                 rejects any non-zero value with -EOPNOTSUPP.
+ *                 Carried in the v0 UAPI to match the
+ *                 mlx5_ib_create_qp shape and avoid a UAPI bump
+ *                 when raw_packet support lands later.
+ *
+ *   @qpn          FW qpn to adopt (24 bits significant). 0 is a
+ *                 documented sentinel (kernel-mode QP reservation)
+ *                 and rejects with -EINVAL.
+ *
+ *   @sq_wqe_count, @rq_wqe_count, @rq_wqe_shift
+ *                 the queue sizing the source used at fresh-create
+ *                 time. Same as in mlx5_ib_create_qp; the adopt
+ *                 path uses these to size the umem pin and to
+ *                 stamp mlx5_ib_qp.{sq,rq}.wqe_cnt. Independently
+ *                 cross-checked against qpc.log_{sq,rq}_size which
+ *                 K7 has shown survives byte-equal -- if the
+ *                 caller's count disagrees with FW, the handler
+ *                 rejects with -EINVAL.
+ *
+ *   @flags        create-time MLX5_QP_FLAG_* bitmask. Captured at
+ *                 source SAVE and replayed verbatim. v0 policy: if
+ *                 the dst kernel does not recognise a flag bit
+ *                 (newer-source-than-dst), reject loud with
+ *                 -EOPNOTSUPP rather than silently zero.
+ *
+ *   @uidx         user_index for WC routing (qpc.user_index).
+ *                 Captured by the dumper from the source-side
+ *                 mlx5_ib_qp.uidx; replayed here so the
+ *                 destination's mlx5_ib_qp.uidx matches. K7 has
+ *                 shown qpc.user_index survives byte-equal at the
+ *                 FW level; this UHW field is what keeps the
+ *                 *kernel*-side mlx5_ib_qp.uidx aligned with FW.
+ *
+ *   @bfreg_index  source BFREG slot index in the source ucontext's
+ *                 bfregs[] table. The source-side
+ *                 mlx5_ib_create_qp_user resolves bfreg_index to a
+ *                 FW UAR id; the destination kernel (after the
+ *                 ucontext was opened with
+ *                 MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE and the
+ *                 RESTORE_DYN_UARS records replayed) does the
+ *                 inverse lookup and validates the resolved FW UAR
+ *                 id against qpc.uar_page (which K7 confirms is
+ *                 byte-equal across LOAD).
+ *
+ *   @ece_options  ECE word the source negotiated. Same semantics
+ *                 as mlx5_ib_create_qp.ece_options. 0 on RESET
+ *                 state QPs. The handler stamps mlx5_ib_qp.ece.
+ *
+ * NOTE on size (64 bytes): well above the 8-byte inline-UHW
+ * threshold so the dispatcher always takes the userspace-pointer
+ * path and ib_copy_from_udata() works as expected on x86_64 with
+ * masked-user-access. Same dodge as mlx5_ib_restore_cq_req. The
+ * reserved[] tail reserves slots for future per-QP DEVX-uid hints,
+ * DCI-stream adoption, raw_packet TIRN/TISN adoption, scatter-CQE
+ * adoption, and TYPE_DCT-specific fields without growing the
+ * struct.
+ */
+struct mlx5_ib_restore_qp_req {
+	__aligned_u64 buf_addr;		/* source userspace VA of WQ ring */
+	__aligned_u64 db_addr;		/* source userspace VA of DBR page */
+	__aligned_u64 sq_buf_addr;	/* raw_packet split-SQ; 0 for v0 RC */
+	__u32	qpn;			/* FW qpn to adopt (24 bits) */
+	__u32	sq_wqe_count;		/* same as mlx5_ib_create_qp */
+	__u32	rq_wqe_count;
+	__u32	rq_wqe_shift;
+	__u32	flags;			/* MLX5_QP_FLAG_* bitmask */
+	__u32	uidx;			/* qpc.user_index (24 bits) */
+	__u32	bfreg_index;		/* source BFREG slot for SQ doorbell */
+	__u32	ece_options;
+	__u32	reserved;		/* must be 0 */
+	__u32	reserved2;		/* must be 0; reserves a 32-bit slot
+					 * for future per-QP flags (DCI-stream
+					 * adoption, scatter-CQE adoption,
+					 * tunnel-offload adoption). */
+};
+
 struct mlx5_ib_tso_caps {
 	__u32 max_tso; /* Maximum tso payload size in bytes */
 
