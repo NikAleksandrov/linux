@@ -27,6 +27,17 @@
  *                    libmlx5 introspection from CRIU returns CRIU's
  *                    VAs rather than the dumpee's.
  *
+ *   QUERY_QP         dump-side counterpart to UVERBS_METHOD_RESTORE_QP.
+ *                    Mirror of QUERY_CQ for QP: reads
+ *                    qp->trans_qp.base.{mqp.qpn, ubuffer.umem->address}
+ *                    plus mlx5_ib_db_user_virt(&qp->db) and the
+ *                    WQ-ring shape (sq/rq.wqe_cnt + rq.wqe_shift)
+ *                    that mlx5_ib_restore_qp re-derives buf_size from,
+ *                    packs them into a 64-byte payload byte-equal to
+ *                    mlx5_ib_restore_qp_req, and returns the per-QP
+ *                    inputs RESTORE_QP takes as core attrs (type /
+ *                    state / user_handle / cap / create_flags).
+ *
  * See tools/testing/mlx5_vfmig/design/uar_restore.md for the full
  * design of the per-ucontext save/restore path, including the
  * rationale for living on the uverbs fd vs the /dev/mlx5_vfmig PF
@@ -36,6 +47,7 @@
  * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.2.4 for
  * the QUERY_CQ rationale (why driver-private vs core QUERY_CQ, why
  * the byte-equal payload contract, and the security boundary).
+ * §5.3.4 covers QUERY_QP -- same shape, QP-shaped fields.
  */
 
 #include <rdma/uverbs_ioctl.h>
@@ -814,13 +826,246 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(u32),
 			    UA_MANDATORY));
 
+/*
+ * MLX5_IB_METHOD_VFMIG_QUERY_QP -- emit, for the QP resolved through
+ * UVERBS_OBJECT_QP on the calling fd's ufile, the bytes a CRIU plugin
+ * needs to drive UVERBS_METHOD_RESTORE_QP on the destination side.
+ *
+ * Six-part output:
+ *   RESP_BLOB         struct mlx5_ib_restore_qp_req (64 bytes), byte-
+ *                     equal to what RESTORE_QP's UHW will consume. The
+ *                     handler leaves req.{reserved, reserved2} zero so
+ *                     the restore path's "must be 0" checks pass
+ *                     round-trip. uidx / bfreg_index / ece_options are
+ *                     emitted as sentinels (0 / MLX5_IB_INVALID_BFREG /
+ *                     0) -- the corresponding QPC fields round-trip
+ *                     across LOAD_VHCA_STATE intact (see K7 byte-equal
+ *                     proof, design §6.3 / S6 wider sweep), and the
+ *                     RESTORE_QP handler validates-and-discards them.
+ *   RESP_TYPE         qp->type, the source's mlx5-internal QP type
+ *                     enum (RC/UC/UD only at v0).
+ *   RESP_STATE        qp->state, the source's kernel-tracked QP state
+ *                     (kept live by mlx5_ib_modify_qp).
+ *   RESP_USER_HANDLE  ibqp->uobject->user_handle, the userspace tag
+ *                     ib_uverbs_create_qp recorded at create.
+ *   RESP_CAP          struct ib_uverbs_qp_cap; best-effort echo of the
+ *                     cap that ibv_create_qp returned to the source.
+ *                     mlx5 doesn't track every cap field on user-mode
+ *                     QPs (see mlx5_ib_query_qp); we emit qp->sq.wqe_cnt
+ *                     for max_send_wr, qp->rq.wqe_cnt for max_recv_wr,
+ *                     qp->rq.max_gs for max_recv_sge, qp->max_inline_data
+ *                     for max_inline_data, and 1 for max_send_sge. The
+ *                     mlx5 RESTORE_QP handler doesn't validate cap
+ *                     content (the actual WQ shape comes from the UHW's
+ *                     {sq,rq}_wqe_count); the field is forward-compat
+ *                     surface for a future driver that may consult it.
+ *   RESP_CREATE_FLAGS qp->flags (the IB_QP_CREATE_* mask captured at
+ *                     create time -- same field mlx5_ib_query_qp
+ *                     returns).
+ *
+ * Precondition: the QP must be a user-mode QP whose mlx5_ib representation
+ * lives in trans_qp (RC / UC / UD). Other QP types -- raw_packet (uses
+ * raw_packet_qp; no trans_qp), XRC INI/TGT, GSI, DCT, DCI -- reject
+ * with -EOPNOTSUPP. This mirrors the v0 type set mlx5_ib_restore_qp
+ * accepts. Kernel-mode QPs (no umem) reject with -ENXIO, mirroring
+ * the QUERY_CQ kernel-mode rejection: there are no source userspace
+ * VAs to emit and RESTORE_QP would have nothing to consume.
+ *
+ * The IDR lookup for HANDLE goes through the calling fd's ufile and
+ * grabs UVERBS_ACCESS_READ on the QP uobject for the duration of
+ * the call, so a concurrent DESTROY_QP on the same fd cannot race.
+ */
+static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_qp *ibqp = uverbs_attr_get_obj(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE);
+	struct mlx5_ib_qp *mqp;
+	struct mlx5_ib_qp_base *base;
+	struct mlx5_ib_restore_qp_req blob = {};
+	struct ib_uverbs_qp_cap cap = {};
+	u32 type;
+	u32 state;
+	u64 user_handle;
+	u32 create_flags;
+	int err;
+
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	/*
+	 * v0 type gate: only the IBTA QP types whose mlx5_ib
+	 * representation lives in mlx5_ib_qp.trans_qp. Other types
+	 * (raw_packet uses raw_packet_qp, XRC/GSI/DCT use their own
+	 * union arms) have no trans_qp.base.{mqp.qpn, ubuffer.umem}
+	 * to emit -- and RESTORE_QP rejects them anyway.
+	 */
+	switch (ibqp->qp_type) {
+	case IB_QPT_RC:
+	case IB_QPT_UC:
+	case IB_QPT_UD:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	mqp = to_mqp(ibqp);
+	base = &mqp->trans_qp.base;
+
+	/*
+	 * Reject kernel-mode QPs: no source userspace state to emit.
+	 * trans_qp.base.ubuffer.umem is NULL iff the QP took the
+	 * create_kernel_qp path; mlx5_ib_db_user_virt returns 0 iff
+	 * db->u is the pgdir (kernel) branch of the union. ibqp->uobject
+	 * is non-NULL here by construction (the IDR lookup came through
+	 * the user ufile) but we don't lean on that for clarity.
+	 */
+	if (!base->ubuffer.umem || mlx5_ib_db_user_virt(&mqp->db) == 0)
+		return -ENXIO;
+	if (!ibqp->uobject)
+		return -ENXIO;
+
+	/*
+	 * Fields that round-trip into mlx5_ib_restore_qp_req:
+	 *
+	 *  qpn          -- base->mqp.qpn is a 24-bit FW resource id;
+	 *                  non-zero for any live QP. RESTORE_QP rejects
+	 *                  0 + sentinels with -EINVAL, so emitting our
+	 *                  value here is always restore-acceptable.
+	 *  buf_addr     -- base->ubuffer.umem->address was set verbatim
+	 *                  by ib_umem_get(@ucmd.buf_addr) at create time
+	 *                  via _create_user_qp. That's the source
+	 *                  userspace VA RESTORE_QP needs to look up the
+	 *                  LOAD_VHCA_STATE-installed (KIND_QP, qpn)
+	 *                  placeholder.
+	 *  db_addr      -- mlx5_ib_db_user_virt(&mqp->db) is the page-
+	 *                  aligned doorbell user-virt that
+	 *                  mlx5_ib_db_map_user dedup-keyed on. The byte
+	 *                  offset into the page survives via the FW
+	 *                  qpc.dbr_addr; the page-aligned form is what
+	 *                  the restore-side placeholder lookup keys on.
+	 *  sq_wqe_count -- mqp->sq.wqe_cnt: post-rounding SQ ring depth,
+	 *                  same value the source's
+	 *                  mlx5_ib_create_qp_user.{ucmd}.sq_wqe_count
+	 *                  carried.
+	 *  rq_wqe_count -- mqp->rq.wqe_cnt
+	 *  rq_wqe_shift -- mqp->rq.wqe_shift; RESTORE_QP gates on
+	 *                  rq_wqe_shift in [4, 16] when rq_wqe_count > 0,
+	 *                  so we faithfully echo what the source set.
+	 *  flags        -- mqp->flags_en (MLX5_QP_FLAG_*); the
+	 *                  source-side ucmd.flags that mlx5_ib_create_qp
+	 *                  cached on the QP.
+	 *
+	 * Sentinels for FW-side fields (round-trip via LOAD_VHCA_STATE):
+	 *
+	 *  uidx         -- 0; qpc.user_index is preserved by LOAD,
+	 *                  RESTORE_QP only validates req.uidx & ~0xffffffU.
+	 *  bfreg_index  -- MLX5_IB_INVALID_BFREG; RESTORE_QP forces
+	 *                  qp->bfregn = MLX5_IB_INVALID_BFREG anyway:
+	 *                  the source's UAR mapping is encoded in the
+	 *                  adopted qpc.uar_page, not re-derived from
+	 *                  this UHW field.
+	 *  ece_options  -- 0; FW negotiates ECE per-connection during
+	 *                  MODIFY_QP and the QPC's ece_options round-trip
+	 *                  via LOAD_VHCA_STATE.
+	 *
+	 *  sq_buf_addr  -- 0; raw_packet split-SQ is rejected by the
+	 *                  type gate above. v0 RC/UC/UD share a single
+	 *                  WQ-ring umem (RQ at offset 0, SQ at
+	 *                  rq_wqe_count << rq_wqe_shift).
+	 */
+	blob.buf_addr = base->ubuffer.umem->address;
+	blob.db_addr = mlx5_ib_db_user_virt(&mqp->db);
+	blob.sq_buf_addr = 0;
+	blob.qpn = base->mqp.qpn;
+	blob.sq_wqe_count = mqp->sq.wqe_cnt;
+	blob.rq_wqe_count = mqp->rq.wqe_cnt;
+	blob.rq_wqe_shift = mqp->rq.wqe_shift;
+	blob.flags = mqp->flags_en;
+	blob.uidx = 0;
+	blob.bfreg_index = MLX5_IB_INVALID_BFREG;
+	blob.ece_options = 0;
+
+	type = mqp->type;
+	state = mqp->state;
+	user_handle = ib_qp_user_handle(ibqp);
+	create_flags = mqp->flags;
+
+	/*
+	 * Cap is best-effort: see method comment for the per-field
+	 * derivation. mlx5_ib_query_qp shows that for user-mode QPs
+	 * the kernel doesn't track max_send_wr / max_send_sge (those
+	 * are libmlx5-internal post-rounding values); we emit
+	 * qp->sq.wqe_cnt for max_send_wr (closest kernel echo of the
+	 * post-rounding SQ depth) and 1 for max_send_sge (no kernel
+	 * field; cap on the dispatcher seam is forward-compat surface,
+	 * not a validation gate for the mlx5 RESTORE_QP handler).
+	 */
+	cap.max_send_wr = mqp->sq.wqe_cnt;
+	cap.max_recv_wr = mqp->rq.wqe_cnt;
+	cap.max_send_sge = 1;
+	cap.max_recv_sge = mqp->rq.max_gs;
+	cap.max_inline_data = mqp->max_inline_data;
+
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB, &blob, sizeof(blob));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE, &type, sizeof(type));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE, &state, sizeof(state));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+		&user_handle, sizeof(user_handle));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP, &cap, sizeof(cap));
+	if (err)
+		return err;
+	return uverbs_copy_to(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
+		&create_flags, sizeof(create_flags));
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	MLX5_IB_METHOD_VFMIG_QUERY_QP,
+	UVERBS_ATTR_IDR(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_restore_qp_req),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+			    UVERBS_ATTR_TYPE(u64),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP,
+			    UVERBS_ATTR_TYPE(struct ib_uverbs_qp_cap),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS),
-	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_CQ));
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_CQ),
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_QP));
 
 const struct uapi_definition mlx5_ib_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(MLX5_IB_OBJECT_VFMIG),

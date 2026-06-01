@@ -454,6 +454,98 @@ enum mlx5_ib_vfmig_methods {
 	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.2.4.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_CQ,
+	/*
+	 * QUERY_QP: dump-side counterpart to UVERBS_METHOD_RESTORE_QP.
+	 * Mirror of QUERY_CQ (above): same cross-process motivation
+	 * (CRIU runs in its own address space so mlx5dv_init_obj on
+	 * MLX5DV_OBJ_QP would return CRIU's VAs rather than the
+	 * dumpee's; ibv_import_qp does not exist in upstream rdma-core),
+	 * same security boundary (HANDLE resolves through the calling
+	 * fd's ufile-idr; same "if you can see the ucontext, you can
+	 * read its metadata" model), same byte-equal payload contract
+	 * (RESP_BLOB is byte-equal to mlx5_ib_restore_qp_req so the CRIU
+	 * plugin copies it verbatim into protobuf at dump and feeds it
+	 * back into the UHW tail of UVERBS_METHOD_RESTORE_QP at restore).
+	 *
+	 * Per-QP scalar outs (RESP_TYPE / RESP_STATE / RESP_USER_HANDLE
+	 * / RESP_CAP / RESP_CREATE_FLAGS) carry the inputs RESTORE_QP
+	 * takes as core attrs (not in the UHW blob).
+	 *
+	 * Kernel-side reads:
+	 *
+	 *   qpn         -- mqp.trans_qp.base.mqp.qpn (24-bit FW resource
+	 *                  id; non-zero for any live QP).
+	 *   buf_addr    -- trans_qp.base.ubuffer.umem->address (the
+	 *                  source userspace VA RESTORE_QP needs to look
+	 *                  up the LOAD_VHCA_STATE-installed (KIND_QP,
+	 *                  qpn) placeholder).
+	 *   db_addr     -- mlx5_ib_db_user_virt(&mqp->db) (the page-
+	 *                  aligned DBR-page user-virt; mlx5_ib_db_map_user
+	 *                  dedup-keyed on this).
+	 *   sq_wqe_count / rq_wqe_count / rq_wqe_shift -- mqp->sq.wqe_cnt
+	 *                  / mqp->rq.wqe_cnt / mqp->rq.wqe_shift (the
+	 *                  WQ-ring shape RESTORE_QP's set_user_buf_size-
+	 *                  equivalent arithmetic re-derives buf_size from).
+	 *   flags       -- mqp->flags_en (MLX5_QP_FLAG_* bitmask).
+	 *
+	 * Three of the round-trip UHW fields are FW-side state inside
+	 * the adopted qpc, not mirrored on mlx5_ib_qp; they round-trip
+	 * via LOAD_VHCA_STATE alone (K7 byte-equal proof) and the
+	 * RESTORE_QP handler validates-and-discards them. The dump-side
+	 * verb emits sentinels for them:
+	 *
+	 *   uidx          -- 0 (qpc.user_index is preserved by LOAD;
+	 *                    RESTORE_QP only validates req.uidx & ~0xffffff)
+	 *   bfreg_index   -- MLX5_IB_INVALID_BFREG (RESTORE_QP forces
+	 *                    qp->bfregn = MLX5_IB_INVALID_BFREG anyway:
+	 *                    the source's UAR mapping is encoded in the
+	 *                    adopted qpc.uar_page, not re-derived from
+	 *                    this field)
+	 *   ece_options   -- 0 (FW negotiates ECE per-connection during
+	 *                    MODIFY_QP; the QPC's ece_options round-trip
+	 *                    via LOAD_VHCA_STATE)
+	 *
+	 * Per-QP scalar outs:
+	 *
+	 *   RESP_TYPE         u32, mqp->type (RC/UC/UD only at v0; the
+	 *                     handler rejects RAW_PACKET / XRC / GSI /
+	 *                     DCT/DCI with -EOPNOTSUPP, mirroring
+	 *                     mlx5_ib_restore_qp's switch).
+	 *   RESP_STATE        u32, mqp->state (the kernel-tracked QP
+	 *                     state mlx5_ib_modify_qp updates on every
+	 *                     transition; RESET / INIT / RTR / RTS / ERR
+	 *                     for v0 -- §5.3.1).
+	 *   RESP_USER_HANDLE  u64, ibqp->uobject->user_handle (the
+	 *                     userspace tag the source's
+	 *                     ib_uverbs_create_qp recorded).
+	 *   RESP_CAP          struct ib_uverbs_qp_cap; best-effort echo
+	 *                     of the cap that ibv_create_qp returned to
+	 *                     the source. mlx5_ib_query_qp shows
+	 *                     max_send_wr / max_send_sge are not tracked
+	 *                     for user-mode QPs (only max_recv_wr /
+	 *                     max_recv_sge / max_inline_data are); the
+	 *                     handler emits qp->sq.wqe_cnt for max_send_wr
+	 *                     to give a useful value, qp->rq.wqe_cnt for
+	 *                     max_recv_wr, qp->rq.max_gs for max_recv_sge,
+	 *                     qp->max_inline_data for max_inline_data,
+	 *                     and 1 for max_send_sge (kernel doesn't
+	 *                     track this on user QP). RESTORE_QP's mlx5
+	 *                     handler doesn't validate cap (the actual
+	 *                     WQ shape comes from the UHW's
+	 *                     {sq,rq}_wqe_count); the field is forward-
+	 *                     compat surface area for a future driver
+	 *                     that may consult it.
+	 *   RESP_CREATE_FLAGS u32, mqp->flags (the IB_QP_CREATE_* mask
+	 *                     captured at create time; same field
+	 *                     mlx5_ib_query_qp returns).
+	 *
+	 * Kernel-mode QPs (no udata at create time -- ibqp->uobject == NULL
+	 * or trans_qp.base.ubuffer.umem == NULL) reject with -ENXIO:
+	 * there are no source userspace VAs to emit.
+	 *
+	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.3.4.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_QP,
 };
 
 /*
@@ -502,6 +594,60 @@ enum mlx5_ib_vfmig_query_cq_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,
 	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
 	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
+};
+
+/*
+ * Attrs for MLX5_IB_METHOD_VFMIG_QUERY_QP.
+ *
+ * The HANDLE is resolved via UVERBS_ATTR_IDR(UVERBS_OBJECT_QP,
+ * UVERBS_ACCESS_READ): the calling fd's ufile-idr must own this QP.
+ *
+ * The five RESP_* outs together provide everything UVERBS_METHOD_RESTORE_QP
+ * consumes for an mlx5 QP that was created from userspace:
+ *
+ *   RESP_BLOB         struct mlx5_ib_restore_qp_req (64 bytes; goes
+ *                     verbatim into UVERBS_ATTR_RESTORE_QP_UHW_IN /
+ *                     attrs->driver_udata at restore time). Carries
+ *                     buf_addr, db_addr, sq_buf_addr, qpn,
+ *                     {sq,rq}_wqe_count, rq_wqe_shift, flags, plus
+ *                     uidx / bfreg_index / ece_options (sentinels
+ *                     for the FW-side fields LOAD_VHCA_STATE
+ *                     preserves) and two reserved u32s the handler
+ *                     leaves zero. The byte-equal contract is the
+ *                     v0 design's whole reason for existing -- CRIU
+ *                     plugin code is memcpy in, memcpy out.
+ *
+ *   RESP_TYPE         u32, the source's mqp->type. Goes into
+ *                     UVERBS_ATTR_RESTORE_QP_TYPE. Constrained to
+ *                     RC / UC / UD at v0 (handler -EOPNOTSUPP for
+ *                     RAW_PACKET / XRC / GSI / DCT/DCI).
+ *
+ *   RESP_STATE        u32, the source's mqp->state. Goes into
+ *                     UVERBS_ATTR_RESTORE_QP_STATE.
+ *
+ *   RESP_USER_HANDLE  u64, the source's ibqp->uobject->user_handle.
+ *                     Goes into UVERBS_ATTR_RESTORE_QP_USER_HANDLE.
+ *
+ *   RESP_CAP          struct ib_uverbs_qp_cap; goes into
+ *                     UVERBS_ATTR_RESTORE_QP_CAP. Best-effort echo
+ *                     of the cap ibv_create_qp returned to the
+ *                     source (see method comment for the per-field
+ *                     derivation).
+ *
+ *   RESP_CREATE_FLAGS u32, the source's mqp->flags. Goes into
+ *                     UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS.
+ *
+ * All six (HANDLE + five RESP_*) are MANDATORY: a CRIU plugin that
+ * ignores any of them at dump time will produce an unrestorable image.
+ */
+enum mlx5_ib_vfmig_query_qp_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
 };
 
 /*
