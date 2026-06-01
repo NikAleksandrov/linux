@@ -53,6 +53,7 @@
 #include <rdma/lag.h>
 
 #include "core_priv.h"
+#include "uverbs.h"
 #include <trace/events/rdma_core.h>
 
 static int ib_resolve_eth_dmac(struct ib_device *device,
@@ -1114,6 +1115,35 @@ void __ib_qp_event_handler(struct ib_event *event, void *context)
 		qp->registered_event_handler(event, qp->qp_context);
 }
 EXPORT_SYMBOL(__ib_qp_event_handler);
+
+/*
+ * Read the userspace tag (`user_handle`) the source's
+ * `ib_uverbs_create_qp` recorded on the QP uobject.
+ *
+ * `struct ib_qp.uobject` is typed `struct ib_uqp_object *` (see
+ * include/rdma/ib_verbs.h: the QP uobject embeds an
+ * `ib_uevent_object` rather than a bare `ib_uobject` because of XRC
+ * shared-receive bookkeeping). The `ib_uqp_object` /
+ * `ib_uevent_object` struct definitions live in
+ * `drivers/infiniband/core/uverbs.h` and are intentionally not
+ * exported via the `<rdma/*>` headers, so driver-side code (e.g.
+ * mlx5_ib's vfmig_uctx.c) cannot reach
+ * `qp->uobject->uevent.uobject.user_handle` directly.
+ *
+ * This thin accessor closes that gap with the minimum API surface:
+ * returns the user_handle for a user-mode QP, or 0 for a kernel-
+ * mode QP (which has `qp->uobject == NULL`). Used by mlx5_ib's
+ * `MLX5_IB_METHOD_VFMIG_QUERY_QP` (the dump-side counterpart to
+ * UVERBS_METHOD_RESTORE_QP) to round-trip the source's user_handle
+ * through the CRIU-managed checkpoint / restore cycle.
+ */
+u64 ib_qp_user_handle(const struct ib_qp *qp)
+{
+	if (!qp->uobject)
+		return 0;
+	return qp->uobject->uevent.uobject.user_handle;
+}
+EXPORT_SYMBOL(ib_qp_user_handle);
 
 static void __ib_shared_qp_event_handler(struct ib_event *event, void *context)
 {
