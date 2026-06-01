@@ -22,6 +22,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/cq_restore/cq_restore_probe_rxe		\
 	uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig	\
 	uobject_restore/cq_query/cq_query_probe_mlx5_vfmig	\
+	uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig	\
 	save_load/user_object_replay/user_object_replay_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
@@ -145,6 +146,18 @@ uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig: \
 uobject_restore/cq_query/cq_query_probe_mlx5_vfmig: \
 		uobject_restore/cq_query/cq_query_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
+
+# RESTORE_QP + mlx5_ib_restore_qp S6b end-to-end probe
+# (design/uobject_restore.md §9.1 S6b). Mirrors
+# cq_restore_probe_mlx5_vfmig structurally: libibverbs only for
+# ibdev->uverbs cdev mapping, then raw write/ioctl on the cdev so
+# we can drive MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE in GET_CONTEXT
+# udata, perform the RESTORE_PD + RESTORE_CQ setup chain, then
+# pass struct mlx5_ib_restore_qp_req as the RESTORE_QP UHW blob.
+# All UAPI bits inlined in the probe; libmlx5 has no plumbing.
+uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig: \
+		uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 # user_mr_dma stage-2 success-criterion probe
 # (design/user_mr_dma.md section 6.4). Allocates a configurable set of
