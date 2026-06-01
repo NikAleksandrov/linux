@@ -321,6 +321,93 @@ static int qp_to_rts(struct ibv_qp *qp)
 	return 0;
 }
 
+struct qp_context_emit {
+	uint32_t sq_wqe_count;
+	uint32_t rq_wqe_count;
+	uint32_t rq_wqe_shift;	/* ilog2(rq.stride); 0 for empty RQ */
+	uint64_t buf_addr;	/* user VA of WQ-ring umem base
+				 * (== mlx5dv_qp.rq.buf because libmlx5
+				 * lays out RQ at offset 0 within the
+				 * shared WQ buffer; SQ then follows at
+				 * rq.wqe_cnt << rq_wqe_shift) */
+	uint64_t db_addr;	/* user VA of doorbell record
+				 * (mlx5dv_qp.dbrec) -- not page-aligned;
+				 * the kernel applies & PAGE_MASK on its
+				 * side. Same passthrough rule as the
+				 * CQ DBR */
+};
+
+/*
+ * Capture every QP-create-time userspace-visible field the S6b
+ * RESTORE_QP verb body needs from the source-side mlx5_ib_create_qp
+ * landing -- the WQ-ring umem base address, the doorbell record VA,
+ * and the WQ shape (sq_wqe_count, rq_wqe_count, rq_wqe_shift). The
+ * destination kernel needs:
+ *
+ *   - buf_addr / db_addr to ib_umem_pin from current->mm and rebind
+ *     into the LOAD_VHCA_STATE-replayed (KIND_QP, qpn) and
+ *     (KIND_DBR, dbrec & PAGE_MASK) placeholders inside
+ *     mlx5_ib_restore_qp's ib_umem_pin + mlx5_vfmig_bind_user_qp
+ *     calls.
+ *   - sq_wqe_count / rq_wqe_count / rq_wqe_shift to recompute
+ *     buf_size verbatim and re-populate qp->{sq,rq}.{wqe_cnt,
+ *     wqe_shift,offset} so the destination userspace's WQ
+ *     producer/consumer indices stay in sync with the kernel's
+ *     view of the ring layout.
+ *
+ * mlx5dv_init_obj(MLX5DV_OBJ_QP) reads these out of the libmlx5-
+ * internal struct mlx5_qp -- they are not exposed via stock
+ * libibverbs because they are libmlx5-private layout details (only
+ * libmlx5's own send/recv path consumes them at runtime). For
+ * CRIU R3 they become wire-visible input to RESTORE_QP on the
+ * destination, hence this helper.
+ *
+ * Why rq.buf is the umem base
+ * ---------------------------
+ * libmlx5 lays out a *single* mmap (struct mlx5_buf) shared by
+ * both queues:
+ *     qp->rq.offset = 0
+ *     qp->sq.offset = qp->rq.wqe_cnt << qp->rq.wqe_shift
+ * mlx5dv_init_obj(QP) then sets:
+ *     out->rq.buf = qp->buf.buf + qp->rq.offset    // == qp->buf.buf
+ *     out->sq.buf = qp->buf.buf + qp->sq.offset
+ * so dvqp.rq.buf is the user VA of the shared umem at byte 0,
+ * which is exactly what mlx5_ib_create_qp_user passed into
+ * mlx5_ib_create_qp_v2.buf_addr at create time. Always-true for
+ * RC/UC/UD with rq.wqe_cnt > 0; if a future caller drives a
+ * srq-backed QP with rq.wqe_cnt == 0 the same identity still
+ * holds because libmlx5 keeps the offset at 0 even for a
+ * zero-length RQ.
+ */
+static int extract_qp_context(struct ibv_qp *qp,
+			      struct qp_context_emit *out)
+{
+	struct mlx5dv_qp dvqp = {};
+	struct mlx5dv_obj obj = {
+		.qp = { .in = qp, .out = &dvqp },
+	};
+	int err = mlx5dv_init_obj(&obj, MLX5DV_OBJ_QP);
+	if (err) {
+		fprintf(stderr, "k6: mlx5dv_init_obj(QP) failed: %d\n", err);
+		return -1;
+	}
+	out->sq_wqe_count = dvqp.sq.wqe_cnt;
+	out->rq_wqe_count = dvqp.rq.wqe_cnt;
+	/*
+	 * rq.stride is the byte size of one RQ WQE (typically 16, 32,
+	 * 64). RESTORE_QP's UHW carries the *shift* (the RQ shift the
+	 * source's create_qp caller sent into the kernel). For
+	 * rq.wqe_cnt == 0 mlx5dv reports stride == 0; emit shift 0
+	 * (the kernel ignores rq_wqe_shift when rq is empty -- the
+	 * has_rq predicate is false).
+	 */
+	out->rq_wqe_shift = dvqp.rq.stride ?
+			    (uint32_t)__builtin_ctz(dvqp.rq.stride) : 0;
+	out->buf_addr = (uint64_t)(uintptr_t)dvqp.rq.buf;
+	out->db_addr  = (uint64_t)(uintptr_t)dvqp.dbrec;
+	return 0;
+}
+
 static int extract_srqn(struct ibv_srq *srq, uint32_t *out)
 {
 	/* mlx5dv exposes mlx5dv_obj.srq.out via MLX5DV_OBJ_SRQ. Field
@@ -383,6 +470,7 @@ int main(int argc, char **argv)
 	const size_t mr_len = 4096;
 	uint32_t pdn = 0, qpn = 0, lkey = 0, rkey = 0, srqn = 0;
 	struct cq_context_emit cqc = {};
+	struct qp_context_emit qpc = {};
 	int rc = 1;
 
 	if (argc < 2) {
@@ -497,6 +585,8 @@ int main(int argc, char **argv)
 			goto out;
 		}
 		qpn = qp->qp_num;
+		if (extract_qp_context(qp, &qpc))
+			goto out;
 	}
 
 	{
@@ -598,6 +688,22 @@ int main(int argc, char **argv)
 	printf("cq_buf_addr=0x%016llx\n", (unsigned long long)cqc.buf_addr);
 	printf("cq_db_addr=0x%016llx\n", (unsigned long long)cqc.db_addr);
 	printf("qpn=%u\n", qpn);
+	/*
+	 * sq_wqe_count / rq_wqe_count / rq_wqe_shift / qp_buf_addr /
+	 * qp_db_addr feed the S6b RESTORE_QP verb body on the
+	 * destination side via struct mlx5_ib_restore_qp_req. The
+	 * dispatcher's UVERBS_ATTR_RESTORE_QP_CAP carries the high-
+	 * level cap; the WQ-shape fields below are the libmlx5-
+	 * negotiated layout the destination kernel needs to
+	 * recompute buf_size and re-populate qp->{sq,rq}.
+	 * {wqe_cnt,wqe_shift,offset}. mlx5dv exposes these via
+	 * mlx5dv_init_obj(MLX5DV_OBJ_QP); see extract_qp_context().
+	 */
+	printf("sq_wqe_count=%u\n", qpc.sq_wqe_count);
+	printf("rq_wqe_count=%u\n", qpc.rq_wqe_count);
+	printf("rq_wqe_shift=%u\n", qpc.rq_wqe_shift);
+	printf("qp_buf_addr=0x%016llx\n", (unsigned long long)qpc.buf_addr);
+	printf("qp_db_addr=0x%016llx\n", (unsigned long long)qpc.db_addr);
 	printf("lkey=0x%08x\n", lkey);
 	printf("rkey=0x%08x\n", rkey);
 	printf("mkey_index=%u\n", lkey >> 8);
