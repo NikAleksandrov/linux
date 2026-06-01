@@ -2830,6 +2830,7 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
 	SET_DEVICE_OP(dev_ops, restore_cq);
 	SET_DEVICE_OP(dev_ops, restore_mr);
 	SET_DEVICE_OP(dev_ops, restore_pd);
+	SET_DEVICE_OP(dev_ops, restore_qp);
 	SET_DEVICE_OP(dev_ops, fill_res_pd_entry);
 	SET_DEVICE_OP(dev_ops, set_vf_guid);
 	SET_DEVICE_OP(dev_ops, set_vf_link_state);
