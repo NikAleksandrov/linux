@@ -125,9 +125,11 @@ static const struct nla_policy nldev_policy[RDMA_NLDEV_ATTR_MAX] = {
 	[RDMA_NLDEV_ATTR_RES_QP]		= { .type = NLA_NESTED },
 	[RDMA_NLDEV_ATTR_RES_QP_ENTRY]		= { .type = NLA_NESTED },
 	[RDMA_NLDEV_ATTR_RES_RAW]		= { .type = NLA_BINARY },
+	[RDMA_NLDEV_ATTR_RES_RECV_CQN]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_RKEY]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_RQPN]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_RQ_PSN]		= { .type = NLA_U32 },
+	[RDMA_NLDEV_ATTR_RES_SEND_CQN]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_SQ_PSN]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_SRC_ADDR]		= {
 			.len = sizeof(struct __kernel_sockaddr_storage) },
@@ -557,6 +559,30 @@ static int fill_res_qp_entry(struct sk_buff *msg, bool has_cap_net_admin,
 
 	if (!rdma_is_kernel_res(res) &&
 	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_PDN, qp->pd->res.id))
+		return -EMSGSIZE;
+
+	/*
+	 * SEND_CQN / RECV_CQN: restrack id of the CQs the QP binds.
+	 * Surfaced for userspace dumpers (CRIU) that need to discover
+	 * the QP's CQ dependencies before driving the
+	 * UVERBS_METHOD_RESTORE_QP verb, whose dispatcher requires
+	 * RESTORE_QP_SEND_CQ_HANDLE / RESTORE_QP_RECV_CQ_HANDLE as
+	 * mandatory IDR refs. Kernel-mode QPs are gated out (mirrors
+	 * the existing !rdma_is_kernel_res guards on PDN / HANDLE just
+	 * above); XRC_TGT QPs lack a conventional send_cq and gate out
+	 * naturally on the qp->send_cq != NULL check. The id keys
+	 * into the same restrack id space fill_res_cq_entry's
+	 * RDMA_NLDEV_ATTR_RES_CQN emits, so userspace can join QP
+	 * entries to CQ entries by id-equality.
+	 */
+	if (!rdma_is_kernel_res(res) && qp->send_cq &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_SEND_CQN,
+			qp->send_cq->res.id))
+		return -EMSGSIZE;
+
+	if (!rdma_is_kernel_res(res) && qp->recv_cq &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_RECV_CQN,
+			qp->recv_cq->res.id))
 		return -EMSGSIZE;
 
 	if (!rdma_is_kernel_res(res) &&

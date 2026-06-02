@@ -600,6 +600,40 @@ enum rdma_nldev_attr {
 	RDMA_NLDEV_ATTR_RES_HANDLE,		/* u32 */
 
 	/*
+	 * Restrack id of the send_cq backing a user-mode QP. Mirrors
+	 * the RDMA_NLDEV_ATTR_RES_CQN that fill_res_srq_entry emits
+	 * for SRQ->ext.cq, applied to qp->send_cq->res.id. Surfaced so
+	 * a userspace dumper (e.g. CRIU's mlx5 plugin) can discover
+	 * the SEND_CQ identity that UVERBS_METHOD_RESTORE_QP requires
+	 * via RESTORE_QP_SEND_CQ_HANDLE without an extra dump-side
+	 * verb. The id keys into the same restrack id space the CQ
+	 * RDMA_NLDEV_ATTR_RES_CQN dump emits, so userspace can join
+	 * QP entries to CQ entries by id-equality.
+	 *
+	 * Kernel QPs (those with !res->user) typically still have a
+	 * non-NULL send_cq, but the attr is omitted on the dump side
+	 * for them anyway -- mirrors the !rdma_is_kernel_res() gate on
+	 * RES_PDN / RES_HANDLE further up. XRC_TGT QPs don't have a
+	 * conventional send_cq either (xrc target is sink-only), so
+	 * the attr is also conditional on qp->send_cq != NULL.
+	 *
+	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md
+	 * §S6b B6 / §5.3.4 for the dump-side discovery rationale.
+	 */
+	RDMA_NLDEV_ATTR_RES_SEND_CQN,		/* u32 */
+
+	/*
+	 * Restrack id of the recv_cq backing a user-mode QP. Same
+	 * rationale and gating as RDMA_NLDEV_ATTR_RES_SEND_CQN, applied
+	 * to qp->recv_cq->res.id. Surfaced for the
+	 * RESTORE_QP_RECV_CQ_HANDLE dependency. Often equal to
+	 * RES_SEND_CQN (single-CQ split-completion is the libibverbs
+	 * default) but the dispatcher requires both as distinct IDR
+	 * refs so the dump-side and restore-side carry both ids.
+	 */
+	RDMA_NLDEV_ATTR_RES_RECV_CQN,		/* u32 */
+
+	/*
 	 * Always the end
 	 */
 	RDMA_NLDEV_ATTR_MAX
