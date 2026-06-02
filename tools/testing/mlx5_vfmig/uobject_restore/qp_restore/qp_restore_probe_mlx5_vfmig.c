@@ -1024,29 +1024,39 @@ static void make_good_cap(const struct qp_args *a,
 /*
  * Subtest 1: gate-negative.
  *
- * Open a fresh ucontext WITHOUT MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE.
- * RESTORE_QP requires PD_HANDLE / SEND_CQ_HANDLE / RECV_CQ_HANDLE
- * IDR refs, but the dispatcher consults
- * mlx5_ib_ucontext_is_restore_mode BEFORE trying to resolve them.
- * We pass 0 for those handles -- the gate will fire with -EPERM
- * before the dispatcher gets to the handle resolution, so no
- * setup is needed.
+ * Verify the dispatcher's restore_check_ucontext gate (the
+ * mlx5_ib_ucontext_is_restore_mode predicate) rejects RESTORE_*
+ * verbs on a ucontext that was opened WITHOUT
+ * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE.
+ *
+ * We exercise the gate via RESTORE_PD rather than RESTORE_QP for a
+ * specific reason: RESTORE_QP declares PD_HANDLE / SEND_CQ_HANDLE /
+ * RECV_CQ_HANDLE as UVERBS_ATTR_TYPE_IDR + UA_MANDATORY, which
+ * means the uverbs core's IDR-resolve layer runs BEFORE the
+ * dispatcher and short-circuits with -ENOENT against bogus
+ * (handle=0) refs -- masking the gate's -EPERM. Adding the
+ * machinery to mint real PD/CQ handles on the throwaway ucontext
+ * (do_alloc_pd plus a full do_create_cq UAR/comp_vector dance)
+ * would be a meaningful chunk of code with no extra coverage,
+ * because the restore_check_ucontext helper is *shared* across the
+ * RESTORE_PD / RESTORE_MR / RESTORE_CQ / RESTORE_QP dispatchers.
+ * RESTORE_PD has zero core IDR attrs, so the gate fires
+ * immediately and -EPERM bubbles back up cleanly. A regression in
+ * mlx5_ib_ucontext_is_restore_mode (or in the per-dispatcher
+ * `ret = restore_check_ucontext(...)` call) shows up here.
  */
 static int subtest_gate_negative(const char *cdev_path,
 				 const struct qp_args *a)
 {
 	struct ib_uverbs_get_context_resp resp_core = {};
 	struct mlx5_ib_alloc_ucontext_resp resp_drv = {};
-	struct mlx5_ib_restore_qp_req uhw;
-	struct ib_uverbs_qp_cap cap;
-	uint32_t resp_qpn = 0;
+	struct mlx5_ib_restore_pd_req uhw = {
+		.pdn = a->src_pdn,
+	};
 	int fd, ret;
 	int fails = 0;
 
-	make_good_uhw(a, &uhw);
-	make_good_cap(a, &cap);
-
-	printf("[1] gate: ucontext WITHOUT VFMIG_RESTORE -> RESTORE_QP must -EPERM\n");
+	printf("[1] gate: ucontext WITHOUT VFMIG_RESTORE -> RESTORE_PD must -EPERM\n");
 
 	fd = open(cdev_path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
@@ -1062,21 +1072,17 @@ static int subtest_gate_negative(const char *cdev_path,
 		return 1;
 	}
 
-	ret = do_restore_qp(fd, a->qp_target_handle,
-			    /* pd/cq handles arbitrary; gate fires first */
-			    0, 0, 0,
-			    a->qp_type, a->qp_state, USER_HANDLE_TAG_QP,
-			    &cap, UINT32_MAX, &uhw, &resp_qpn);
+	ret = do_restore_pd(fd, a->pd_target_handle, &uhw);
 	if (ret == -EPERM) {
-		printf("  PASS RESTORE_QP on non-restore-mode ucontext -> -EPERM\n");
+		printf("  PASS RESTORE_PD on non-restore-mode ucontext -> -EPERM\n");
 	} else if (ret == 0) {
 		fprintf(stderr,
-			"  FAIL RESTORE_QP on non-restore-mode ucontext succeeded "
+			"  FAIL RESTORE_PD on non-restore-mode ucontext succeeded "
 			"(security regression: predicate not consulted)\n");
 		fails++;
 	} else {
 		fprintf(stderr,
-			"  FAIL RESTORE_QP on non-restore-mode ucontext -> %s "
+			"  FAIL RESTORE_PD on non-restore-mode ucontext -> %s "
 			"(expected -EPERM)\n", strerror(-ret));
 		fails++;
 	}
