@@ -229,9 +229,14 @@ start_src_probe() {
          < "$fifo_in" > "$fifo_out" 2>&1 &
     SRC_PROBE_PID=$!
     exec 7> "$fifo_in"
+    # Hold fifo_out open as fd 6 across the entire read loop. Per-
+    # iteration `read < $fifo` would close + reopen each cycle,
+    # opening a SIGPIPE race window where the probe's next write
+    # races a reader-less moment and gets killed mid-output.
+    exec 6< "$fifo_out"
 
     local line
-    while IFS= read -r line < "$fifo_out"; do
+    while IFS= read -r line <&6; do
         echo "  [src probe] $line"
         case "$line" in
             READY) return 0 ;;
@@ -250,6 +255,7 @@ start_src_probe() {
 
 quit_src_probe() {
     echo "quit" >&7; exec 7>&-
+    exec 6<&-
     wait "$SRC_PROBE_PID" 2>/dev/null || true
     SRC_PROBE_PID=""
     echo "  [src probe] exited"
@@ -280,9 +286,14 @@ start_dst_probe() {
         < "$fifo_in" > "$fifo_out" 2>&1 &
     DST_PROBE_PID=$!
     exec 8> "$fifo_in"
+    # Hold fifo_out open as fd 5 across the entire read loop. Per-
+    # iteration `read < $fifo` would close + reopen each cycle,
+    # opening a SIGPIPE race window where the probe's next write
+    # races a reader-less moment and gets killed mid-output.
+    exec 5< "$fifo_out"
 
     local line k v
-    while IFS= read -r line < "$fifo_out"; do
+    while IFS= read -r line <&5; do
         echo "  [dst probe] $line"
         case "$line" in
             READY) return 0 ;;
@@ -304,13 +315,14 @@ start_dst_probe() {
 
 quit_dst_probe() {
     echo "quit" >&8; exec 8>&-
-    while IFS= read -r line < "$WORKDIR/dst.out"; do
+    while IFS= read -r line <&5; do
         echo "  [dst probe] $line"
         case "$line" in
             "  FAIL"*) dst_post_quit_fail=1 ;;
             "qp_restore_probe_mlx5_vfmig: PASS"*) dst_overall_pass=1 ;;
         esac
     done
+    exec 5<&-
     if wait "$DST_PROBE_PID"; then
         DST_PROBE_RC=0
     else
