@@ -1474,6 +1474,13 @@ int main(int argc, char **argv)
 	int fails = 0;
 	unsigned long u;
 
+	/* Force line buffering on stdout so harness/log readers see
+	 * subtest progress in real time even if we get SIGKILL'd
+	 * mid-flight. Without this, glibc full-buffers stdout when
+	 * connected to a FIFO and we lose all subtest progress info
+	 * if we hang in a kernel ioctl. */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	if (argc < 16 || argc > 17) {
 		usage(argv[0]);
 		return 2;
