@@ -24,6 +24,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/cq_query/cq_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig	\
 	uobject_restore/qp_query/qp_query_probe_mlx5_vfmig	\
+	uobject_restore/qp_query/qp_nlattr_probe		\
 	save_load/user_object_replay/user_object_replay_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
@@ -172,6 +173,21 @@ uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig: \
 uobject_restore/qp_query/qp_query_probe_mlx5_vfmig: \
 		uobject_restore/qp_query/qp_query_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
+
+# Raw NLDEV netlink dumper for QP + CQ resource entries
+# (design/uobject_restore.md §5.3.4). Validation tool for the
+# RDMA_NLDEV_ATTR_RES_SEND_CQN / _RECV_CQN attrs the QP entry now
+# carries -- iproute2's `rdma resource show qp` predates these ids
+# and silently skips them, so this probe sends a raw
+# RDMA_NLDEV_CMD_RES_QP_GET (and RDMA_NLDEV_CMD_RES_CQ_GET) on a
+# NETLINK_RDMA socket and walks every nested attribute to prove the
+# kernel emits both ids on the wire and that the join-by-id-equality
+# QP -> CQ contract holds. No driver-private deps; uses in-tree
+# rdma-core UAPI ids via -isystem on include/uapi.
+uobject_restore/qp_query/qp_nlattr_probe: \
+		uobject_restore/qp_query/qp_nlattr_probe.c \
+		../../../include/uapi/rdma/rdma_netlink.h
+	$(CC) $(CFLAGS) -isystem ../../../include/uapi -o $@ $<
 
 # user_mr_dma stage-2 success-criterion probe
 # (design/user_mr_dma.md section 6.4). Allocates a configurable set of
