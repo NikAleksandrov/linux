@@ -470,14 +470,17 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_QP)(
 		return ret;
 
 	/*
-	 * v0 QP types: RC, UD. XRC, GSI, RAW_PACKET, DRIVER (DCT/DCI)
-	 * are reserved for later stages with the matching driver-
-	 * private UHW shape.
+	 * v0 QP types: RC, UD. UC is parked at -EOPNOTSUPP until a
+	 * dedicated harness subtest exercises it -- the FW QPC is
+	 * preserved across LOAD identically to RC (no per-type
+	 * special-case in mlx5_ib_restore_qp), so re-enabling is a
+	 * one-line patch + matching qp_restore probe subtest. XRC,
+	 * GSI, RAW_PACKET, DRIVER (DCT/DCI) are reserved for later
+	 * stages with the matching driver-private UHW shape.
 	 */
 	switch (qp_type) {
 	case IB_QPT_RC:
 	case IB_QPT_UD:
-	case IB_QPT_UC:
 		break;
 	default:
 		return -EOPNOTSUPP;

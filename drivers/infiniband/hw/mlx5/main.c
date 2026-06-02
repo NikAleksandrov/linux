@@ -3615,14 +3615,16 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		return -EPERM;
 
 	/*
-	 * v0: only the IBTA QP types whose mlx5_ib representation
-	 * lives in trans_qp (RC, UC, UD). Raw packet, XRC, GSI, DCT/DCI
-	 * are dispatcher-rejected anyway; we additionally guard here
-	 * because driver-direct callers can supply any type.
+	 * v0: RC + UD only. UC's mlx5_ib representation also lives in
+	 * trans_qp, but is parked at the dispatcher gate until a
+	 * qp_restore probe subtest covers it (see
+	 * uverbs_std_types_restore.c restore_qp_dispatcher). Raw
+	 * packet, XRC, GSI, DCT/DCI are dispatcher-rejected anyway; we
+	 * additionally guard here because driver-direct callers can
+	 * supply any type.
 	 */
 	switch (ibqp->qp_type) {
 	case IB_QPT_RC:
-	case IB_QPT_UC:
 	case IB_QPT_UD:
 		break;
 	default:
@@ -3678,7 +3680,18 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	qp->state = qp_state;
 	qp->flags = create_flags;
 	qp->flags_en = req.flags;
-	qp->port = 1;	/* v0: single-port VF */
+	/*
+	 * v0: single-port VF. multi-port VFs would need port to come
+	 * from the inherited qpc.primary_address_path.port field
+	 * (preserved byte-equal across LOAD per K7) instead of the
+	 * hard-coded 1. WARN_ON_ONCE catches the case where someone
+	 * runs CRIU on a multi-port VF before that follow-on work
+	 * lands -- otherwise port-2 traffic would silently get
+	 * stamped as port-1 and the QP would lose its egress
+	 * affinity on the destination.
+	 */
+	WARN_ON_ONCE(ibqp->device->phys_port_cnt > 1);
+	qp->port = 1;
 	/*
 	 * bfregn is a kernel-allocator slot; req.bfreg_index is the
 	 * source's UAR-mapping index (encoded in the adopted
