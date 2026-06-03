@@ -880,4 +880,268 @@ struct mlx5_vfmig_probe_cqn {
 #define MLX5_VFMIG_IOC_PROBE_CQN \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0d, struct mlx5_vfmig_probe_cqn)
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_QP_TEARDOWN:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_PD / PROBE_MKEY /
+ *       PROBE_CQN / PROBE_UID / QUERY_QP, NOT part of the M2/M3
+ *       contract. ***
+ *
+ *   Drives the §S3b "DEVX-adoption blind spot, destroy direction"
+ *   empirical question: "Given a QPC adopted from a DEVX-enabled
+ *   source (qpc owner-uid == src.devx_uid != 0), what does the FW
+ *   actually do when the destination kernel issues DESTROY_QP or
+ *   2RST_QP with a different uid in the IFC uid field?"
+ *
+ *   Background: the existing §S3b matrix in test_pd_adopt.sh only
+ *   probed the CREATE direction (CREATE_MKEY with various uid_hints
+ *   against an adopted PDN). The destroy direction was inferred,
+ *   not measured. The CRIU agent's pd_cq_qp end-to-end repro on
+ *   FW 28.48.1000 surfaced a smoking-gun asymmetry: kernel-side
+ *   mlx5_cmd_exec(DESTROY_QP, uid=0) returns err=0 against a uid=2-
+ *   owned QPC (so destroy_qp_common's mlx5_ib_err diagnostic does
+ *   NOT fire), but the next opcode that propagates a FW errno
+ *   (DEALLOC_PD, in the v0 mitigation chain that opens the dest
+ *   ucontext without DEVX) fails with bad_resource_state syndrome
+ *   0xef0c8a-class -- meaning *something* still pins the PDC after
+ *   the kernel believed the QP was destroyed.
+ *
+ *   This ioctl bracket-tests that scenario directly:
+ *
+ *     1. QUERY_QP(qpn) -- pre-op snapshot. fw_status / fw_syndrome
+ *        from FW; @pre_qpc_state is qpc.state, @pre_qpc_pd is
+ *        qpc.pd. Establishes "the FW QPC exists and has these
+ *        contents at the moment of the test".
+ *
+ *     2. The op being tested:
+ *          @op_mode = MLX5_VFMIG_QP_TEARDOWN_OP_DESTROY (0):
+ *            DESTROY_QP(qpn, uid=@uid_hint).
+ *          @op_mode = MLX5_VFMIG_QP_TEARDOWN_OP_2RST (1):
+ *            MODIFY_QP 2RST(qpn, uid=@uid_hint).
+ *        @op_status / @op_syndrome from FW; for 2RST_QP a non-zero
+ *        FW syndrome with err != 0 is a hard reject; for
+ *        DESTROY_QP a zero @op_status from FW is the "looks like
+ *        success" lane the agent observed -- the bracketing
+ *        QUERY_QP below is what tells us if the QPC actually
+ *        died.
+ *
+ *     3. QUERY_QP(qpn) -- post-op snapshot. The interpretation:
+ *          @post_query_status == 0 => QPC is still alive in FW.
+ *            For op_mode==DESTROY this is the "silent no-op"
+ *            verdict: FW ack'd the destroy but did not destroy.
+ *            For op_mode==2RST this means modify either succeeded
+ *            (and qpc.state should be 0 = RESET) or silently
+ *            no-op'd (qpc.state unchanged).
+ *          @post_query_status != 0 => QUERY_QP rejected. Most
+ *            likely "QPC not found" syndrome class, meaning the
+ *            destroy actually destroyed. Caller decodes
+ *            @post_query_syndrome to be sure.
+ *
+ *   What we deliberately do NOT measure:
+ *     - The QPC owner-uid. Looking at struct mlx5_ifc_qpc_bits the
+ *       FW does not surface the owning uid in the queryable QPC
+ *       (it is FW-internal allocator metadata). Inference about
+ *       cross-uid behaviour comes from "we issued DESTROY/2RST
+ *       with uid=@uid_hint, the QPC was ?provably not? destroyed
+ *       afterwards, and we know what uid the source ucontext had
+ *       allocated this QP under from the harness's dmesg capture".
+ *     - Subsequent FW resource refcount state. Even if QUERY_QP
+ *       reports "QPC gone", the bug surface in the agent's repro
+ *       was a PDC pin that survived the destroy chain. Followup
+ *       PROBE_PD (existing) + DEALLOC_PD attempt (caller-driven)
+ *       checks that.
+ *
+ *   Locking, VF mdev lookup, and cmdif uid all mirror PROBE_PD /
+ *   QUERY_QP / PROBE_UID. The VF mdev's cmdif runs cmdif-uid=0
+ *   (host-privileged); we reach the @uid_hint via the IFC field
+ *   on the destroy/modify/query commands. QUERY_QP itself has no
+ *   uid field on the input (struct mlx5_ifc_query_qp_in_bits
+ *   reserved_at_10 stays 0), so the bracketing queries always run
+ *   under host-priv and observe whatever state the actual op
+ *   produced.
+ *
+ *   Errors: -EFAULT on copy_{from,to}_user; -EINVAL if @vf_id is
+ *   out of range, @qpn or @uid_hint exceed their 24-bit / 16-bit
+ *   ranges, @op_mode is unknown, or any reserved field is non-zero;
+ *   -ENODEV if the VF is unbound or its mdev interface is down;
+ *   any negative kernel/FW err code on cmdif transport failure for
+ *   the bracketing QUERY_QP calls. The op-under-test (destroy or
+ *   modify) does NOT propagate its negative errno: a FW reject is
+ *   recorded in @op_status / @op_syndrome and the call returns 0
+ *   so the caller can see the bracketing query result.
+ */
+enum mlx5_vfmig_qp_teardown_op {
+	MLX5_VFMIG_QP_TEARDOWN_OP_DESTROY = 0,
+	MLX5_VFMIG_QP_TEARDOWN_OP_2RST    = 1,
+};
+
+struct mlx5_vfmig_probe_qp_teardown {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 qpn;			/* in:  FW QP number to test
+					 *      (24 bits significant)
+					 */
+	__u32 uid_hint;			/* in:  uid value to write into the
+					 *      destroy/modify command's IFC
+					 *      uid field (16 bits significant)
+					 */
+	__u32 op_mode;			/* in:  enum mlx5_vfmig_qp_teardown_op:
+					 *      0 = DESTROY_QP (default)
+					 *      1 = MODIFY_QP 2RST
+					 */
+	__u8  reserved_in[16];		/* in:  must be 0 */
+
+	/* pre-op QUERY_QP */
+	__u32 pre_query_status;		/* out: 0 = QPC found pre-op;
+					 *      non-zero = QUERY_QP failed
+					 *      pre-op (QPC missing? FW
+					 *      transport failure?). On
+					 *      pre-query failure the @op
+					 *      step is SKIPPED and @op_*
+					 *      / @post_* are zeroed.
+					 */
+	__u32 pre_query_syndrome;	/* out: FW syndrome if
+					 *      pre-query rejected; 0 on
+					 *      accept.
+					 */
+	__u8  pre_qpc_state;		/* out: qpc.state pre-op
+					 *      (0=RESET 1=INIT 2=RTR
+					 *      3=RTS 4=SQEr 5=SQD
+					 *      6=ERR 9=Suspended 10=SQDC).
+					 *      0 if pre_query_status != 0.
+					 */
+	__u8  reserved_pre[3];		/* out: zeroed */
+	__u32 pre_qpc_pd;		/* out: qpc.pd pre-op (24 bits).
+					 *      0 if pre_query_status != 0.
+					 *      Useful for cross-checking
+					 *      with the source's src_pdn
+					 *      capture before SAVE.
+					 */
+
+	/* the destroy or modify-2RST result */
+	__u32 op_status;		/* out: -ERRNO returned by
+					 *      mlx5_cmd_exec for the op
+					 *      under test (0 = FW ack;
+					 *      < 0 = FW reject converted
+					 *      to errno). Cast through
+					 *      (int).
+					 */
+	__u32 op_syndrome;		/* out: FW syndrome from the op
+					 *      output blob; 0 on FW
+					 *      accept.
+					 */
+
+	/* post-op QUERY_QP */
+	__u32 post_query_status;	/* out: 0 = QPC still alive;
+					 *      non-zero = QUERY_QP
+					 *      rejected (QPC gone if
+					 *      syndrome class is
+					 *      "not found"). The smoking-
+					 *      gun signal for "did the
+					 *      destroy actually destroy?":
+					 *        op_status==0 &&
+					 *        post_query_status==0 ==
+					 *          silent no-op (QPC
+					 *          survived a successful-
+					 *          looking destroy).
+					 *        op_status==0 &&
+					 *        post_query_status!=0 ==
+					 *          destroy worked.
+					 */
+	__u32 post_query_syndrome;	/* out: FW syndrome if post-
+					 *      query rejected; 0 on
+					 *      accept.
+					 */
+	__u8  post_qpc_state;		/* out: qpc.state post-op (only
+					 *      meaningful when
+					 *      post_query_status==0). 0 if
+					 *      QPC gone or pre-query failed.
+					 */
+	__u8  reserved_post[3];		/* out: zeroed */
+	__u8  reserved_out[16];		/* out: zeroed */
+};
+
+#define MLX5_VFMIG_IOC_PROBE_QP_TEARDOWN \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0e, struct mlx5_vfmig_probe_qp_teardown)
+
+/*
+ * MLX5_VFMIG_IOC_PROBE_DEALLOC_PD:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_QP_TEARDOWN, NOT
+ *       part of the M2/M3 contract. ***
+ *
+ *   Drives the §S3b "DEALLOC_PD uid-gating" empirical question:
+ *   "Does FW honor a caller-supplied uid_hint in DEALLOC_PD's
+ *   alloc_pd_in.uid field, or does it gate on the PDC's owning
+ *   uid (the one captured at ALLOC_PD time)?"
+ *
+ *   Background: PROBE_QP_TEARDOWN (ioctl 0x0e) refuted the
+ *   silent-no-op hypothesis on DESTROY_QP / 2RST_QP -- those
+ *   honor the uid_hint and actually destroy / reset uid=src-owned
+ *   QPCs under uid=0 / src_devx / hi_unalloc lanes alike. But the
+ *   CRIU agent's pd_cq_qp end-to-end repro still fails at
+ *   DEALLOC_PD with bad_resource_state syndrome 0xef0c8a-class
+ *   under the v0 mitigation (dest ucontext opened without DEVX,
+ *   so mpd->uid=0 is asserted on the dealloc against a uid=src-
+ *   owned PDC).
+ *
+ *   This ioctl tests DEALLOC_PD's uid semantics in isolation,
+ *   on a dependent-free source-owned PDC (the harness uses a
+ *   PD-only source probe so the PDC has no QP/CQ/MR/SRQ
+ *   dependents). Three cells, one per uid lane:
+ *     uid=0           -- v0 mitigation lane (host-priv claim)
+ *     uid=src_devx    -- speculative kernel-only fix: cache
+ *                        source's devx_uid at restore_pd and
+ *                        assert it on dealloc
+ *     uid=hi_unalloc  -- alternative host-priv bucket from
+ *                        test_pd_adopt's matrix
+ *
+ *   Per cell we report op_status / op_syndrome (FW result of the
+ *   dealloc). PDC existence pre/post is left to the caller via the
+ *   existing MLX5_VFMIG_IOC_PROBE_PD (CREATE_MKEY-acceptance test):
+ *     pre  PROBE_PD(pdn, uid=0)  expected fw_accept=1 (PDC alive)
+ *     PROBE_DEALLOC_PD(pdn, uid_hint)
+ *     post PROBE_PD(pdn, uid=0)  fw_accept=0 (with "unknown PD"
+ *                                syndrome class) means the PDC
+ *                                was actually deallocated.
+ *
+ *   Locking, VF mdev lookup, cmdif uid all mirror PROBE_PD /
+ *   PROBE_QP_TEARDOWN. The VF mdev's cmdif runs cmdif-uid=0
+ *   (host-privileged); we reach the @uid_hint via the IFC field
+ *   on the dealloc command.
+ *
+ *   This ioctl IS destructive on success: a successful dealloc
+ *   removes the source's PDC from the destination VHCA. Use one
+ *   PDC per uid_hint cell (the harness allocates 3 source PDs).
+ *
+ *   Errors: -EFAULT on copy_{from,to}_user; -EINVAL if @vf_id is
+ *   out of range, @pdn or @uid_hint exceed their 24-bit / 16-bit
+ *   ranges, or any reserved field is non-zero; -ENODEV if the VF
+ *   is unbound or its mdev interface is down. The op-under-test
+ *   does NOT propagate its negative errno: a FW reject is
+ *   recorded in @op_status / @op_syndrome and the call returns 0.
+ */
+struct mlx5_vfmig_probe_dealloc_pd {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 pdn;			/* in:  FW pdn to dealloc
+					 *      (24 bits significant)
+					 */
+	__u32 uid_hint;			/* in:  uid value to write into
+					 *      DEALLOC_PD's IFC uid field
+					 *      (16 bits significant)
+					 */
+	__u8  reserved_in[12];		/* in:  must be 0 */
+
+	__u32 op_status;		/* out: -ERRNO returned by
+					 *      mlx5_cmd_exec for DEALLOC_PD
+					 *      (cast through int; 0 = FW
+					 *      ack).
+					 */
+	__u32 op_syndrome;		/* out: FW syndrome from the
+					 *      DEALLOC_PD output blob;
+					 *      0 on FW accept.
+					 */
+	__u8  reserved_out[16];		/* out: zeroed */
+};
+
+#define MLX5_VFMIG_IOC_PROBE_DEALLOC_PD \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0f, struct mlx5_vfmig_probe_dealloc_pd)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

@@ -634,33 +634,52 @@ static int subtest_collision(int fd, uint32_t src_pdn, uint32_t target_handle)
 }
 
 /*
- * Subtest 7: v0 dealloc semantics on a still-loaded VHCA.
+ * Subtest 7: v0 dealloc semantics on a vfmig-restored PD (post-gate).
  *
- * After LOAD_VHCA_STATE the destination FW still holds the *full* set of
- * the source's pdn-rooted dependents (CQ/QP/MR/SRQ). v0 only restores
- * PDs into the kernel ufile; the dependent FW objects have no kernel
- * uobjects yet, so the kernel cannot dealloc them first. Issuing
- * MLX5_CMD_OP_DEALLOC_PD against an FW pdn that still has FW-side
- * dependents must therefore be rejected by firmware -- the FW returns
- * status BAD_RES_STATE (0x9), which cmd_status_to_err maps to -EINVAL.
- * (Dmesg confirms: "DEALLOC_PD(...) ... status bad resource state(0x9),
- * syndrome (0x...), err(-22)".)
+ * Updated 2026-06 -- the previous expectation in this subtest ("FW
+ * must -EINVAL because the pdn has FW dependents") was based on a
+ * model that conflated two distinct FW behaviours; see
+ * tools/testing/mlx5_vfmig/design/pd_registration_wipe.md for the
+ * full investigation that revised the model.
  *
- * That rejection is the *correct* CRIU restore-ordering invariant:
- *   restore PD  ->  restore CQ/QP/MR/SRQ  ->  user destroys QP/MR/CQ/SRQ
- *               ->  user destroys PD  ->  FW DEALLOC_PD succeeds.
+ * Empirical findings (test_dealloc_pd_chain.sh and friends):
+ *   1. After LOAD_VHCA_STATE the destination VHCA's PDN allocator
+ *      preserves its high-water mark (a fresh ALLOC_PD post-LOAD
+ *      returns pdn > src_max_pdn -- no collision risk for fresh
+ *      post-restore allocations).
+ *   2. The (pdn -> owner_uid) registration entries are NOT
+ *      preserved. DEALLOC_PD against a source-restored pdn returns
+ *      status=bad_resource_state(0x9) syndrome=0xef0c8a regardless
+ *      of the asserting uid -- the same shape FW returns for
+ *      definitely-bogus pdns. So the failure is "PDN unknown to
+ *      allocator", NOT "PDC has dependents".
+ *   3. The failure is independent of the source-side CQ/QP being
+ *      present (TEST A in test_dealloc_pd_chain.sh confirmed the
+ *      same syndrome before any DESTROY_QP runs). So the previous
+ *      claim "FW dependents pin the PDC, which is why dealloc
+ *      fails" was incorrect.
  *
- * Because uverbs_destroy_uobject propagates the FW error out of
- * destroy_hw without clearing uobj->object or removing the idr handle,
- * INFO_HANDLES *must* still report target_handle after the failed
- * DEALLOC_PD -- the uobj stays parked in the ufile so a later cascading
- * teardown (once S4..S7 land) can retry.
+ * Mitigation landed in mlx5_ib_dealloc_pd: gate on
+ *   (mpd->vfmig_restored && status == 0x9 && syndrome == 0xef0c8a)
+ * suppresses the FW failure as benign. The kernel-side mpd is
+ * freed by ib_dealloc_pd_user; uverbs removes the handle from the
+ * ufile idr; the FW state is reclaimed at VHCA close (VF unbind),
+ * mirroring the upstream SR-IOV VM-LM contract that resource
+ * cleanup is VHCA-lifecycle-scoped (the host kernel never runs
+ * DEALLOC_PD against migrated PDs in the VM-LM scenario, so FW
+ * never observes this asymmetry there).
  *
- * So subtest 7's v0 PASS criterion is the inverse of an alloc/dealloc
- * round-trip: DEALLOC_PD must -EINVAL AND INFO_HANDLES must still see
- * the handle. We accept -EREMOTEIO and -EBUSY in addition to -EINVAL
- * to stay forward-compatible with FW versions that map "has
- * dependents" to RES_BUSY or surface the raw remote-IO error.
+ * Post-gate v0 PASS criterion:
+ *   - DEALLOC_PD(target_handle) returns 0 (gate suppressed the
+ *     FW failure)
+ *   - INFO_HANDLES(PD) no longer reports target_handle (uobj
+ *     freed by ib_dealloc_pd_user)
+ *
+ * This is the inverse of the pre-gate criterion. If you are
+ * looking at this on a kernel without the gate landed, expect
+ * DEALLOC_PD to return -EINVAL and INFO_HANDLES to still report
+ * the handle -- check that mlx5_ib_dealloc_pd contains the
+ * MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_SYNDROME match.
  */
 static int subtest_destroy_round_trip(int fd, uint32_t target_handle)
 {
@@ -668,28 +687,26 @@ static int subtest_destroy_round_trip(int fd, uint32_t target_handle)
 	uint32_t total = 0;
 	int ret;
 
-	printf("[7] v0 dealloc semantics: DEALLOC_PD(0x%x) on a pdn with FW\n"
-	       "    dependents must fail; INFO_HANDLES must still see it\n",
+	printf("[7] v0 dealloc semantics (post-gate): DEALLOC_PD(0x%x) on a\n"
+	       "    vfmig_restored PD must succeed via the syndrome-gated\n"
+	       "    suppression in mlx5_ib_dealloc_pd; INFO_HANDLES must\n"
+	       "    NOT report it after the dealloc.\n",
 	       target_handle);
 
 	ret = do_dealloc_pd(fd, target_handle);
-	if (ret == 0) {
+	if (ret != 0) {
 		fprintf(stderr,
-			"  FAIL DEALLOC_PD(0x%x) -> 0 (unexpected: pdn should\n"
-			"       still have FW dependents from LOAD_VHCA_STATE;\n"
-			"       FW should have rejected with BAD_RES_STATE)\n",
-			target_handle);
-		return 1;
-	}
-	if (ret != -EINVAL && ret != -EBUSY && ret != -EREMOTEIO) {
-		fprintf(stderr,
-			"  FAIL DEALLOC_PD(0x%x) -> %s (expected -EINVAL /\n"
-			"       -EBUSY / -EREMOTEIO from FW BAD_RES_STATE)\n",
+			"  FAIL DEALLOC_PD(0x%x) -> %s (expected 0 via the\n"
+			"       MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN syndrome\n"
+			"       gate in mlx5_ib_dealloc_pd; check that the\n"
+			"       loaded mlx5_ib has commit landing the gate --\n"
+			"       see design/pd_registration_wipe.md)\n",
 			target_handle, strerror(-ret));
 		return 1;
 	}
-	printf("  PASS DEALLOC_PD(0x%x) -> %s (FW dependents present -- as expected for v0)\n",
-	       target_handle, strerror(-ret));
+	printf("  PASS DEALLOC_PD(0x%x) -> 0 (gate suppressed expected\n"
+	       "       FW status=0x9 syndrome=0xef0c8a; mlx5_ib_dbg in dmesg)\n",
+	       target_handle);
 
 	ret = do_info_handles_pd(fd, list, 64, &total);
 	if (ret) {
@@ -697,14 +714,16 @@ static int subtest_destroy_round_trip(int fd, uint32_t target_handle)
 			strerror(-ret));
 		return 1;
 	}
-	if (!handle_present(list, total, target_handle)) {
+	if (handle_present(list, total, target_handle)) {
 		fprintf(stderr,
-			"  FAIL INFO_HANDLES(PD) lost 0x%x after a FAILED\n"
-			"       DEALLOC_PD (uobj should still be parked)\n",
+			"  FAIL INFO_HANDLES(PD) still reports 0x%x after a\n"
+			"       successful dealloc (uobj should have been freed\n"
+			"       by ib_dealloc_pd_user; check uverbs path is not\n"
+			"       parking the uobj on a 0-return)\n",
 			target_handle);
 		return 1;
 	}
-	printf("  PASS INFO_HANDLES(PD) still reports 0x%x after the failed dealloc\n",
+	printf("  PASS INFO_HANDLES(PD) no longer reports 0x%x (uobj freed)\n",
 	       target_handle);
 	return 0;
 }

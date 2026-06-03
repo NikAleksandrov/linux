@@ -2758,29 +2758,151 @@ static int mlx5_ib_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 		}
 	}
 
-	/*
-	 * vfmig_pd_dbg: TEMPORARY. Emits the FW pdn returned by
-	 * MLX5_CMD_OP_ALLOC_PD against the destination VF, the uid scope
-	 * the alloc ran under, and the udata? bit (user path vs kernel
-	 * internal). Cross-reference with rdma res show pd link <ibdev>
-	 * to see what restrack id was assigned to this same PD; NLDEV
-	 * emits restrack id (res->id) as RDMA_NLDEV_ATTR_RES_PDN -- the
-	 * two are unrelated. Drop with the rest of vfmig_pd_dbg once the
-	 * NLDEV-vs-FW-pdn pipeline confusion is fixed.
-	 */
-	pr_info("vfmig_pd_dbg: alloc_pd ibdev=%s fw_pdn=0x%x uid=%u udata=%d\n",
-		dev_name(&ibdev->dev), pd->pdn, uid, udata ? 1 : 0);
 	return 0;
 }
 
+/*
+ * Empirical "PDN unknown to allocator" syndrome and status returned
+ * by FW for DEALLOC_PD when the PDN was inherited from another VHCA
+ * via LOAD_VHCA_STATE (i.e. the dest VHCA's allocator preserved its
+ * high-water mark but lost the (pdn -> owner_uid) registration
+ * entry). The same status/syndrome combo is also returned for
+ * definitely-bogus pdns -- see test_pdn_highwater.sh and
+ * test_dealloc_pd_chain.sh under tools/testing/mlx5_vfmig.
+ *
+ * Reproduced on FW 28.48.1000 across ConnectX-7. If a future FW
+ * version re-classes this with a different syndrome, mlx5_ib_dbg
+ * will surface the new value at restore-mode dealloc time and the
+ * gate below should be widened to match. The status==0x9 component
+ * (bad_resource_state) is the umbrella class FW uses for PDN/UID
+ * registry misses; the syndrome is the precise sub-classification.
+ */
+#define MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_STATUS	0x9
+#define MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_SYNDROME	0xef0c8a
+
+/*
+ * §S3b "DEALLOC_PD on a vfmig-restored PD" gate.
+ *
+ * Architectural background:
+ *   The destination VHCA's PDN allocator preserves its high-water
+ *   mark across SAVE/LOAD -- a fresh ALLOC_PD post-LOAD returns a
+ *   pdn strictly greater than the source's max_pdn (verified by
+ *   test_pdn_highwater.sh), so the source's PDN slots are reserved
+ *   and there is no collision risk for fresh post-restore allocs.
+ *   But the (pdn -> owner_uid) registration table is NOT preserved
+ *   across SAVE/LOAD. DEALLOC_PD on a source-restored pdn therefore
+ *   returns status=bad_resource_state(0x9) syndrome=0xef0c8a
+ *   regardless of the asserting uid; the same shape FW returns for
+ *   never-allocated bogus pdns. mlx5_ib_restore_pd never issues
+ *   ALLOC_PD on the destination, so from the destination VHCA's
+ *   point of view our DEALLOC_PD really IS asserting "free a pdn
+ *   I never allocated" -- FW's response is correct, our destructor
+ *   path just needs to recognise it as the expected outcome.
+ *
+ *   The same FW limitation exists for the upstream SR-IOV VM-LM
+ *   path through vfio-mlx5: SUSPEND_VHCA / SAVE_VHCA_STATE /
+ *   LOAD_VHCA_STATE / RESUME_VHCA opcode sequence is identical
+ *   between mlx5_vfmig and vfio-mlx5 (drivers/vfio/pci/mlx5/cmd.c).
+ *   It is silent there because the host kernel never has mlx5_ib
+ *   bound to the migrated VF (only vfio-pci), so it never runs
+ *   DEALLOC_PD; only the guest's mlx5_ib does, and any failure
+ *   returns -EINVAL to the guest userspace which typically does
+ *   not check ibv_dealloc_pd return codes. CRIU-on-host is the
+ *   first scenario where a host-resident mlx5_ib observes the
+ *   limitation, because the restored target process drives the
+ *   destructor path through host mlx5_ib directly.
+ *
+ *   The leak budget here is bounded:
+ *     - Per restore: at most N PDN slots, where N is the source's
+ *       PD count at SAVE time (typically a handful).
+ *     - Per VHCA lifetime: the leak does not grow over time --
+ *       fresh post-restore allocations land past the source's
+ *       max_pdn and roundtrip cleanly through DEALLOC_PD.
+ *     - At VHCA close (VF unbind): all FW state is reclaimed
+ *       in one shot, including the source's PDN slots. So the
+ *       leak's effective lifetime is "until the dest target
+ *       process exits and the VF unbinds" -- which is also the
+ *       lifetime of the kernel-side mlx5_ib_pd struct anyway.
+ *
+ * Gate logic (this function):
+ *   1. Always issue DEALLOC_PD via mlx5_cmd_do (the quiet variant of
+ *      mlx5_cmd_exec): -EREMOTEIO on FW status mismatch, no scary
+ *      auto-emitted dev_err. We then read status/syndrome from the
+ *      response blob and decide for ourselves whether to log.
+ *   2. On FW success (err == 0): normal teardown. mpd will be
+ *      freed by ib_dealloc_pd_user.
+ *   3. On FW failure with mpd->vfmig_restored AND the precise
+ *      "PDN unknown to allocator" status/syndrome: emit a single
+ *      mlx5_ib_dbg line explaining the toleration, return 0. mpd
+ *      is freed by ib_dealloc_pd_user; the FW state is reclaimed
+ *      at VHCA close. dmesg stays quiet -- this is the expected
+ *      VFMIG path and operators should not see a "DEALLOC_PD
+ *      failed" message every time a restored process exits.
+ *   4. On any other failure (including a bad_resource_state on
+ *      a NON-restored mpd, which would be a real kernel/FW
+ *      bookkeeping bug): replay through mlx5_cmd_check to get
+ *      the standard mlx5_core error log and errno translation,
+ *      then propagate. uverbs leaves mpd in place; user sees
+ *      -EINVAL/-EIO/etc.
+ *
+ * Future work (covered in the design doc):
+ *   - This gate is a v0 mitigation. The proper fix needs FW-side
+ *     work: either LOAD_VHCA_STATE should additionally restore
+ *     the (pdn -> owner_uid) and (uid -> uctx_attrs) registration
+ *     tables, or FW should expose explicit ADOPT_PD /
+ *     RESTORE_UCTX_REGISTRATION opcodes the dest kernel can call
+ *     from the corresponding restore methods.
+ *   - QPs and CQs do not appear to need the same gate today (the
+ *     QP destroy matrix proved DESTROY_QP works cross-uid and
+ *     CQs do not reference PDs in cqc), but if a similar
+ *     "registration wiped" symptom is found for them, the same
+ *     vfmig_restored bool + syndrome match pattern should be
+ *     applied -- see tools/testing/mlx5_vfmig/design/
+ *     pd_registration_wipe.md "Generalising to QP/CQ".
+ */
 static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 {
 	struct mlx5_ib_dev *mdev = to_mdev(pd->device);
 	struct mlx5_ib_pd *mpd = to_mpd(pd);
+	u32 in[MLX5_ST_SZ_DW(dealloc_pd_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(dealloc_pd_out)] = {};
+	u32 syndrome;
+	u8 status;
+	int err;
 
-	pr_info("vfmig_pd_dbg: dealloc_pd ibdev=%s fw_pdn=0x%x uid=%u restrack_id=0x%x\n",
-		dev_name(&pd->device->dev), mpd->pdn, mpd->uid, pd->res.id);
-	return mlx5_cmd_dealloc_pd(mdev->mdev, mpd->pdn, mpd->uid);
+	MLX5_SET(dealloc_pd_in, in, opcode, MLX5_CMD_OP_DEALLOC_PD);
+	MLX5_SET(dealloc_pd_in, in, pd, mpd->pdn);
+	MLX5_SET(dealloc_pd_in, in, uid, mpd->uid);
+	err = mlx5_cmd_do(mdev->mdev, in, sizeof(in), out, sizeof(out));
+	if (!err)
+		return 0;
+
+	status = MLX5_GET(dealloc_pd_out, out, status);
+	syndrome = MLX5_GET(dealloc_pd_out, out, syndrome);
+
+	if (mpd->vfmig_restored &&
+	    status == MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_STATUS &&
+	    syndrome == MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_SYNDROME) {
+		mlx5_ib_dbg(mdev,
+			    "vfmig: tolerating DEALLOC_PD pdn=0x%x uid=%u: err=%d status=0x%x syndrome=0x%x (PDN registration wiped by LOAD_VHCA_STATE; FW state reclaimed at VHCA close; bounded leak documented in design/pd_registration_wipe.md)\n",
+			    mpd->pdn, mpd->uid, err, status, syndrome);
+		return 0;
+	}
+
+	/*
+	 * Not the gated case: replay through mlx5_cmd_check so the
+	 * standard mlx5_core error log fires (mlx5_cmd_out_err in
+	 * dmesg with full status/syndrome/opcode context) and we get
+	 * the canonical errno translation that callers above us
+	 * expect (mlx5_cmd_exec's normal return -- typically -EINVAL
+	 * for bad_resource_state).
+	 */
+	err = mlx5_cmd_check(mdev->mdev, err, in, out);
+	mlx5_ib_warn(mdev,
+		     "DEALLOC_PD pdn=0x%x uid=%u failed: err=%d status=0x%x syndrome=0x%x vfmig_restored=%d\n",
+		     mpd->pdn, mpd->uid, err, status, syndrome,
+		     mpd->vfmig_restored);
+	return err;
 }
 
 /*
@@ -2959,15 +3081,6 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 	(void)target_handle; /* ufile-handle slot is the dispatcher's job */
 
 	/*
-	 * vfmig_pd_dbg: TEMPORARY. Echoes what CRIU asked the kernel to
-	 * adopt + the destination ucontext's devx_uid scope. Drop with
-	 * the rest of vfmig_pd_dbg once we have an end-to-end clean run.
-	 */
-	pr_info("vfmig_pd_dbg: restore_pd ibdev=%s req_pdn=0x%x target_handle=0x%x devx_uid=%u vfmig_restore_mode=%d\n",
-		dev_name(&ibpd->device->dev), req.pdn, target_handle,
-		context->devx_uid, context->vfmig_restore_mode);
-
-	/*
 	 * Defense-in-depth: confirm the (pdn, uid) the caller wants to
 	 * adopt is actually usable on the destination VHCA before we
 	 * stamp it onto mpd. The probe issues CREATE_MKEY(pdn, uid)
@@ -3034,6 +3147,17 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 
 	pd->pdn = req.pdn;
 	pd->uid = context->devx_uid;
+	/*
+	 * Mark this mpd as a vfmig-restored PD. mlx5_ib_dealloc_pd uses
+	 * this flag to recognise that the (pdn, uid) pair was inherited
+	 * from a SAVE/LOAD blob rather than allocated locally, and that
+	 * an "unknown PDN" syndrome from FW on the eventual DEALLOC_PD
+	 * is the expected/tolerated outcome (FW state is reclaimed at
+	 * VHCA close instead). Setting this is what ties the gate in
+	 * mlx5_ib_dealloc_pd to the §S3b registration-wipe analysis;
+	 * see tools/testing/mlx5_vfmig/design/pd_registration_wipe.md.
+	 */
+	pd->vfmig_restored = true;
 	return 0;
 }
 

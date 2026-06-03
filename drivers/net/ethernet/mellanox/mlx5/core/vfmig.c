@@ -1088,7 +1088,7 @@ out_unlock:
  *
  * Issues a raw FW QUERY_QP(opcode 0x50b) on the bound VF's mdev for
  * the supplied qpn and reports the subset of the QPC needed by the
- * §6.3 piggyback experiment in tools/testing/mlx5_vfmig/design/uobject_restore.md.
+ * ?6.3 piggyback experiment in tools/testing/mlx5_vfmig/design/uobject_restore.md.
  *
  * VF mdev lookup mirrors vfmig_ioc_probe_uid: resolve the VF pci_dev
  * from the PF + vf_id, take device_lock to keep ->driver and drvdata
@@ -1246,11 +1246,11 @@ out_unlock:
 }
 
 /*
- * MLX5_VFMIG_IOC_PROBE_PD handler -- experimental, §S3b empirical.
+ * MLX5_VFMIG_IOC_PROBE_PD handler -- experimental, ?S3b empirical.
  *
  * Issues a transient CREATE_MKEY(uid, pd, access_mode=PA, length64=1)
  * followed by DESTROY_MKEY on the bound VF mdev's cmdif. The whole
- * point is to answer the §S3b question: "can a uid that has no
+ * point is to answer the ?S3b question: "can a uid that has no
  * destination-side ucontext owner still be used by FW to validate a
  * PD reference in a fresh CREATE_MKEY?" If yes (FW accepts), Model A
  * for mlx5_ib_restore_pd is sound: we can build a kernel-side
@@ -1393,11 +1393,11 @@ out_unlock:
 }
 
 /*
- * MLX5_VFMIG_IOC_PROBE_MKEY handler -- experimental, §S4b empirical.
+ * MLX5_VFMIG_IOC_PROBE_MKEY handler -- experimental, ?S4b empirical.
  *
  * Issues a single QUERY_MKEY(mkey_index) on the bound VF mdev's
  * cmdif and -- on FW accept -- reads back the mkc pd / qpn / len /
- * start_addr fields. The whole point is to answer the §S4b
+ * start_addr fields. The whole point is to answer the ?S4b
  * existence question: "Does the source's user-mode MKEY at index N
  * survive LOAD_VHCA_STATE intact, with the same pd/length/iova the
  * source had at SAVE time?" If yes, Model A for mlx5_ib_restore_mr
@@ -1526,13 +1526,13 @@ out_free:
 }
 
 /*
- * MLX5_VFMIG_IOC_PROBE_CQN handler -- experimental, §S5b empirical.
+ * MLX5_VFMIG_IOC_PROBE_CQN handler -- experimental, ?S5b empirical.
  *
  * Issues a single QUERY_CQ(cqn) on the bound VF mdev's cmdif and --
- * on FW accept -- reads back the cqc fields the §S5b byte-equality
+ * on FW accept -- reads back the cqc fields the ?S5b byte-equality
  * assertion checks (status, oi, log_cq_size, log_page_size,
  * page_offset, c_eqn_or_apu_element). The whole point is to answer
- * the §S5b existence question that mr_restore_probe asks for mkeys:
+ * the ?S5b existence question that mr_restore_probe asks for mkeys:
  * "Does the source's user-mode CQ at cqn=N survive LOAD_VHCA_STATE
  * intact, with the same eqn binding and shape parameters the source
  * had at SAVE time?" If yes, Model A for mlx5_ib_restore_cq is sound:
@@ -1672,6 +1672,291 @@ out_unlock:
 	pci_dev_put(vf_pdev);
 out_free:
 	kfree(out);
+	return err;
+}
+
+/*
+ * MLX5_VFMIG_IOC_PROBE_QP_TEARDOWN handler -- experimental, ?S3b
+ * "DEVX-adoption blind spot, destroy direction" empirical.
+ *
+ * Three FW commands per call, on the same VF mdev cmdif:
+ *   1. QUERY_QP(qpn)              -- pre-op snapshot
+ *   2. DESTROY_QP(qpn, uid)       -- @op_mode = OP_DESTROY
+ *      or MODIFY_QP 2RST(qpn, uid) -- @op_mode = OP_2RST
+ *   3. QUERY_QP(qpn)              -- post-op snapshot
+ *
+ * Step 1 establishes "the FW QPC exists at the moment of the test
+ * and looks like this". Step 2 issues the operation under test
+ * with the caller-supplied uid in the IFC field (the field FW
+ * reads for ownership-scope checks). Step 3 -- the smoking gun --
+ * tells us whether the QPC was actually destroyed: a successful
+ * QUERY_QP after a "successful" DESTROY_QP means FW silently
+ * no-op'd the destroy.
+ *
+ * Why a single ioctl: the three commands need to run with no other
+ * cmdif traffic in between (the VF is paused for migration but
+ * other PF-cdev callers exist), and the bracketing needs to hold
+ * device_lock across all three so a concurrent unbind can't pull
+ * the rug. Composing this in userspace would race.
+ *
+ * What this is NOT trying to be: an in-tree consumer of the result.
+ * The caller (test_qp_destroy_uid_matrix.sh) interprets the per-cell
+ * verdict and updates the design doc's matrix. Once the empirical
+ * picture is settled, this ioctl can be removed without breaking
+ * any non-debug consumer.
+ */
+static long vfmig_ioc_probe_qp_teardown(struct mlx5_vfmig_pf *vfmig,
+					void __user *uarg)
+{
+	u32 q_in[MLX5_ST_SZ_DW(query_qp_in)] = {};
+	u32 q_out[MLX5_ST_SZ_DW(query_qp_out)];
+	u32 d_in[MLX5_ST_SZ_DW(destroy_qp_in)] = {};
+	u32 d_out[MLX5_ST_SZ_DW(destroy_qp_out)] = {};
+	u32 r_in[MLX5_ST_SZ_DW(qp_2rst_in)] = {};
+	u32 r_out[MLX5_ST_SZ_DW(qp_2rst_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_qp_teardown arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	void *qpc;
+	int err, op_err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (memchr_inv(arg.reserved_in, 0, sizeof(arg.reserved_in)))
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.qpn & 0xff000000)		/* qpn is 24 bits */
+		return -EINVAL;
+	if (arg.uid_hint & 0xffff0000)		/* uid is 16 bits */
+		return -EINVAL;
+	if (arg.op_mode != MLX5_VFMIG_QP_TEARDOWN_OP_DESTROY &&
+	    arg.op_mode != MLX5_VFMIG_QP_TEARDOWN_OP_2RST)
+		return -EINVAL;
+
+	/*
+	 * Zero all output fields up-front so partial-fill paths (e.g.
+	 * pre-query failure -> we skip op + post-query) don't leak
+	 * stack contents to userspace.
+	 */
+	arg.pre_query_status = 0;
+	arg.pre_query_syndrome = 0;
+	arg.pre_qpc_state = 0;
+	memset(arg.reserved_pre, 0, sizeof(arg.reserved_pre));
+	arg.pre_qpc_pd = 0;
+	arg.op_status = 0;
+	arg.op_syndrome = 0;
+	arg.post_query_status = 0;
+	arg.post_query_syndrome = 0;
+	arg.post_qpc_state = 0;
+	memset(arg.reserved_post, 0, sizeof(arg.reserved_post));
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_qp_teardown: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_qp_teardown: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	/* ---- Step 1: pre-op QUERY_QP ---- */
+	memset(q_out, 0, sizeof(q_out));
+	MLX5_SET(query_qp_in, q_in, opcode, MLX5_CMD_OP_QUERY_QP);
+	MLX5_SET(query_qp_in, q_in, qpn, arg.qpn);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.pre_query_status = (u32)(int)err;
+		arg.pre_query_syndrome = MLX5_GET(query_qp_out, q_out,
+						  syndrome);
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: probe_qp_teardown: vf %u qpn 0x%x pre QUERY_QP err %d syndrome 0x%x -- skipping op + post-query\n",
+			      arg.vf_id, arg.qpn, err,
+			      arg.pre_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+	qpc = MLX5_ADDR_OF(query_qp_out, q_out, qpc);
+	arg.pre_qpc_state = MLX5_GET(qpc, qpc, state);
+	arg.pre_qpc_pd    = MLX5_GET(qpc, qpc, pd);
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: probe_qp_teardown: vf %u qpn 0x%x pre-op state=%u pd=0x%x\n",
+		      arg.vf_id, arg.qpn, arg.pre_qpc_state, arg.pre_qpc_pd);
+
+	/* ---- Step 2: the op under test ---- */
+	if (arg.op_mode == MLX5_VFMIG_QP_TEARDOWN_OP_DESTROY) {
+		MLX5_SET(destroy_qp_in, d_in, opcode, MLX5_CMD_OP_DESTROY_QP);
+		MLX5_SET(destroy_qp_in, d_in, qpn, arg.qpn);
+		MLX5_SET(destroy_qp_in, d_in, uid, arg.uid_hint);
+		op_err = mlx5_cmd_exec(vf_mdev, d_in, sizeof(d_in),
+				       d_out, sizeof(d_out));
+		arg.op_syndrome = MLX5_GET(destroy_qp_out, d_out, syndrome);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: probe_qp_teardown: vf %u qpn 0x%x DESTROY_QP(uid=0x%x) -> err=%d syndrome=0x%x\n",
+			       arg.vf_id, arg.qpn, arg.uid_hint, op_err,
+			       arg.op_syndrome);
+	} else {
+		/* MLX5_VFMIG_QP_TEARDOWN_OP_2RST */
+		MLX5_SET(qp_2rst_in, r_in, opcode, MLX5_CMD_OP_2RST_QP);
+		MLX5_SET(qp_2rst_in, r_in, qpn, arg.qpn);
+		MLX5_SET(qp_2rst_in, r_in, uid, arg.uid_hint);
+		op_err = mlx5_cmd_exec(vf_mdev, r_in, sizeof(r_in),
+				       r_out, sizeof(r_out));
+		arg.op_syndrome = MLX5_GET(qp_2rst_out, r_out, syndrome);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: probe_qp_teardown: vf %u qpn 0x%x 2RST_QP(uid=0x%x) -> err=%d syndrome=0x%x\n",
+			       arg.vf_id, arg.qpn, arg.uid_hint, op_err,
+			       arg.op_syndrome);
+	}
+	arg.op_status = (u32)op_err;	/* zero on FW accept; cast through int */
+
+	/* ---- Step 3: post-op QUERY_QP ---- */
+	memset(q_out, 0, sizeof(q_out));
+	memset(q_in, 0, sizeof(q_in));
+	MLX5_SET(query_qp_in, q_in, opcode, MLX5_CMD_OP_QUERY_QP);
+	MLX5_SET(query_qp_in, q_in, qpn, arg.qpn);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.post_query_status = (u32)(int)err;
+		arg.post_query_syndrome = MLX5_GET(query_qp_out, q_out,
+						   syndrome);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: probe_qp_teardown: vf %u qpn 0x%x post QUERY_QP err %d syndrome 0x%x (QPC likely destroyed)\n",
+			       arg.vf_id, arg.qpn, err,
+			       arg.post_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+	qpc = MLX5_ADDR_OF(query_qp_out, q_out, qpc);
+	arg.post_qpc_state = MLX5_GET(qpc, qpc, state);
+	mlx5_core_info(pf_mdev,
+		       "vfmig: probe_qp_teardown: vf %u qpn 0x%x post-op QPC ALIVE state=%u (op_mode=%u uid_hint=0x%x op_status=0x%x op_syndrome=0x%x)\n",
+		       arg.vf_id, arg.qpn, arg.post_qpc_state,
+		       arg.op_mode, arg.uid_hint,
+		       arg.op_status, arg.op_syndrome);
+
+out_copy:
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
+/*
+ * MLX5_VFMIG_IOC_PROBE_DEALLOC_PD handler -- experimental, ?S3b
+ * "DEALLOC_PD uid-gating" empirical (follow-up to PROBE_QP_TEARDOWN).
+ *
+ * Issues DEALLOC_PD(pdn=@pdn, uid=@uid_hint) on the bound VF mdev's
+ * cmdif and reports the FW result. Unlike PROBE_PD (which is non-
+ * destructive), this ioctl IS destructive on success: a uid-accepted
+ * dealloc removes the source's PDC from the destination VHCA. Use
+ * one source PDC per uid_hint cell.
+ *
+ * No bracketing query opcode exists for PDs (FW has no QUERY_PD),
+ * so PDC existence pre/post is left to the caller via PROBE_PD's
+ * CREATE_MKEY-acceptance test. The harness does this composition.
+ *
+ * Locking, VF mdev lookup, cmdif uid: same shape as PROBE_PD /
+ * PROBE_QP_TEARDOWN.
+ */
+static long vfmig_ioc_probe_dealloc_pd(struct mlx5_vfmig_pf *vfmig,
+				       void __user *uarg)
+{
+	u32 in[MLX5_ST_SZ_DW(dealloc_pd_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(dealloc_pd_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_dealloc_pd arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	int err, op_err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (memchr_inv(arg.reserved_in, 0, sizeof(arg.reserved_in)))
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.pdn & 0xff000000)		/* pdn is 24 bits */
+		return -EINVAL;
+	if (arg.uid_hint & 0xffff0000)		/* uid is 16 bits */
+		return -EINVAL;
+
+	arg.op_status = 0;
+	arg.op_syndrome = 0;
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_dealloc_pd: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_dealloc_pd: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	MLX5_SET(dealloc_pd_in, in, opcode, MLX5_CMD_OP_DEALLOC_PD);
+	MLX5_SET(dealloc_pd_in, in, uid, arg.uid_hint);
+	MLX5_SET(dealloc_pd_in, in, pd, arg.pdn);
+
+	op_err = mlx5_cmd_exec(vf_mdev, in, sizeof(in), out, sizeof(out));
+	arg.op_syndrome = MLX5_GET(dealloc_pd_out, out, syndrome);
+	arg.op_status = (u32)op_err;
+
+	mlx5_core_info(pf_mdev,
+		       "vfmig: probe_dealloc_pd: vf %u pdn 0x%x DEALLOC_PD(uid=0x%x) -> err=%d syndrome=0x%x\n",
+		       arg.vf_id, arg.pdn, arg.uid_hint, op_err,
+		       arg.op_syndrome);
+
+	if (copy_to_user(uarg, &arg, sizeof(arg))) {
+		err = -EFAULT;
+		goto out_unlock;
+	}
+	err = 0;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
 	return err;
 }
 
@@ -4425,6 +4710,12 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case MLX5_VFMIG_IOC_PROBE_CQN:
 		ret = vfmig_ioc_probe_cqn(vfmig, uarg);
 		break;
+	case MLX5_VFMIG_IOC_PROBE_QP_TEARDOWN:
+		ret = vfmig_ioc_probe_qp_teardown(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_PROBE_DEALLOC_PD:
+		ret = vfmig_ioc_probe_dealloc_pd(vfmig, uarg);
+		break;
 	default:
 		ret = -ENOTTY;
 		break;
@@ -4855,7 +5146,7 @@ EXPORT_SYMBOL(mlx5_vfmig_bind_user_dbr);
  *     The destination's Stage-3 bind path needs a stable key that
  *     spans the SAVE -> LOAD boundary; mlx5_ib_db_map_user already
  *     dedups on (mm, user_virt & PAGE_MASK), so we lean on that key.
- *     user_mr_dma.md §6.3 + §A.E.
+ *     user_mr_dma.md ?6.3 + ?A.E.
  *
  *   - The shape is always one PAGE_SIZE entry per doorbell page (the
  *     allocator only ever maps single pages via ib_umem_get(..,
@@ -5567,7 +5858,7 @@ void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev)
  * Drop any per-VF deterministic IOVA domains. Mirror image of
  * vfmig_pf_drop_pending_loads_locked() but for vfs_ctx[].vfmig_iova_dom.
  *
- * Ordering contract (CRITICAL — get this wrong and you get a UAF in
+ * Ordering contract (CRITICAL ? get this wrong and you get a UAF in
  * vfmig_iova_free_slot on teardown):
  *
  *   The IOVA domain MUST outlive every code path on the VF side that

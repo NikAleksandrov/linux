@@ -458,6 +458,7 @@ int main(int argc, char **argv)
 	const char *ibdev_name;
 	int post_recv_wrs = 0;
 	enum k6_qp_state target_state = K6_QPS_RESET;
+	int pd_only = 0;
 	const uint8_t port = 1;
 	struct ibv_device *dev;
 	struct ibv_context *ctx = NULL;
@@ -477,7 +478,8 @@ int main(int argc, char **argv)
 		fprintf(stderr,
 			"usage: %s <ibdev> "
 			"[--qp-state {RESET|INIT|RTR|RTS}] "
-			"[--post-recv-wrs N]\n",
+			"[--post-recv-wrs N] "
+			"[--pd-only]\n",
 			argv[0]);
 		return 2;
 	}
@@ -495,6 +497,16 @@ int main(int argc, char **argv)
 					argv[i]);
 				return 2;
 			}
+		} else if (!strcmp(argv[i], "--pd-only")) {
+			/*
+			 * §S3b DEALLOC_PD uid-gating probe: skip CQ /
+			 * QP / MR / SRQ creation so the PDC has zero
+			 * dependents at SAVE time. Lets the destination-
+			 * side PROBE_DEALLOC_PD test FW's uid semantics
+			 * in isolation, with no "PD has dependents"
+			 * confound.
+			 */
+			pd_only = 1;
 		} else {
 			fprintf(stderr, "k6: unknown arg '%s'\n", argv[i]);
 			return 2;
@@ -529,6 +541,35 @@ int main(int argc, char **argv)
 	}
 	if (extract_pdn(pd, &pdn))
 		goto out;
+
+	if (pd_only) {
+		/*
+		 * Skip CQ / QP / MR / SRQ. The harness still wants
+		 * a READY-followed-by-key=value manifest; emit pdn
+		 * + sentinels so existing capture loops keep working.
+		 */
+		printf("ibdev=%s\n", ibdev_name);
+		printf("pdn=%u\n", pdn);
+		printf("cqn=SKIPPED\n");
+		printf("qpn=SKIPPED\n");
+		printf("lkey=SKIPPED\n");
+		printf("rkey=SKIPPED\n");
+		printf("mkey_index=SKIPPED\n");
+		printf("srqn=SKIPPED\n");
+		printf("qp_state=PD_ONLY\n");
+		printf("READY\n");
+		fflush(stdout);
+
+		{
+			char line[64];
+			while (fgets(line, sizeof(line), stdin)) {
+				if (!strncmp(line, "quit", 4))
+					break;
+			}
+		}
+		rc = 0;
+		goto out;
+	}
 
 	cq = ibv_create_cq(ctx, 16, NULL, NULL, 0);
 	if (!cq) {

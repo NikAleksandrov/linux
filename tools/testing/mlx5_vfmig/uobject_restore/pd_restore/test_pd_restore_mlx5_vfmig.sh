@@ -50,11 +50,17 @@
 #            here means a single integrated test covers both the
 #            ABI + FW dimensions.
 #   Phase H  Tell the probe to "quit", which triggers subtest 7
-#            (v0 dealloc semantics: DEALLOC_PD on the adopted PD
-#            must -EINVAL because LOAD_VHCA_STATE also carried over
-#            the source's pdn-rooted CQ/QP/MR/SRQ and v0 has not
-#            yet restored kernel uobjects for those). Wait for the
-#            probe to exit 0.
+#            (v0 dealloc semantics, post-gate: DEALLOC_PD on the
+#            adopted PD must succeed (return 0) because the
+#            mlx5_ib_dealloc_pd gate suppresses the expected FW
+#            failure -- status=0x9 syndrome=0xef0c8a, "PDN unknown
+#            to allocator", caused by LOAD_VHCA_STATE not preserving
+#            the (pdn -> owner_uid) registration table. INFO_HANDLES
+#            must NOT report the handle afterwards (uobj freed). See
+#            tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+#            for the full empirical investigation that revised this
+#            subtest's expected behaviour.). Wait for the probe to
+#            exit 0.
 #   Phase I  Verdict + manifest.
 #
 # Usage:
@@ -359,14 +365,20 @@ echo
 echo "================ Phase H: v0 dealloc semantics ======="
 echo "Tell the probe to quit; it will run subtest 7."
 echo
-echo "In v0 only PDs have kernel uobjects -- the source's CQ/QP/MR/SRQ"
-echo "still live in FW (carried over by LOAD_VHCA_STATE) and depend on"
-echo "pdn=$src_pdn. The kernel cannot dealloc them first, so FW must"
-echo "reject DEALLOC_PD with BAD_RES_STATE (-EINVAL). The uobj stays"
-echo "parked in the ufile so a future RESTORE_CQ/MR/QP/SRQ cascade"
-echo "(S4..S7) can drain it. This is the correct CRIU restore-ordering"
-echo "invariant; subtest 7 PASSes when the dealloc fails AND the handle"
-echo "is still in INFO_HANDLES."
+echo "DEALLOC_PD on a vfmig_restored PD will fail at FW with the"
+echo "expected status=0x9 syndrome=0xef0c8a (PDN unknown to allocator,"
+echo "because LOAD_VHCA_STATE preserves the per-VHCA PDN-allocator"
+echo "high-water mark but not the (pdn -> owner_uid) registration"
+echo "table). The mlx5_ib_dealloc_pd gate recognises this exact"
+echo "(status, syndrome, mpd->vfmig_restored) tuple and suppresses"
+echo "the failure as benign: kernel returns 0, ib_dealloc_pd_user"
+echo "frees the kernel mpd, INFO_HANDLES no longer reports it. FW"
+echo "state for the source's PDN slot is reclaimed at VHCA close"
+echo "(VF unbind), bounded leak documented in"
+echo "  tools/testing/mlx5_vfmig/design/pd_registration_wipe.md."
+echo
+echo "Subtest 7 PASSes when DEALLOC_PD returns 0 AND INFO_HANDLES"
+echo "no longer reports the handle."
 quit_dst_probe
 
 # --- verdict --------------------------------------------------------
@@ -397,10 +409,15 @@ if [ "${DST_PROBE_RC:-1}" = 0 ] \
    && [ "$fw_ok" = 1 ]; then
     echo "  PASS  RESTORE_PD landed on $DST_IBDEV @ handle $TARGET_HANDLE,"
     echo "        adopted pdn $src_pdn, FW accepts CREATE_MKEY referencing"
-    echo "        it, and DEALLOC_PD correctly fails on the orphan PD with"
-    echo "        FW BAD_RES_STATE (subtest 7's v0 expectation). The full"
-    echo "        teardown cascade unlocks once S4..S7 land. mlx5_ib_restore_pd"
-    echo "        is functional for the v0 critical path."
+    echo "        it, and DEALLOC_PD round-trips cleanly via the"
+    echo "        mlx5_ib_dealloc_pd vfmig_restored+syndrome gate"
+    echo "        (subtest 7's post-gate expectation). The kernel-side"
+    echo "        teardown completes regardless of S4..S7 landing because"
+    echo "        the gate is independent of dependent FW resources --"
+    echo "        FW state is reclaimed at VHCA close (VF unbind)."
+    echo "        mlx5_ib_restore_pd + the gate are functional for the v0"
+    echo "        critical path. See design/pd_registration_wipe.md for the"
+    echo "        leak-budget analysis."
 else
     echo "  FAIL  see the per-subtest log above. Common causes:"
     echo "        - kernel not running C3+C4 (rebuild + reboot needed)"

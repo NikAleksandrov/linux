@@ -304,6 +304,137 @@ static int do_probe_cqn(int fd, unsigned int vf_id, unsigned int cqn)
 }
 
 /*
+ * EXPERIMENTAL: §S3b "destroy direction" probe -- bracket-tests the
+ * FW behaviour when DESTROY_QP / 2RST_QP is issued under a uid_hint
+ * that may or may not match the QPC's owning uid. Three FW commands
+ * per call (QUERY_QP -> destroy/2RST -> QUERY_QP) so the caller can
+ * tell whether the operation actually destroyed the QPC, or merely
+ * silently no-op'd.
+ *
+ * Output format: one key=value per line so the harness can capture
+ * each cell into a uid-lane x op-mode matrix.
+ */
+static int do_probe_qp_teardown(int fd, unsigned int vf_id,
+				unsigned int qpn,
+				unsigned int uid_hint,
+				unsigned int op_mode)
+{
+	struct mlx5_vfmig_probe_qp_teardown arg = {
+		.vf_id    = vf_id,
+		.qpn      = qpn,
+		.uid_hint = uid_hint,
+		.op_mode  = op_mode,
+	};
+	const char *op_name;
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_QP_TEARDOWN, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(PROBE_QP_TEARDOWN requires the VF mdev "
+				"to be interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"PROBE_QP_TEARDOWN: invalid arg "
+				"(vf_id=%u qpn=0x%x uid_hint=0x%x "
+				"op_mode=%u). qpn 24 bits, uid 16 bits, "
+				"op_mode 0 (DESTROY) or 1 (2RST).\n",
+				vf_id, qpn, uid_hint, op_mode);
+		else
+			perror("PROBE_QP_TEARDOWN");
+		return 1;
+	}
+
+	op_name = (op_mode == MLX5_VFMIG_QP_TEARDOWN_OP_DESTROY) ?
+		  "DESTROY_QP" : "2RST_QP";
+
+	printf("vf_id=%u\n", vf_id);
+	printf("qpn=0x%06x\n", qpn);
+	printf("uid_hint=0x%04x\n", uid_hint);
+	printf("op_mode=%u\n", op_mode);
+	printf("op_name=%s\n", op_name);
+
+	printf("pre_query_status=0x%08x\n", arg.pre_query_status);
+	printf("pre_query_syndrome=0x%08x\n", arg.pre_query_syndrome);
+	printf("pre_query_accept=%u\n",
+	       arg.pre_query_status == 0 ? 1 : 0);
+	printf("pre_qpc_state=%u\n", arg.pre_qpc_state);
+	printf("pre_qpc_pd=0x%06x\n", arg.pre_qpc_pd);
+
+	printf("op_status=0x%08x\n", arg.op_status);
+	printf("op_syndrome=0x%08x\n", arg.op_syndrome);
+	/*
+	 * op_status is the (cast through int) errno from
+	 * mlx5_cmd_exec; treat 0 as the FW-accept lane the caller
+	 * wants to interpret. Cast back to int for the boolean.
+	 */
+	printf("op_accept=%u\n",
+	       ((int)arg.op_status == 0 && arg.op_syndrome == 0) ? 1 : 0);
+
+	printf("post_query_status=0x%08x\n", arg.post_query_status);
+	printf("post_query_syndrome=0x%08x\n", arg.post_query_syndrome);
+	printf("post_query_accept=%u\n",
+	       arg.post_query_status == 0 ? 1 : 0);
+	printf("post_qpc_state=%u\n", arg.post_qpc_state);
+
+	/*
+	 * Combined verdict for the smoking-gun check the harness wants:
+	 *   qpc_alive_after_op = post_query_status == 0
+	 * == "FW QPC is still queryable after the destroy/2RST".
+	 *
+	 * For DESTROY: qpc_alive_after_op==1 means silent-no-op.
+	 * For 2RST: qpc_alive_after_op==1 always (RESET QPC is not
+	 *           destroyed). Caller checks post_qpc_state ==
+	 *           pre_qpc_state to detect "modify silently no-op'd".
+	 */
+	printf("qpc_alive_after_op=%u\n",
+	       arg.post_query_status == 0 ? 1 : 0);
+	return 0;
+}
+
+/*
+ * EXPERIMENTAL: §S3b "DEALLOC_PD uid-gating" probe -- issues
+ * DEALLOC_PD(pdn, uid_hint) on the bound VF mdev's cmdif and
+ * reports the FW result. Destructive on success; the harness pairs
+ * each call with PROBE_PD before/after to confirm whether the PDC
+ * was actually deallocated.
+ */
+static int do_probe_dealloc_pd(int fd, unsigned int vf_id,
+			       unsigned int pdn, unsigned int uid_hint)
+{
+	struct mlx5_vfmig_probe_dealloc_pd arg = {
+		.vf_id    = vf_id,
+		.pdn      = pdn,
+		.uid_hint = uid_hint,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_DEALLOC_PD, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(PROBE_DEALLOC_PD requires the VF mdev "
+				"to be interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"PROBE_DEALLOC_PD: invalid arg "
+				"(vf_id=%u pdn=0x%x uid_hint=0x%x). "
+				"pdn 24 bits, uid 16 bits.\n",
+				vf_id, pdn, uid_hint);
+		else
+			perror("PROBE_DEALLOC_PD");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("pdn=0x%06x\n", pdn);
+	printf("uid_hint=0x%04x\n", uid_hint);
+	printf("op_status=0x%08x\n", arg.op_status);
+	printf("op_syndrome=0x%08x\n", arg.op_syndrome);
+	printf("op_accept=%u\n",
+	       ((int)arg.op_status == 0 && arg.op_syndrome == 0) ? 1 : 0);
+	return 0;
+}
+
+/*
  * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND CLI wrapper. user_mr_dma
  * stage-2 success-criterion accessor: post-LOAD, asks the PF how
  * many awaiting_bind placeholders landed in the VF's
@@ -683,6 +814,11 @@ static void usage(const char *argv0)
 		"  probe_pd          <vf_id> <pdn> [<uid_hint=0>]  (experimental)\n"
 		"  probe_mkey        <vf_id> <mkey_index>  (experimental)\n"
 		"  probe_cqn         <vf_id> <cqn>  (experimental)\n"
+		"  probe_qp_teardown <vf_id> <qpn> <uid_hint> <op_mode>\n"
+		"                    op_mode: 0 = DESTROY_QP, 1 = MODIFY_QP 2RST\n"
+		"                    (experimental, §S3b destroy-direction probe)\n"
+		"  probe_dealloc_pd  <vf_id> <pdn> <uid_hint>\n"
+		"                    (experimental, §S3b DEALLOC_PD uid-gating probe)\n"
 		"  query_awaiting_bind <vf_id>  (user_mr_dma stage-2)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
@@ -784,6 +920,21 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_probe_cqn(fd, strtoul(argv[3], NULL, 0),
 				   strtoul(argv[4], NULL, 0));
+	} else if (verb_eq(verb, "probe_qp_teardown")) {
+		if (argc != 7)
+			goto badargs;
+		ret = do_probe_qp_teardown(fd,
+				strtoul(argv[3], NULL, 0),
+				strtoul(argv[4], NULL, 0),
+				strtoul(argv[5], NULL, 0),
+				strtoul(argv[6], NULL, 0));
+	} else if (verb_eq(verb, "probe_dealloc_pd")) {
+		if (argc != 6)
+			goto badargs;
+		ret = do_probe_dealloc_pd(fd,
+				strtoul(argv[3], NULL, 0),
+				strtoul(argv[4], NULL, 0),
+				strtoul(argv[5], NULL, 0));
 	} else if (verb_eq(verb, "query_awaiting_bind")) {
 		if (argc != 4)
 			goto badargs;

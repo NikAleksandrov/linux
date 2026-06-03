@@ -982,6 +982,26 @@ plugin's dump path) and at restore time:
   on a `devx_uid != 0` source fails -EINVAL there (early, before
   any `restore_pd/cq/qp` runs) instead of obscurely at teardown.
 
+  > **Update (2026-06):** parts of the analysis in this paragraph
+  > were superseded by the empirical work in
+  > [`pd_registration_wipe.md`](pd_registration_wipe.md). In
+  > particular: (a) `DESTROY_QP` and `2RST_QP` empirically DO
+  > honor cross-uid lanes (the silent-fail framing was wrong --
+  > see `qp_destroy_matrix/`); (b) the `DEALLOC_PD bad_resource_state
+  > syndrome 0xef0c8a` failure is independent of the DEVX/non-DEVX
+  > source-uid story -- it's the (pdn -> owner_uid) registration
+  > table that gets wiped by `LOAD_VHCA_STATE`, not just the (uid
+  > -> uctx_attrs) one, and the same syndrome is returned for
+  > definitely-bogus pdns. The kernel-side mitigation landed in
+  > `mlx5_ib_dealloc_pd` (gated on `mpd->vfmig_restored` plus the
+  > exact "PDN unknown" status/syndrome tuple) closes the failure
+  > path for v0; see the design doc for the full leak-budget
+  > analysis and the parallel with the upstream vfio-mlx5 SR-IOV
+  > VM-LM path. The strict-equality `meta.devx_uid` check on
+  > `RESTORE_UCONTEXT` (commit `c659ab66483d`) is preserved as
+  > defense-in-depth but is no longer load-bearing for the
+  > DEALLOC_PD outcome.
+
 **Landed shape (mlx5)**
 
 `include/uapi/rdma/mlx5_user_ioctl_cmds.h`:
