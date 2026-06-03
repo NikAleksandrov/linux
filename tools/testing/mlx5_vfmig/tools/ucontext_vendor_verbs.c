@@ -204,7 +204,8 @@ struct mlx5_ib_vfmig_ucontext_meta {
 	uint8_t  lib_uar_4k;
 	uint8_t  lib_uar_dyn;
 	uint8_t  cqe_version;
-	uint8_t  reserved1[5];
+	uint8_t  reserved1[3];
+	uint16_t devx_uid;
 } __attribute__((aligned(8)));
 
 /*

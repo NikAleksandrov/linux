@@ -686,13 +686,23 @@ enum mlx5_ib_vfmig_query_ucontext_attrs {
  *   1. The ucontext was created with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
  *      (so sys_pages[] is sentinel-INVALID and ready to be seeded).
  *   2. lib_uar_dyn=false (v0 doesn't cover dynamic-UAR ucontexts).
- *   3. META cross-check: every field of the supplied
+ *   3. META cross-check: every shape-defining field of the supplied
  *      mlx5_ib_vfmig_ucontext_meta must match what the destination's
  *      mlx5_ib_alloc_ucontext computed for THIS ucontext (strict bitwise
  *      equality on num_static_sys_pages, num_sys_pages, num_dyn_bfregs,
  *      num_low_latency_bfregs, total_num_bfregs, lib_caps, lib_uar_4k,
- *      lib_uar_dyn, cqe_version). v0 targets a homogeneous fleet; this
- *      guarantee can be relaxed later if needed.
+ *      lib_uar_dyn, cqe_version, devx_uid). v0 targets a homogeneous
+ *      fleet; this guarantee can be relaxed later if needed.
+ *      @devx_uid being included makes the FW-owner-id seam loud at
+ *      RESTORE_UCONTEXT instead of silently letting subsequent
+ *      restore_pd/cq/qp stamp a mismatched uid that surfaces only at
+ *      DEALLOC_PD teardown as bad_resource_state -- by the time
+ *      RESTORE_UCONTEXT runs the dest's c->devx_uid is already final
+ *      (set by mlx5_ib_alloc_ucontext from req.adopt_devx_uid when
+ *      MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID was passed, or from a fresh
+ *      mlx5_ib_devx_create otherwise), so a mismatch here = "the
+ *      dump and restore plugins disagree about the source's FW
+ *      owner-id" = unrestorable.
  *   4. UAR_TABLE length == num_sys_pages * sizeof(__u32) (mandatory).
  *   5. UAR_TABLE[0..num_static_sys_pages) must all be valid (none equal
  *      to MLX5_IB_INVALID_UAR_INDEX = BIT(31)). Static slots are
@@ -716,6 +726,59 @@ enum mlx5_ib_vfmig_restore_ucontext_attrs {
 	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META,
 };
 
+/*
+ * @devx_uid carries the source ucontext's mlx5_ib_ucontext::devx_uid
+ * across the SAVE/LOAD seam. It is the FW-allocated (or 0 = "kernel /
+ * non-DEVX") owner-id that LOAD_VHCA_STATE preserves on every imported
+ * FW resource (PDC, CQC, QPC, MKC, SRQC, ...) -- but the matching
+ * uctx-registration table entry is NOT preserved (per the §S3b
+ * "DEVX-adoption blind spot" matrix on FW 28.48.1000). The dest VF's
+ * FW will reject any low-range non-zero uid at CREATE_x / MODIFY_x /
+ * DESTROY_x with the "unknown uid" syndrome 0x76555f.
+ *
+ * Consequences for the v0 restore path:
+ *
+ *   - source.devx_uid == 0 (non-DEVX libibverbs ucontext): the
+ *     destination opens its restore-mode ucontext without DEVX, the
+ *     dest's c->devx_uid is also 0, every adopted FW resource lands
+ *     in the uid=0 host-privileged ungated lane, and modify/destroy
+ *     all succeed. This is the v0 critical path and what the
+ *     bring-up harnesses exercise.
+ *
+ *   - source.devx_uid != 0 (libmlx5 auto-DEVX or explicit DEVX): the
+ *     destination CANNOT successfully open with
+ *     MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID (the alloc_ucontext liveness
+ *     check on ALLOC_TRANSPORT_DOMAIN will fail because the uid is
+ *     not registered post-LOAD), and the v0 mitigation of "open
+ *     without DEVX, run everything under uid=0" silently breaks the
+ *     destroy chain: the FW QPC/CQC/PDC are owned by source.devx_uid
+ *     but the destination kernel issues 2RST_QP / DESTROY_QP /
+ *     DESTROY_CQ / DEALLOC_PD with uid=0. mlx5_ib_destroy_qp's path
+ *     warn-only-logs FW failures and unconditionally returns 0, so
+ *     the user-visible failure surfaces only at the first opcode
+ *     that propagates its FW errno verbatim (DEALLOC_PD: bad_resource
+ *     state, syndrome 0xef0c8a-class). The CRIU plugin therefore
+ *     MUST refuse to dump a ucontext whose meta.devx_uid is non-zero
+ *     until either the matrix's row for "uid=src_devx_uid" flips to
+ *     accept (a future-FW capability that preserves the uctx
+ *     registry) or one of the alternatives in §S3b options 1-3
+ *     lands.
+ *
+ * Exposing the field rather than hiding it makes the failure mode
+ * detectable at dump time by the plugin (refuse cleanly) and at
+ * restore time by the kernel (see RESTORE_UCONTEXT precondition #3:
+ * meta.devx_uid is included in the strict-equality check, so a
+ * mis-matched dump/restore plugin pair fails -EINVAL early at
+ * RESTORE_UCONTEXT instead of silently letting subsequent
+ * restore_pd/cq/qp adopt resources whose FW commands then fail
+ * obscurely at teardown).
+ *
+ * Backward compat: a kernel that doesn't yet emit @devx_uid leaves
+ * it 0 (it occupies bytes that were previously reserved1[0..1]). A
+ * userspace running against the older kernel sees only the existing
+ * "non-DEVX-only" test surface, which is exactly the v0 critical
+ * path; no behavior change.
+ */
 struct mlx5_ib_vfmig_ucontext_meta {
 	__u32	num_static_sys_pages;
 	__u32	num_sys_pages;
@@ -727,7 +790,8 @@ struct mlx5_ib_vfmig_ucontext_meta {
 	__u8	lib_uar_4k;
 	__u8	lib_uar_dyn;
 	__u8	cqe_version;
-	__u8	reserved1[5];
+	__u8	reserved1[3];
+	__u16	devx_uid;
 };
 
 /*

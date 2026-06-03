@@ -956,6 +956,31 @@ plugin's dump path) and at restore time:
   own qpn pool and the assert relaxes to "any qpn the rxe
   driver accepted". Same shape as the cqn / mkey identity
   asserts the CQ/MR plugin paths already do.
+* **Source `devx_uid` must be 0.** Pre-suspend the plugin
+  reads `meta.devx_uid` from `MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT`
+  (kernel commit "RDMA/mlx5: Expose source devx_uid via
+  VFMIG_QUERY_UCONTEXT"); a non-zero value indicates a
+  DEVX-enabled source ucontext (e.g. libmlx5 auto-DEVX). v0
+  cannot restore those: `LOAD_VHCA_STATE` does NOT preserve the
+  FW uctx-registration table (§S3b "DEVX-adoption blind spot"),
+  so neither the destination's ADOPT_DEVX_UID path (alloc
+  ucontext fails at ALLOC_TRANSPORT_DOMAIN with "unknown uid")
+  nor the uid=0 host-priv lane (which empirically only covers
+  CREATE_*, DESTROY_PD, DESTROY_CQ for cross-uid resources --
+  DESTROY_QP / 2RST_QP modify against a uid != 0-owned QPC
+  silently fail at FW with destroy_qp_common warn-only-logging
+  to dmesg) can complete the destroy chain on uid != 0 FW
+  resources -- the user-visible failure surfaces only at the
+  first errno-propagating downstream opcode, typically
+  `DEALLOC_PD bad_resource_state` (syndrome 0xef0c8a-class). The
+  plugin must refuse the dump with a clear "VFMIG v0 does not
+  support DEVX-enabled source ucontexts; await future-FW
+  uctx-registry preservation or a per-resource uid rebind path"
+  message. As defense-in-depth the kernel includes
+  `meta.devx_uid` in the `RESTORE_UCONTEXT` strict-equality
+  check, so even a buggy plugin pair that gets to RESTORE_UCONTEXT
+  on a `devx_uid != 0` source fails -EINVAL there (early, before
+  any `restore_pd/cq/qp` runs) instead of obscurely at teardown.
 
 **Landed shape (mlx5)**
 
@@ -2381,6 +2406,52 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   too: it now reads as "fail loudly the moment a future caller
   flips the flag on without an FW capability that preserves the
   uctx registry."
+
+  **Critical caveat (2026-06-02): the v0 mitigation only works
+  when source `devx_uid == 0` too.** Empirical re-evaluation
+  via the CRIU pd_cq_qp end-to-end test exposed that the matrix
+  above only covers `CREATE_MKEY` semantics; the host-priv
+  uid=0 lane is asymmetric across opcodes:
+
+    * `CREATE_*` / `DEALLOC_PD` / `DESTROY_CQ` under uid=0 act
+      on FW resources owned by source.devx_uid != 0 cleanly
+      (these rows of the matrix). The pd_cq scenario's teardown
+      (no QP) succeeds end-to-end on a DEVX-enabled source.
+    * `DESTROY_QP` under uid=0 against a QPC owned by
+      source.devx_uid != 0 silently fails at FW. The kernel
+      path `mlx5_ib_destroy_qp -> destroy_qp_common` is `void`
+      and only `mlx5_ib_warn`s the FW errno; `mlx5_ib_destroy_qp`
+      unconditionally returns 0 to userspace. The orphan QPC
+      then surfaces at the next opcode that propagates its
+      errno verbatim -- `DEALLOC_PD` -- as `bad_resource_state`
+      (syndrome 0xef0c8a-class). Same hazard for the prerequisite
+      `2RST_QP` modify if the QPC was non-RESET on the source.
+
+  This means a pure "uid=0 lane" v0 mitigation is unsafe for any
+  source that opened its ucontext through libmlx5 (or anything
+  else that triggers auto-DEVX). To make the failure mode
+  detectable instead of obscure, the kernel exposes the source's
+  `devx_uid` across the seam:
+
+    * `MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT` populates
+      `meta.devx_uid = c->devx_uid` (occupies bytes formerly in
+      `reserved1[0..1]`; older userspaces see 0, which is the
+      correct non-DEVX behavior).
+    * `MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT` includes
+      `meta.devx_uid == c->devx_uid` in its strict-equality
+      precondition #3. A snapshot taken from a `devx_uid != 0`
+      source against a destination ucontext opened without
+      `ADOPT_DEVX_UID` (or with the wrong value) fails -EINVAL
+      at `RESTORE_UCONTEXT`, before any resource adoption runs.
+    * `destroy_qp_common`'s warn-only paths upgrade from
+      `mlx5_ib_warn` to `mlx5_ib_err` and now carry qpn / uid /
+      state / errno so a uid mismatch is obvious in dmesg.
+
+  The CRIU plugin's pre-suspend filter must therefore reject
+  any source ucontext with `meta.devx_uid != 0` (see ?5.3.4
+  "CRIU plugin v0 contract"). When one of the §S3b future-FW
+  options 1-3 below lands, the filter relaxes to "match dump and
+  restore through ADOPT_DEVX_UID".
 
   **Restored-process limitation.** Without DEVX on the dest,
   `mlx5dv_*` / `devx_obj_create` / DEVX-rooted UAR allocations

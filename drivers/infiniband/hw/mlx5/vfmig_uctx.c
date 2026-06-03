@@ -142,6 +142,29 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT)(
 	meta.lib_uar_4k             = bfregi->lib_uar_4k ? 1 : 0;
 	meta.lib_uar_dyn            = bfregi->lib_uar_dyn ? 1 : 0;
 	meta.cqe_version            = c->cqe_version;
+	/*
+	 * Source ucontext's FW owner-id. Exposed across the SAVE/LOAD
+	 * seam so the dump-side CRIU plugin can detect a DEVX-enabled
+	 * source (devx_uid != 0) and refuse the dump cleanly --
+	 * LOAD_VHCA_STATE does NOT preserve the FW uctx-registration
+	 * table (§S3b "DEVX-adoption blind spot" matrix on FW
+	 * 28.48.1000), so neither MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID nor
+	 * the uid=0 host-priv lane can correctly run modify/destroy
+	 * commands against PDC/CQC/QPC owned by the source's
+	 * devx_uid. The downstream symptom is silent FW failure in
+	 * destroy_qp_common (warn-only-logs to dmesg, mlx5_ib_destroy_qp
+	 * returns 0 regardless) followed by DEALLOC_PD bad_resource_
+	 * state at the first opcode that propagates its FW errno. uid
+	 * is a 16-bit FW field; widening into reserved1's first two
+	 * bytes preserves the existing wire layout (older userspaces
+	 * see meta.devx_uid == 0, which is correct for the non-DEVX
+	 * v0 test surface). RESTORE_UCONTEXT cross-checks
+	 * meta.devx_uid against c->devx_uid so a mis-matched
+	 * dump/restore plugin pair fails -EINVAL at RESTORE_UCONTEXT
+	 * (early, before any resource adoption) instead of obscurely
+	 * at teardown.
+	 */
+	meta.devx_uid               = c->devx_uid;
 
 	err = uverbs_copy_to(attrs,
 		MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META,
@@ -225,11 +248,12 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT)(
 	    meta.lib_caps               != c->lib_caps                    ||
 	    meta.lib_uar_4k             != (bfregi->lib_uar_4k ? 1 : 0)   ||
 	    meta.lib_uar_dyn            != (bfregi->lib_uar_dyn ? 1 : 0)  ||
-	    meta.cqe_version            != c->cqe_version) {
+	    meta.cqe_version            != c->cqe_version                 ||
+	    meta.devx_uid               != c->devx_uid) {
 		mlx5_ib_dbg(dev,
 			    "VFMIG_RESTORE_UCONTEXT: META mismatch (snapshot vs dst): "
 			    "static_pages=%u/%u num_pages=%u/%u dyn_bfregs=%u/%u low_lat=%u/%u total_bfregs=%u/%u "
-			    "lib_caps=0x%llx/0x%llx 4k=%u/%u dyn=%u/%u cqe_ver=%u/%u\n",
+			    "lib_caps=0x%llx/0x%llx 4k=%u/%u dyn=%u/%u cqe_ver=%u/%u devx_uid=%u/%u\n",
 			    meta.num_static_sys_pages, bfregi->num_static_sys_pages,
 			    meta.num_sys_pages, bfregi->num_sys_pages,
 			    meta.num_dyn_bfregs, bfregi->num_dyn_bfregs,
@@ -239,7 +263,26 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT)(
 			    (unsigned long long)c->lib_caps,
 			    meta.lib_uar_4k, bfregi->lib_uar_4k ? 1 : 0,
 			    meta.lib_uar_dyn, bfregi->lib_uar_dyn ? 1 : 0,
-			    meta.cqe_version, c->cqe_version);
+			    meta.cqe_version, c->cqe_version,
+			    (unsigned)meta.devx_uid, c->devx_uid);
+		/*
+		 * @devx_uid is the FW owner-id LOAD_VHCA_STATE preserves
+		 * byte-equal on every imported PDC/CQC/QPC/MKC/SRQC. A
+		 * mismatch here means the dest's c->devx_uid (set by
+		 * mlx5_ib_alloc_ucontext from either ADOPT_DEVX_UID or
+		 * a fresh mlx5_ib_devx_create) doesn't match what the
+		 * dump-side QUERY_UCONTEXT recorded for the source. We
+		 * reject loud and early here because the only alternative
+		 * is letting subsequent restore_pd/cq/qp stamp a uid that
+		 * doesn't match the FW resources -- destroy_qp_common
+		 * then warn-only-logs the resulting FW failures and
+		 * returns success, so the seam surfaces only at the
+		 * teardown's first uid-propagating opcode (typically
+		 * DEALLOC_PD with bad_resource_state, syndrome 0xef0c8a-
+		 * class). Fix on the CRIU side: pass adopt_devx_uid =
+		 * source.devx_uid (or open without DEVX when source had
+		 * uid=0).
+		 */
 		return -EINVAL;
 	}
 

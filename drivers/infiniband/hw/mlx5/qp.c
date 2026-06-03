@@ -2811,9 +2811,23 @@ static void destroy_qp_common(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 
 			err = modify_raw_packet_qp(dev, qp, &raw_qp_param, 0);
 		}
+		/*
+		 * destroy_qp_common is void by design (mlx5_ib_destroy_qp
+		 * unconditionally returns 0), so any FW failure here is
+		 * dmesg-only. Upgrade to mlx5_ib_err and surface qpn+uid+
+		 * state+errno so the most common reason for failure --
+		 * uid mismatch on a CRIU-restored QP whose FW QPC is owned
+		 * by the source's devx_uid but whose dest mlx5_core_qp.uid
+		 * was stamped from a destination ucontext that didn't run
+		 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID -- is recognisable in
+		 * dmesg without requiring a syndrome decoder. See
+		 * mlx5_ib_vfmig_ucontext_meta::devx_uid.
+		 */
 		if (err)
-			mlx5_ib_warn(dev, "mlx5_ib: modify QP 0x%06x to RESET failed\n",
-				     base->mqp.qpn);
+			mlx5_ib_err(dev,
+				    "modify QP 0x%06x to RESET failed: err=%d uid=%u state=%d (FW errno-only path; check ucontext.devx_uid vs mlx5_core_qp.uid for VFMIG-restored QPs)\n",
+				    base->mqp.qpn, err, base->mqp.uid,
+				    qp->state);
 	}
 
 	get_cqs(qp->type, qp->ibqp.send_cq, qp->ibqp.recv_cq, &send_cq,
@@ -2844,9 +2858,19 @@ static void destroy_qp_common(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 		destroy_raw_packet_qp(dev, qp);
 	} else {
 		err = mlx5_core_destroy_qp(dev, &base->mqp);
+		/*
+		 * Same warn-loudness rationale as the 2RST_QP case above.
+		 * If this fires, the FW QPC stays alive and pinned to its
+		 * PD/CQs -- the next teardown opcode that propagates its
+		 * FW errno verbatim (mlx5_ib_dealloc_pd / mlx5_ib_destroy_cq
+		 * both return mlx5_cmd_*'s errno directly) will fail with
+		 * bad_resource_state on the orphan QPC.
+		 */
 		if (err)
-			mlx5_ib_warn(dev, "failed to destroy QP 0x%x\n",
-				     base->mqp.qpn);
+			mlx5_ib_err(dev,
+				    "destroy QP 0x%06x failed: err=%d uid=%u state=%d (FW errno-only path; QPC may remain pinned to PD/CQ -- expect downstream DEALLOC_PD bad_resource_state)\n",
+				    base->mqp.qpn, err, base->mqp.uid,
+				    qp->state);
 	}
 
 	destroy_qp(dev, qp, base, udata);
