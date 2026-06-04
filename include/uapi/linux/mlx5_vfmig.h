@@ -1144,4 +1144,207 @@ struct mlx5_vfmig_probe_dealloc_pd {
 #define MLX5_VFMIG_IOC_PROBE_DEALLOC_PD \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x0f, struct mlx5_vfmig_probe_dealloc_pd)
 
+/*
+ * MLX5_VFMIG_IOC_PROBE_CQ_DESTROY:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_QP_TEARDOWN /
+ *       PROBE_DEALLOC_PD, NOT part of the M2/M3 contract. ***
+ *
+ *   Drives the §S3b "Generalising to QP/CQ" empirical question for
+ *   CQs: "Given a CQC adopted from a DEVX-enabled source (cqc owner-
+ *   uid == src.devx_uid != 0), does the FW honor a different uid
+ *   in DESTROY_CQ's IFC uid field?"
+ *
+ *   The PD gate analysis (design/pd_registration_wipe.md) showed
+ *   DEALLOC_PD is sensitive to the (pdn -> owner_uid) registration
+ *   wipe imposed by LOAD_VHCA_STATE. This ioctl asks whether
+ *   DESTROY_CQ has the same sensitivity: if it returns "CQN unknown
+ *   to allocator" with vfmig-restored CQs, we need a parallel gate
+ *   in mlx5_ib_destroy_cq; if it works cross-uid like DESTROY_QP,
+ *   no kernel gate is needed.
+ *
+ *   Bracketing pattern mirrors PROBE_QP_TEARDOWN:
+ *     1. pre-op QUERY_CQ   -- prove the CQC exists post-LOAD
+ *     2. DESTROY_CQ(cqn, uid_hint)
+ *     3. post-op QUERY_CQ  -- prove the CQC is actually gone
+ *
+ *   "DESTROY worked across uid" verdict:
+ *     op_status == 0 && post_query_status != 0
+ *   "DESTROY silent no-op" verdict:
+ *     op_status == 0 && post_query_status == 0
+ *   "DESTROY failed cross-uid (gate needed)" verdict:
+ *     op_status != 0 -- inspect op_syndrome for the class
+ *
+ *   Locking, VF mdev lookup, cmdif uid all mirror PROBE_PD /
+ *   PROBE_QP_TEARDOWN. The VF mdev's cmdif runs cmdif-uid=0
+ *   (host-privileged); the @uid_hint is asserted via the IFC
+ *   uid field on the destroy command.
+ *
+ *   This ioctl IS destructive on success. Use one source CQ per
+ *   uid_hint cell (the harness allocates 3 source CQs).
+ *
+ *   Errors: -EFAULT on copy_{from,to}_user; -EINVAL if @vf_id is
+ *   out of range, @cqn or @uid_hint exceed their 24-bit / 16-bit
+ *   ranges, or any reserved field is non-zero; -ENODEV if the VF
+ *   is unbound or its mdev interface is down. The op-under-test
+ *   does NOT propagate its negative errno: a FW reject is recorded
+ *   in @op_status / @op_syndrome and the call returns 0, so the
+ *   caller can see the bracketing query result.
+ */
+struct mlx5_vfmig_probe_cq_destroy {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 cqn;			/* in:  FW CQ number to destroy
+					 *      (24 bits significant)
+					 */
+	__u32 uid_hint;			/* in:  uid value to write into
+					 *      DESTROY_CQ's IFC uid field
+					 *      (16 bits significant)
+					 */
+	__u8  reserved_in[16];		/* in:  must be 0 */
+
+	/* pre-op QUERY_CQ */
+	__u32 pre_query_status;		/* out: 0 = CQC found pre-op;
+					 *      non-zero = QUERY_CQ failed
+					 *      pre-op (CQC missing? FW
+					 *      transport failure?). On
+					 *      pre-query failure the @op
+					 *      step is SKIPPED and @op_*
+					 *      / @post_* are zeroed.
+					 */
+	__u32 pre_query_syndrome;	/* out: FW syndrome if
+					 *      pre-query rejected; 0 on
+					 *      accept.
+					 */
+	__u8  pre_cqc_status;		/* out: cqc.status pre-op (4 bits
+					 *      significant). 0 if
+					 *      pre_query_status != 0.
+					 */
+	__u8  reserved_pre[3];		/* out: zeroed */
+
+	/* DESTROY_CQ */
+	__u32 op_status;		/* out: -ERRNO returned by
+					 *      mlx5_cmd_exec for DESTROY_CQ
+					 *      (0 = FW ack; <0 = FW reject
+					 *      converted to errno). Cast
+					 *      through int.
+					 */
+	__u32 op_syndrome;		/* out: FW syndrome from the
+					 *      DESTROY_CQ output blob;
+					 *      0 on FW accept.
+					 */
+
+	/* post-op QUERY_CQ */
+	__u32 post_query_status;	/* out: 0 = CQC still alive
+					 *      (silent no-op if op_status
+					 *      was also 0); non-zero =
+					 *      CQC gone (the "destroy
+					 *      worked" lane).
+					 */
+	__u32 post_query_syndrome;	/* out: FW syndrome if post-
+					 *      query rejected; 0 on
+					 *      accept.
+					 */
+	__u8  post_cqc_status;		/* out: cqc.status post-op (only
+					 *      meaningful when
+					 *      post_query_status==0). 0 if
+					 *      CQC gone or pre-query failed.
+					 */
+	__u8  reserved_post[3];		/* out: zeroed */
+	__u8  reserved_out[16];		/* out: zeroed */
+};
+
+#define MLX5_VFMIG_IOC_PROBE_CQ_DESTROY \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x10, struct mlx5_vfmig_probe_cq_destroy)
+
+/*
+ * MLX5_VFMIG_IOC_PROBE_MR_DESTROY:
+ *   *** EXPERIMENTAL DEBUG IOCTL -- like PROBE_QP_TEARDOWN /
+ *       PROBE_DEALLOC_PD / PROBE_CQ_DESTROY, NOT part of the
+ *       M2/M3 contract. ***
+ *
+ *   Drives the same §S3b "Generalising to QP/CQ" empirical
+ *   question for memory keys: does DESTROY_MKEY honor a uid_hint
+ *   that differs from the mkey's owning uid (which after
+ *   LOAD_VHCA_STATE is a wiped registration entry on the dest)?
+ *
+ *   Bracketing pattern mirrors PROBE_CQ_DESTROY: pre-op
+ *   QUERY_MKEY, DESTROY_MKEY, post-op QUERY_MKEY. The "destroy
+ *   worked across uid" verdict is op_status==0 && post_query
+ *   _status != 0. "Silent no-op" is op_status==0 && post_query
+ *   _status==0. "Cross-uid rejection (gate needed)" is op_status
+ *   != 0 with op_syndrome in the registration-wipe class.
+ *
+ *   Note: mkc.free is the post-destroy life-status indicator
+ *   (free=1 means the mkey index is freed back to the allocator)
+ *   but a freshly-allocated mkey has free=0. After a successful
+ *   DESTROY_MKEY the post-op QUERY_MKEY will return a "not
+ *   found" syndrome, which is the actual pass signal.
+ *
+ *   Destructive on success. Use one source mkey per uid_hint
+ *   cell; the harness allocates 3 source MRs.
+ *
+ *   Errors / locking semantics mirror PROBE_QP_TEARDOWN.
+ */
+struct mlx5_vfmig_probe_mr_destroy {
+	__u32 vf_id;			/* in:  target VF on this PF */
+	__u32 mkey_index;		/* in:  FW mkey index to destroy
+					 *      (24 bits significant; this
+					 *      is the upper-24 of the full
+					 *      mkey == mkey_variant<<24 |
+					 *      mkey_index).
+					 */
+	__u32 uid_hint;			/* in:  uid value to write into
+					 *      DESTROY_MKEY's IFC uid field
+					 *      (16 bits significant)
+					 */
+	__u8  reserved_in[16];		/* in:  must be 0 */
+
+	/* pre-op QUERY_MKEY */
+	__u32 pre_query_status;		/* out: 0 = MKEY found pre-op;
+					 *      non-zero = QUERY_MKEY failed
+					 *      pre-op. On pre-query failure
+					 *      the @op step is SKIPPED and
+					 *      @op_* / @post_* are zeroed.
+					 */
+	__u32 pre_query_syndrome;	/* out: FW syndrome if
+					 *      pre-query rejected; 0 on
+					 *      accept.
+					 */
+	__u8  pre_mkc_free;		/* out: mkc.free pre-op (1 bit
+					 *      significant). 0 if
+					 *      pre_query_status != 0.
+					 */
+	__u8  reserved_pre[3];		/* out: zeroed */
+
+	/* DESTROY_MKEY */
+	__u32 op_status;		/* out: -ERRNO returned by
+					 *      mlx5_cmd_exec for
+					 *      DESTROY_MKEY.
+					 */
+	__u32 op_syndrome;		/* out: FW syndrome from the
+					 *      DESTROY_MKEY output blob;
+					 *      0 on FW accept.
+					 */
+
+	/* post-op QUERY_MKEY */
+	__u32 post_query_status;	/* out: 0 = MKC still alive
+					 *      (silent no-op if op_status
+					 *      was also 0); non-zero =
+					 *      MKC gone.
+					 */
+	__u32 post_query_syndrome;	/* out: FW syndrome if post-
+					 *      query rejected; 0 on
+					 *      accept.
+					 */
+	__u8  post_mkc_free;		/* out: mkc.free post-op (only
+					 *      meaningful when
+					 *      post_query_status==0). 0 if
+					 *      MKC gone or pre-query failed.
+					 */
+	__u8  reserved_post[3];		/* out: zeroed */
+	__u8  reserved_out[16];		/* out: zeroed */
+};
+
+#define MLX5_VFMIG_IOC_PROBE_MR_DESTROY \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x11, struct mlx5_vfmig_probe_mr_destroy)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

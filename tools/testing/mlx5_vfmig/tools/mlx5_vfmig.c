@@ -435,6 +435,110 @@ static int do_probe_dealloc_pd(int fd, unsigned int vf_id,
 }
 
 /*
+ * EXPERIMENTAL: §S3b "Generalising to QP/CQ" probe (CQ branch) --
+ * issues QUERY_CQ -> DESTROY_CQ(cqn, uid_hint) -> QUERY_CQ on the
+ * bound VF mdev's cmdif. Destructive on success.
+ *
+ * Verdict from the printed key=value pairs:
+ *   op_status=0 && post_query_status!=0  -> destroy worked cross-uid
+ *   op_status=0 && post_query_status==0  -> silent no-op (alarm)
+ *   op_status!=0                          -> destroy rejected; check
+ *                                            op_syndrome class
+ */
+static int do_probe_cq_destroy(int fd, unsigned int vf_id,
+			       unsigned int cqn, unsigned int uid_hint)
+{
+	struct mlx5_vfmig_probe_cq_destroy arg = {
+		.vf_id    = vf_id,
+		.cqn      = cqn,
+		.uid_hint = uid_hint,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_CQ_DESTROY, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(PROBE_CQ_DESTROY requires the VF mdev "
+				"to be interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"PROBE_CQ_DESTROY: invalid arg "
+				"(vf_id=%u cqn=0x%x uid_hint=0x%x). "
+				"cqn 24 bits, uid 16 bits.\n",
+				vf_id, cqn, uid_hint);
+		else
+			perror("PROBE_CQ_DESTROY");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("cqn=0x%06x\n", cqn);
+	printf("uid_hint=0x%04x\n", uid_hint);
+	printf("pre_query_status=0x%08x\n", arg.pre_query_status);
+	printf("pre_query_syndrome=0x%08x\n", arg.pre_query_syndrome);
+	printf("pre_cqc_status=%u\n", arg.pre_cqc_status);
+	printf("op_status=0x%08x\n", arg.op_status);
+	printf("op_syndrome=0x%08x\n", arg.op_syndrome);
+	printf("post_query_status=0x%08x\n", arg.post_query_status);
+	printf("post_query_syndrome=0x%08x\n", arg.post_query_syndrome);
+	printf("post_cqc_status=%u\n", arg.post_cqc_status);
+	printf("op_accept=%u\n",
+	       ((int)arg.op_status == 0 && arg.op_syndrome == 0) ? 1 : 0);
+	printf("destroyed=%u\n",
+	       ((int)arg.op_status == 0 && (int)arg.post_query_status != 0)
+	       ? 1 : 0);
+	return 0;
+}
+
+/*
+ * EXPERIMENTAL: §S3b "Generalising to QP/CQ" probe (MR/mkey branch).
+ * Same shape as probe_cq_destroy but driven against DESTROY_MKEY.
+ */
+static int do_probe_mr_destroy(int fd, unsigned int vf_id,
+			       unsigned int mkey_index,
+			       unsigned int uid_hint)
+{
+	struct mlx5_vfmig_probe_mr_destroy arg = {
+		.vf_id      = vf_id,
+		.mkey_index = mkey_index,
+		.uid_hint   = uid_hint,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_PROBE_MR_DESTROY, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(PROBE_MR_DESTROY requires the VF mdev "
+				"to be interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"PROBE_MR_DESTROY: invalid arg "
+				"(vf_id=%u mkey_index=0x%x uid_hint=0x%x). "
+				"mkey_index 24 bits, uid 16 bits.\n",
+				vf_id, mkey_index, uid_hint);
+		else
+			perror("PROBE_MR_DESTROY");
+		return 1;
+	}
+	printf("vf_id=%u\n", vf_id);
+	printf("mkey_index=0x%06x\n", mkey_index);
+	printf("uid_hint=0x%04x\n", uid_hint);
+	printf("pre_query_status=0x%08x\n", arg.pre_query_status);
+	printf("pre_query_syndrome=0x%08x\n", arg.pre_query_syndrome);
+	printf("pre_mkc_free=%u\n", arg.pre_mkc_free);
+	printf("op_status=0x%08x\n", arg.op_status);
+	printf("op_syndrome=0x%08x\n", arg.op_syndrome);
+	printf("post_query_status=0x%08x\n", arg.post_query_status);
+	printf("post_query_syndrome=0x%08x\n", arg.post_query_syndrome);
+	printf("post_mkc_free=%u\n", arg.post_mkc_free);
+	printf("op_accept=%u\n",
+	       ((int)arg.op_status == 0 && arg.op_syndrome == 0) ? 1 : 0);
+	printf("destroyed=%u\n",
+	       ((int)arg.op_status == 0 && (int)arg.post_query_status != 0)
+	       ? 1 : 0);
+	return 0;
+}
+
+/*
  * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND CLI wrapper. user_mr_dma
  * stage-2 success-criterion accessor: post-LOAD, asks the PF how
  * many awaiting_bind placeholders landed in the VF's
@@ -819,6 +923,10 @@ static void usage(const char *argv0)
 		"                    (experimental, §S3b destroy-direction probe)\n"
 		"  probe_dealloc_pd  <vf_id> <pdn> <uid_hint>\n"
 		"                    (experimental, §S3b DEALLOC_PD uid-gating probe)\n"
+		"  probe_cq_destroy  <vf_id> <cqn> <uid_hint>\n"
+		"                    (experimental, §S3b DESTROY_CQ cross-uid probe)\n"
+		"  probe_mr_destroy  <vf_id> <mkey_index> <uid_hint>\n"
+		"                    (experimental, §S3b DESTROY_MKEY cross-uid probe)\n"
 		"  query_awaiting_bind <vf_id>  (user_mr_dma stage-2)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
@@ -932,6 +1040,20 @@ int main(int argc, char **argv)
 		if (argc != 6)
 			goto badargs;
 		ret = do_probe_dealloc_pd(fd,
+				strtoul(argv[3], NULL, 0),
+				strtoul(argv[4], NULL, 0),
+				strtoul(argv[5], NULL, 0));
+	} else if (verb_eq(verb, "probe_cq_destroy")) {
+		if (argc != 6)
+			goto badargs;
+		ret = do_probe_cq_destroy(fd,
+				strtoul(argv[3], NULL, 0),
+				strtoul(argv[4], NULL, 0),
+				strtoul(argv[5], NULL, 0));
+	} else if (verb_eq(verb, "probe_mr_destroy")) {
+		if (argc != 6)
+			goto badargs;
+		ret = do_probe_mr_destroy(fd,
 				strtoul(argv[3], NULL, 0),
 				strtoul(argv[4], NULL, 0),
 				strtoul(argv[5], NULL, 0));

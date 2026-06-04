@@ -233,12 +233,16 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT)(
 		return err;
 
 	/*
-	 * Precondition #3: META cross-check. Strict bitwise equality on
-	 * every shape-defining field. v0 targets a homogeneous fleet
-	 * (same kernel, same libmlx5, same MLX5_LIB_CAP_*), so any drift
-	 * here means somebody is feeding us a snapshot from a
-	 * structurally different ucontext. Reject before we corrupt
-	 * bfregi rather than fail later in obscure ways.
+	 * Precondition #3a: bfregi/lib_caps/cqe_version cross-check.
+	 * Strict bitwise equality on every UAR-shape-defining field.
+	 * v0 targets a homogeneous fleet (same kernel, same libmlx5,
+	 * same MLX5_LIB_CAP_*), so any drift here means somebody is
+	 * feeding us a snapshot from a structurally different
+	 * ucontext. Reject before we corrupt bfregi rather than fail
+	 * later in obscure ways.
+	 *
+	 * @devx_uid is intentionally NOT in this strict-equality bag
+	 * (see Precondition #3b below).
 	 */
 	if (meta.num_static_sys_pages   != bfregi->num_static_sys_pages   ||
 	    meta.num_sys_pages          != bfregi->num_sys_pages          ||
@@ -248,12 +252,11 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT)(
 	    meta.lib_caps               != c->lib_caps                    ||
 	    meta.lib_uar_4k             != (bfregi->lib_uar_4k ? 1 : 0)   ||
 	    meta.lib_uar_dyn            != (bfregi->lib_uar_dyn ? 1 : 0)  ||
-	    meta.cqe_version            != c->cqe_version                 ||
-	    meta.devx_uid               != c->devx_uid) {
+	    meta.cqe_version            != c->cqe_version) {
 		mlx5_ib_dbg(dev,
 			    "VFMIG_RESTORE_UCONTEXT: META mismatch (snapshot vs dst): "
 			    "static_pages=%u/%u num_pages=%u/%u dyn_bfregs=%u/%u low_lat=%u/%u total_bfregs=%u/%u "
-			    "lib_caps=0x%llx/0x%llx 4k=%u/%u dyn=%u/%u cqe_ver=%u/%u devx_uid=%u/%u\n",
+			    "lib_caps=0x%llx/0x%llx 4k=%u/%u dyn=%u/%u cqe_ver=%u/%u\n",
 			    meta.num_static_sys_pages, bfregi->num_static_sys_pages,
 			    meta.num_sys_pages, bfregi->num_sys_pages,
 			    meta.num_dyn_bfregs, bfregi->num_dyn_bfregs,
@@ -263,27 +266,63 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT)(
 			    (unsigned long long)c->lib_caps,
 			    meta.lib_uar_4k, bfregi->lib_uar_4k ? 1 : 0,
 			    meta.lib_uar_dyn, bfregi->lib_uar_dyn ? 1 : 0,
-			    meta.cqe_version, c->cqe_version,
-			    (unsigned)meta.devx_uid, c->devx_uid);
-		/*
-		 * @devx_uid is the FW owner-id LOAD_VHCA_STATE preserves
-		 * byte-equal on every imported PDC/CQC/QPC/MKC/SRQC. A
-		 * mismatch here means the dest's c->devx_uid (set by
-		 * mlx5_ib_alloc_ucontext from either ADOPT_DEVX_UID or
-		 * a fresh mlx5_ib_devx_create) doesn't match what the
-		 * dump-side QUERY_UCONTEXT recorded for the source. We
-		 * reject loud and early here because the only alternative
-		 * is letting subsequent restore_pd/cq/qp stamp a uid that
-		 * doesn't match the FW resources -- destroy_qp_common
-		 * then warn-only-logs the resulting FW failures and
-		 * returns success, so the seam surfaces only at the
-		 * teardown's first uid-propagating opcode (typically
-		 * DEALLOC_PD with bad_resource_state, syndrome 0xef0c8a-
-		 * class). Fix on the CRIU side: pass adopt_devx_uid =
-		 * source.devx_uid (or open without DEVX when source had
-		 * uid=0).
-		 */
+			    meta.cqe_version, c->cqe_version);
 		return -EINVAL;
+	}
+
+	/*
+	 * Precondition #3b: devx_uid mismatch is LOG-AND-CONTINUE, not
+	 * a hard reject.
+	 *
+	 * History: an earlier version of this code (commit
+	 * c659ab66483d "expose VFMIG source devx_uid + harden
+	 * destroy_qp diagnostics") rejected -EINVAL on
+	 * meta.devx_uid != c->devx_uid as defense-in-depth, on the
+	 * (then-current) belief that the CRIU agent's DEALLOC_PD
+	 * failure was caused by a uid mismatch between mpd->uid and
+	 * the FW PDC's owner-uid. Empirical investigation
+	 * (tools/testing/mlx5_vfmig/uobject_restore/qp_destroy_matrix,
+	 * cq_destroy_matrix, mr_destroy_matrix, dealloc_pd_chain)
+	 * subsequently established:
+	 *
+	 *   * DESTROY_QP / 2RST_QP honor cross-uid (FW does not gate
+	 *     on QPC owner-uid for destroy/modify ops).
+	 *   * DESTROY_CQ honors cross-uid (after dropping dependent
+	 *     QPs).
+	 *   * DESTROY_MKEY honors cross-uid.
+	 *   * DEALLOC_PD on a vfmig-restored PDN fails with status
+	 *     0x9 syndrome 0xef0c8a regardless of the asserting uid
+	 *     -- the (pdn -> owner_uid) registration table is wiped
+	 *     by LOAD_VHCA_STATE. The failure is independent of the
+	 *     DEVX/non-DEVX source-uid story; it is mitigated by the
+	 *     vfmig_restored gate landed in mlx5_ib_dealloc_pd
+	 *     (commit ee27d8e391aa).
+	 *
+	 * With that mitigation in place the strict-equality check is
+	 * not load-bearing for the DEALLOC_PD outcome and is now
+	 * actively unhelpful: it rejects the common case of a default
+	 * libmlx5 ucontext (which auto-allocates a fresh DEVX uid on
+	 * every ibv_open_device, so source.devx_uid != dest.devx_uid
+	 * by construction). The standard-verbs data path through such
+	 * ucontexts works fine post-restore -- doorbells and
+	 * completions are HW-only paths that do not consult the FW
+	 * registration tables.
+	 *
+	 * What we still log: the mismatch itself, so an operator
+	 * debugging an unexpected post-restore failure can correlate
+	 * the snapshot's source.devx_uid with what the dest got.
+	 *
+	 * What still fails (intentionally out of scope for v0):
+	 * DEVX-direct manipulation (ibv_devx_obj_*) of restored
+	 * objects -- those use the wiped (uid -> uctx_attrs)
+	 * registration table for ownership validation. See
+	 * tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+	 * "DEVX-direct opcodes" for the FW-team escalation path.
+	 */
+	if (meta.devx_uid != c->devx_uid) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_UCONTEXT: devx_uid mismatch tolerated: snapshot=%u dest=%u (PD destroy gated on vfmig_restored; CQ/QP/MR destroy honor cross-uid; standard-verbs data path is uid-blind)\n",
+			    (unsigned)meta.devx_uid, c->devx_uid);
 	}
 
 	want_uar_len = (size_t)bfregi->num_sys_pages *

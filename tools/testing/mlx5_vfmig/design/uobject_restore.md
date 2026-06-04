@@ -987,20 +987,33 @@ plugin's dump path) and at restore time:
   > [`pd_registration_wipe.md`](pd_registration_wipe.md). In
   > particular: (a) `DESTROY_QP` and `2RST_QP` empirically DO
   > honor cross-uid lanes (the silent-fail framing was wrong --
-  > see `qp_destroy_matrix/`); (b) the `DEALLOC_PD bad_resource_state
-  > syndrome 0xef0c8a` failure is independent of the DEVX/non-DEVX
-  > source-uid story -- it's the (pdn -> owner_uid) registration
-  > table that gets wiped by `LOAD_VHCA_STATE`, not just the (uid
-  > -> uctx_attrs) one, and the same syndrome is returned for
-  > definitely-bogus pdns. The kernel-side mitigation landed in
-  > `mlx5_ib_dealloc_pd` (gated on `mpd->vfmig_restored` plus the
-  > exact "PDN unknown" status/syndrome tuple) closes the failure
-  > path for v0; see the design doc for the full leak-budget
-  > analysis and the parallel with the upstream vfio-mlx5 SR-IOV
-  > VM-LM path. The strict-equality `meta.devx_uid` check on
-  > `RESTORE_UCONTEXT` (commit `c659ab66483d`) is preserved as
-  > defense-in-depth but is no longer load-bearing for the
-  > DEALLOC_PD outcome.
+  > see `qp_destroy_matrix/`); (b) `DESTROY_CQ` (after dropping
+  > dependent QPs) and `DESTROY_MKEY` also honor cross-uid lanes
+  > (`cq_destroy_matrix/`, `mr_destroy_matrix/`); (c) the
+  > `DEALLOC_PD bad_resource_state syndrome 0xef0c8a` failure is
+  > independent of the DEVX/non-DEVX source-uid story -- it's the
+  > (pdn -> owner_uid) registration table that gets wiped by
+  > `LOAD_VHCA_STATE`, not just the (uid -> uctx_attrs) one, and
+  > the same syndrome is returned for definitely-bogus pdns. The
+  > kernel-side mitigation landed in `mlx5_ib_dealloc_pd` (gated
+  > on `mpd->vfmig_restored` plus the exact "PDN unknown"
+  > status/syndrome tuple) closes the failure path for v0.
+  >
+  > **Update (2026-06, follow-up):** the strict-equality
+  > `meta.devx_uid` check in `RESTORE_UCONTEXT` (commit
+  > `c659ab66483d`) was relaxed to log-and-continue. With the
+  > `mlx5_ib_dealloc_pd` gate in place and the empirically-proven
+  > cross-uid behaviour of `DESTROY_QP`/`DESTROY_CQ`/`DESTROY_MKEY`,
+  > the strict check is no longer load-bearing AND it actively
+  > rejects the common case of a default `libmlx5` ucontext, where
+  > `source.devx_uid != dest.devx_uid` by construction (each
+  > `ibv_open_device` auto-allocates a fresh DEVX uid). The
+  > standard-verbs data path through such ucontexts works fine
+  > post-restore -- doorbells and completions are HW-only and do
+  > not consult the FW registration tables. Mismatch is now logged
+  > via `mlx5_ib_dbg` ("VFMIG_RESTORE_UCONTEXT: devx_uid mismatch
+  > tolerated"). DEVX-direct manipulation of restored objects
+  > remains out of scope for v0.
 
 **Landed shape (mlx5)**
 

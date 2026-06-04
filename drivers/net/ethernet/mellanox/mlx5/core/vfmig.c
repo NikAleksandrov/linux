@@ -1961,6 +1961,292 @@ out_unlock:
 }
 
 /*
+ * MLX5_VFMIG_IOC_PROBE_CQ_DESTROY handler -- experimental, §S3b
+ * "Generalising to QP/CQ" empirical (CQ branch).
+ *
+ * Issues QUERY_CQ -> DESTROY_CQ(@cqn, uid=@uid_hint) -> QUERY_CQ
+ * on the bound VF mdev's cmdif and reports the bracketed FW
+ * results so the harness can verify cross-uid DESTROY_CQ behaves
+ * the same way as DESTROY_QP (cross-uid honored, no kernel gate
+ * needed) versus DEALLOC_PD (cross-uid honored opcode-wise but
+ * the resource is unknown to the dest VHCA's allocator, kernel
+ * gate needed). The op-under-test errno is captured in
+ * @op_status / @op_syndrome and the call returns 0 on FW reject.
+ *
+ * Locking, VF mdev lookup, and cmdif-uid handling all mirror
+ * vfmig_ioc_probe_qp_teardown above; see that handler's comment
+ * block for the full rationale.
+ */
+static long vfmig_ioc_probe_cq_destroy(struct mlx5_vfmig_pf *vfmig,
+				       void __user *uarg)
+{
+	u32 q_in[MLX5_ST_SZ_DW(query_cq_in)] = {};
+	u32 q_out[MLX5_ST_SZ_DW(query_cq_out)];
+	u32 d_in[MLX5_ST_SZ_DW(destroy_cq_in)] = {};
+	u32 d_out[MLX5_ST_SZ_DW(destroy_cq_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_cq_destroy arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	void *cqc;
+	int err, op_err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (memchr_inv(arg.reserved_in, 0, sizeof(arg.reserved_in)))
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.cqn & 0xff000000)
+		return -EINVAL;
+	if (arg.uid_hint & 0xffff0000)
+		return -EINVAL;
+
+	arg.pre_query_status = 0;
+	arg.pre_query_syndrome = 0;
+	arg.pre_cqc_status = 0;
+	memset(arg.reserved_pre, 0, sizeof(arg.reserved_pre));
+	arg.op_status = 0;
+	arg.op_syndrome = 0;
+	arg.post_query_status = 0;
+	arg.post_query_syndrome = 0;
+	arg.post_cqc_status = 0;
+	memset(arg.reserved_post, 0, sizeof(arg.reserved_post));
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_cq_destroy: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_cq_destroy: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	memset(q_out, 0, sizeof(q_out));
+	MLX5_SET(query_cq_in, q_in, opcode, MLX5_CMD_OP_QUERY_CQ);
+	MLX5_SET(query_cq_in, q_in, cqn, arg.cqn);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.pre_query_status = (u32)(int)err;
+		arg.pre_query_syndrome = MLX5_GET(query_cq_out, q_out,
+						  syndrome);
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: probe_cq_destroy: vf %u cqn 0x%x pre QUERY_CQ err %d syndrome 0x%x -- skipping op + post-query\n",
+			      arg.vf_id, arg.cqn, err,
+			      arg.pre_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+	cqc = MLX5_ADDR_OF(query_cq_out, q_out, cq_context);
+	arg.pre_cqc_status = MLX5_GET(cqc, cqc, status);
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: probe_cq_destroy: vf %u cqn 0x%x pre-op status=0x%x\n",
+		      arg.vf_id, arg.cqn, arg.pre_cqc_status);
+
+	MLX5_SET(destroy_cq_in, d_in, opcode, MLX5_CMD_OP_DESTROY_CQ);
+	MLX5_SET(destroy_cq_in, d_in, cqn, arg.cqn);
+	MLX5_SET(destroy_cq_in, d_in, uid, arg.uid_hint);
+	op_err = mlx5_cmd_exec(vf_mdev, d_in, sizeof(d_in),
+			       d_out, sizeof(d_out));
+	arg.op_syndrome = MLX5_GET(destroy_cq_out, d_out, syndrome);
+	arg.op_status = (u32)op_err;
+	mlx5_core_info(pf_mdev,
+		       "vfmig: probe_cq_destroy: vf %u cqn 0x%x DESTROY_CQ(uid=0x%x) -> err=%d syndrome=0x%x\n",
+		       arg.vf_id, arg.cqn, arg.uid_hint, op_err,
+		       arg.op_syndrome);
+
+	memset(q_out, 0, sizeof(q_out));
+	memset(q_in, 0, sizeof(q_in));
+	MLX5_SET(query_cq_in, q_in, opcode, MLX5_CMD_OP_QUERY_CQ);
+	MLX5_SET(query_cq_in, q_in, cqn, arg.cqn);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.post_query_status = (u32)(int)err;
+		arg.post_query_syndrome = MLX5_GET(query_cq_out, q_out,
+						   syndrome);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: probe_cq_destroy: vf %u cqn 0x%x post QUERY_CQ err %d syndrome 0x%x (CQC likely destroyed)\n",
+			       arg.vf_id, arg.cqn, err,
+			       arg.post_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+	cqc = MLX5_ADDR_OF(query_cq_out, q_out, cq_context);
+	arg.post_cqc_status = MLX5_GET(cqc, cqc, status);
+	mlx5_core_info(pf_mdev,
+		       "vfmig: probe_cq_destroy: vf %u cqn 0x%x post-op CQC ALIVE status=0x%x (uid_hint=0x%x op_status=0x%x op_syndrome=0x%x)\n",
+		       arg.vf_id, arg.cqn, arg.post_cqc_status,
+		       arg.uid_hint, arg.op_status, arg.op_syndrome);
+
+out_copy:
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
+/*
+ * MLX5_VFMIG_IOC_PROBE_MR_DESTROY handler -- experimental, §S3b
+ * "Generalising to QP/CQ" empirical (MR/mkey branch).
+ *
+ * Issues QUERY_MKEY -> DESTROY_MKEY(@mkey_index, uid=@uid_hint) ->
+ * QUERY_MKEY on the bound VF mdev's cmdif. Identical bracketing
+ * pattern to vfmig_ioc_probe_cq_destroy; see that comment block
+ * for verdict semantics.
+ */
+static long vfmig_ioc_probe_mr_destroy(struct mlx5_vfmig_pf *vfmig,
+				       void __user *uarg)
+{
+	u32 q_in[MLX5_ST_SZ_DW(query_mkey_in)] = {};
+	u32 q_out[MLX5_ST_SZ_DW(query_mkey_out)];
+	u32 d_in[MLX5_ST_SZ_DW(destroy_mkey_in)] = {};
+	u32 d_out[MLX5_ST_SZ_DW(destroy_mkey_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_probe_mr_destroy arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	void *mkc;
+	int err, op_err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (memchr_inv(arg.reserved_in, 0, sizeof(arg.reserved_in)))
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.mkey_index & 0xff000000)
+		return -EINVAL;
+	if (arg.uid_hint & 0xffff0000)
+		return -EINVAL;
+
+	arg.pre_query_status = 0;
+	arg.pre_query_syndrome = 0;
+	arg.pre_mkc_free = 0;
+	memset(arg.reserved_pre, 0, sizeof(arg.reserved_pre));
+	arg.op_status = 0;
+	arg.op_syndrome = 0;
+	arg.post_query_status = 0;
+	arg.post_query_syndrome = 0;
+	arg.post_mkc_free = 0;
+	memset(arg.reserved_post, 0, sizeof(arg.reserved_post));
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_mr_destroy: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: probe_mr_destroy: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	memset(q_out, 0, sizeof(q_out));
+	MLX5_SET(query_mkey_in, q_in, opcode, MLX5_CMD_OP_QUERY_MKEY);
+	MLX5_SET(query_mkey_in, q_in, mkey_index, arg.mkey_index);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.pre_query_status = (u32)(int)err;
+		arg.pre_query_syndrome = MLX5_GET(query_mkey_out, q_out,
+						  syndrome);
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: probe_mr_destroy: vf %u mkey_idx 0x%x pre QUERY_MKEY err %d syndrome 0x%x -- skipping op + post-query\n",
+			      arg.vf_id, arg.mkey_index, err,
+			      arg.pre_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+	mkc = MLX5_ADDR_OF(query_mkey_out, q_out, memory_key_mkey_entry);
+	arg.pre_mkc_free = MLX5_GET(mkc, mkc, free);
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: probe_mr_destroy: vf %u mkey_idx 0x%x pre-op free=%u\n",
+		      arg.vf_id, arg.mkey_index, arg.pre_mkc_free);
+
+	MLX5_SET(destroy_mkey_in, d_in, opcode, MLX5_CMD_OP_DESTROY_MKEY);
+	MLX5_SET(destroy_mkey_in, d_in, mkey_index, arg.mkey_index);
+	MLX5_SET(destroy_mkey_in, d_in, uid, arg.uid_hint);
+	op_err = mlx5_cmd_exec(vf_mdev, d_in, sizeof(d_in),
+			       d_out, sizeof(d_out));
+	arg.op_syndrome = MLX5_GET(destroy_mkey_out, d_out, syndrome);
+	arg.op_status = (u32)op_err;
+	mlx5_core_info(pf_mdev,
+		       "vfmig: probe_mr_destroy: vf %u mkey_idx 0x%x DESTROY_MKEY(uid=0x%x) -> err=%d syndrome=0x%x\n",
+		       arg.vf_id, arg.mkey_index, arg.uid_hint, op_err,
+		       arg.op_syndrome);
+
+	memset(q_out, 0, sizeof(q_out));
+	memset(q_in, 0, sizeof(q_in));
+	MLX5_SET(query_mkey_in, q_in, opcode, MLX5_CMD_OP_QUERY_MKEY);
+	MLX5_SET(query_mkey_in, q_in, mkey_index, arg.mkey_index);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.post_query_status = (u32)(int)err;
+		arg.post_query_syndrome = MLX5_GET(query_mkey_out, q_out,
+						   syndrome);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: probe_mr_destroy: vf %u mkey_idx 0x%x post QUERY_MKEY err %d syndrome 0x%x (MKC likely destroyed)\n",
+			       arg.vf_id, arg.mkey_index, err,
+			       arg.post_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+	mkc = MLX5_ADDR_OF(query_mkey_out, q_out, memory_key_mkey_entry);
+	arg.post_mkc_free = MLX5_GET(mkc, mkc, free);
+	mlx5_core_info(pf_mdev,
+		       "vfmig: probe_mr_destroy: vf %u mkey_idx 0x%x post-op MKC ALIVE free=%u (uid_hint=0x%x op_status=0x%x op_syndrome=0x%x)\n",
+		       arg.vf_id, arg.mkey_index, arg.post_mkc_free,
+		       arg.uid_hint, arg.op_status, arg.op_syndrome);
+
+out_copy:
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
+/*
  * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND handler -- user_mr_dma stage-2
  * success-criterion accessor.
  *
@@ -4715,6 +5001,12 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_PROBE_DEALLOC_PD:
 		ret = vfmig_ioc_probe_dealloc_pd(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_PROBE_CQ_DESTROY:
+		ret = vfmig_ioc_probe_cq_destroy(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_PROBE_MR_DESTROY:
+		ret = vfmig_ioc_probe_mr_destroy(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

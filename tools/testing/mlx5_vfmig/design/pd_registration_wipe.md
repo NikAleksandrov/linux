@@ -280,13 +280,14 @@ Three edits, all in `drivers/infiniband/hw/mlx5/`:
   `mlx5_ib_dev_res` PDs, ...) keep their unmodified semantics.
 
 **Does NOT cover**:
-* `DESTROY_QP`/`DESTROY_CQ` for restored QPs/CQs -- the QP destroy
-  matrix (`qp_destroy_matrix/`) showed those work cross-uid
-  without any gate. CQs do not reference PDs in `cqc` so the
-  "registration wipe" pattern doesn't apply to them in the same
-  way. If a future test reveals a similar symptom for QP/CQ
-  destruction, the same `vfmig_restored` flag pattern can be
-  applied.
+* `DESTROY_QP`/`DESTROY_CQ`/`DESTROY_MKEY` for restored
+  QPs/CQs/MRs -- the three destroy-matrix harnesses (`qp_destroy
+  _matrix/`, `cq_destroy_matrix/`, `mr_destroy_matrix/`) confirmed
+  all of those honor cross-uid lanes. The "registration wipe"
+  pattern is unique to PDs because the PD's per-VHCA storage IS
+  the registration entry; CQs/QPs/MRs have dedicated context
+  tables (CQC/QPC/MKC) that ARE preserved verbatim by LOAD, so
+  destroy commands find them via the resource ID and succeed.
 * DEVX-direct opcodes (`MODIFY_GENERAL_OBJECT`,
   `QUERY_GENERAL_OBJECT`, ...) on migrated objects -- those use
   the wiped uid registration table for ownership validation and
@@ -299,7 +300,57 @@ Three edits, all in `drivers/infiniband/hw/mlx5/`:
   small short-lived PDs originally allocated on the source) the
   leak could become noticeable in long-lived processes.
 
-### 5.3 Leak budget (formal)
+### 5.3 Companion change: relaxed `RESTORE_UCONTEXT` devx_uid check
+
+When the gated `mlx5_ib_dealloc_pd` workaround landed, the
+strict-equality check on `meta.devx_uid` in
+`MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT` (commit `c659ab66483d`)
+became actively unhelpful. That check was originally added as
+defense-in-depth on the (then-current) belief that mismatched
+`devx_uid` between source and destination was the root cause of
+the `DEALLOC_PD bad_resource_state syndrome 0xef0c8a-class`
+failure. The empirical work in §3 / §6 established that:
+
+* The failure is per-VHCA registration-table wipe, not a
+  uid mismatch, so the strict check does not prevent it.
+* The PD-destroy gate now suppresses the failure for restored
+  PDs regardless of the asserting `uid`.
+* `DESTROY_QP/CQ/MKEY` work cross-uid in their own right.
+* Standard-verbs data path through default `libmlx5` ucontexts
+  (auto-DEVX, fresh `devx_uid` per `ibv_open_device`) does NOT
+  rely on `source.devx_uid == dest.devx_uid` -- doorbells and
+  completions are HW-only paths that never consult the FW
+  registration tables.
+
+The strict check thus rejected the common case (default
+`libmlx5` source with a fresh `devx_uid` on the dest) without
+preventing any concrete failure. The follow-up relaxation in
+`drivers/infiniband/hw/mlx5/vfmig_uctx.c::UVERBS_HANDLER(VFMIG
+_RESTORE_UCONTEXT)`:
+
+* Splits Precondition #3 into:
+  * **#3a** (strict, retained): bfregi shape, `lib_caps`,
+    `lib_uar_4k`, `lib_uar_dyn`, `cqe_version`. Mismatches here
+    indicate structural drift that would corrupt the dest's
+    UAR map and are still rejected `-EINVAL`.
+  * **#3b** (log-and-continue, new): `meta.devx_uid != c->devx_uid`.
+    Mismatches are logged via `mlx5_ib_dbg` but do not fail the
+    method.
+* Continues to refuse DEVX-direct opcodes against restored
+  resources (those need uctx-registry preservation, which FW
+  still does not provide -- see §7 escalation path).
+
+The kernel-side regression test for the relaxed path is
+end-to-end: any source ucontext that uses `libmlx5` auto-DEVX
+followed by a destination ucontext opened without
+`MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID` will land on the relaxed
+path. A dedicated synthetic-mismatch probe (open
+`VFMIG_RESTORE | DEVX` without `ADOPT_DEVX_UID` and call
+`RESTORE_UCONTEXT` against a captured snapshot) is a future
+artifact -- v0 relies on the empirical matrices + the gate +
+end-to-end PD-restore harness for coverage.
+
+### 5.4 Leak budget (formal)
 
 Let `N_src` be the source's PD count at SAVE time (= number of
 PDs that arrive on the destination via `RESTORE_PD`).
@@ -321,29 +372,62 @@ RDMA applications). The dest VHCA's PDN namespace is also
 24-bit; the leak is a small fraction of available namespace per
 restore.
 
-## 6. Generalising to QP/CQ
+## 6. Generalising to QP/CQ/MR
 
-Per the QP destroy matrix, `DESTROY_QP` works cross-uid for
-RESET-state QPs. We have not exhaustively tested:
-* Non-RESET QPs (`INIT`/`RTR`/`RTS`).
-* `DESTROY_CQ`.
-* `DESTROY_MKEY`.
-* `MODIFY_QP` transitions on restored QPs.
+Empirically tested on FW 28.48.1000 with three destroy-direction
+matrix harnesses (one per resource type). **PDs are unique** in
+exhibiting the registration-wipe symptom; **QPs, CQs, and MRs all
+roundtrip cleanly cross-uid** post-LOAD_VHCA_STATE.
 
-If any of these reveal a similar "registration wiped" symptom,
-the same pattern applies:
+| Resource | Harness | Result | Gate needed? |
+|---|---|---|---|
+| QP (RESET) | `qp_destroy_matrix/test_qp_destroy_matrix.sh` | `DESTROY_QP` and `2RST_QP` honor cross-uid for all three lanes (uid=0, uid=src_devx, uid=hi_unalloc). Post-op `QUERY_QP` returns syndrome `0x23528a` ("QPC not found"). | No |
+| CQ | `cq_destroy_matrix/test_cq_destroy_matrix.sh` | After dropping the dependent QP first (`DESTROY_QP(uid=0)` works cross-uid for that), `DESTROY_CQ` succeeds cross-uid for all three lanes. Post-op `QUERY_CQ` returns syndrome `0x1fb6ec` ("CQC not found"). | No |
+| MR (mkey) | `mr_destroy_matrix/test_mr_destroy_matrix.sh` | `DESTROY_MKEY` succeeds cross-uid for all three lanes; post-op `QUERY_MKEY` returns "MKC not found". MRs do not require pre-tearing dependents. | No |
+| PD | `dealloc_pd_chain/test_dealloc_pd_chain.sh` | `DEALLOC_PD` on vfmig-restored PDs **fails** with status `0x9` syndrome `0xef0c8a` (PDN unknown to allocator) for all three lanes; same shape as definitely-bogus pdns. | **YES** -- gate landed in `mlx5_ib_dealloc_pd` |
 
-1. Add `bool vfmig_restored` to the relevant struct
-   (`mlx5_ib_qp`, `mlx5_ib_cq`, `mlx5_ib_mr`).
+This matches the architectural model in §3: FW preserves the
+allocator counters and the resource contexts, but the per-resource
+registration tables that map IDs to owner-uid are wiped only for
+PDs. CQs and mkeys appear to have a different storage path inside
+FW (likely in their dedicated context tables, which ARE preserved
+verbatim across LOAD), so cross-uid destroy commands find them via
+the resource ID and succeed. PDs are the outlier because the
+"PD context" is essentially just the registration entry -- there
+is no dedicated PDC ICM region for FW to preserve.
+
+**Pre-tearing for CQs**: a first version of `cq_destroy_matrix`
+ran `DESTROY_CQ` directly on a CQC that still had a dependent
+QPC referencing it via `qpc.send_cqn`/`qpc.recv_cqn`, and FW
+rejected with syndrome `0x1870ad` ("CQ has dependents"). This is
+**not** the registration-wipe symptom; it is FW's normal
+dependency enforcement and is uid-independent. The harness was
+updated to drop the dependent QP first (cross-uid `DESTROY_QP`
+under `uid=0` works fine per the QP matrix) before running the
+CQ destroy under the lane's `uid_hint`. This mirrors the actual
+mlx5_ib teardown order (`destroy_qp -> destroy_cq -> dealloc_pd`)
+and isolates the cross-uid CQN-registration question from
+dependent-tracking.
+
+**MRs and dependents**: MRs do not require any pre-teardown.
+The MKEY context references its parent PD via `mkc.pd` but FW
+does not block `DESTROY_MKEY` on the PDN being unknown. Posted
+WRs that reference the MKEY at WR-time are a transient
+relationship and do not affect destroy.
+
+**If a future test reveals a similar registration-wiped symptom**
+on a different opcode (e.g., a non-RESET QP modify path, an
+mlx5_ib_devx_modify path), the same pattern applies:
+
+1. Add `bool vfmig_restored` to the relevant struct.
 2. Set it in the corresponding `RESTORE_*` method.
-3. Capture the FW status and syndrome in the destructor.
-4. Gate suppression on the specific syndrome class observed
-   empirically (do **not** suppress arbitrary failures -- doing
-   so would mask real kernel/FW bookkeeping bugs).
-
-A v1 follow-up should run a destroy-direction matrix harness for
-each of these resource types, mirroring `qp_destroy_matrix` and
-`dealloc_pd_chain`, and document the syndromes observed.
+3. Capture FW status and syndrome in the destructor (use
+   `mlx5_cmd_do` instead of `mlx5_cmd_exec` to suppress the
+   default loud `mlx5_cmd_out_err` log on the gated path; replay
+   through `mlx5_cmd_check` on the warn path).
+4. Gate suppression on the precise syndrome class observed
+   empirically. Do **not** suppress arbitrary failures -- that
+   would mask real bookkeeping bugs.
 
 ## 7. The proper fix (FW-side)
 
@@ -375,6 +459,8 @@ compatibility until support drops.
 | Test | Path | Result |
 |---|---|---|
 | QP destroy matrix | `tools/testing/mlx5_vfmig/uobject_restore/qp_destroy_matrix/test_qp_destroy_matrix.sh` | Cross-uid `DESTROY_QP`/`2RST_QP` work; "silent no-op" hypothesis refuted. |
+| CQ destroy matrix | `tools/testing/mlx5_vfmig/uobject_restore/cq_destroy_matrix/test_cq_destroy_matrix.sh` | Cross-uid `DESTROY_CQ` works after dropping dependent QP; no gate needed. |
+| MR destroy matrix | `tools/testing/mlx5_vfmig/uobject_restore/mr_destroy_matrix/test_mr_destroy_matrix.sh` | Cross-uid `DESTROY_MKEY` works directly; no gate needed. |
 | DEALLOC_PD (PD-only) | `tools/testing/mlx5_vfmig/uobject_restore/dealloc_pd_matrix/test_dealloc_pd_matrix.sh` | `DEALLOC_PD` succeeds on dest for source-PD-only shape. |
 | DEALLOC_PD (PD+CQ+QP) | `tools/testing/mlx5_vfmig/uobject_restore/dealloc_pd_chain/test_dealloc_pd_chain.sh` | `DEALLOC_PD` fails `0xef0c8a` for source-PD+CQ+QP shape. |
 | PDN high-water | `tools/testing/mlx5_vfmig/uobject_restore/dealloc_pd_chain/test_pdn_highwater.sh` | Dest's first fresh `ALLOC_PD` returns `pdn > src_max_pdn`; high-water survives LOAD. |

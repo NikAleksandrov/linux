@@ -2212,6 +2212,21 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 					goto out_devx;
 			}
 		}
+		/*
+		 * One-line trace of the devx_uid the destination FW just
+		 * allocated for this ucontext. mlx5_ib_dbg keeps it off by
+		 * default; enable via dynamic_debug
+		 *   echo 'func mlx5_ib_alloc_ucontext +p' \
+		 *     > /sys/kernel/debug/dynamic_debug/control
+		 * The §S3b destroy/dealloc matrix harnesses (qp_destroy_matrix,
+		 * cq_destroy_matrix, mr_destroy_matrix, dealloc_pd_chain) grep
+		 * dmesg for this format on the source-VF ibdev to capture
+		 * src_devx_uid for the cross-uid lane of their probes.
+		 */
+		mlx5_ib_dbg(dev,
+			    "vfmig_uctx_dbg: alloc_ucontext ibdev=%s devx_uid=%u adopted=%d\n",
+			    dev_name(&ibdev->dev), context->devx_uid,
+			    !!(req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE));
 	}
 
 	lib_uar_4k = req.lib_caps & MLX5_LIB_CAP_4K_UAR;

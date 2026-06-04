@@ -282,16 +282,21 @@ echo "source ibdev: $SRC_IBDEV"
 
 echo "=== Phase B: 6 source probes, capturing 6 (pdn, cqn, qpn) ==="
 sudo dmesg -C
+# Enable the mlx5_ib_dbg trace in mlx5_ib_alloc_ucontext that emits
+# the freshly-allocated devx_uid (vfmig_uctx_dbg). Replaced the older
+# vfmig_pd_dbg pr_info that we cleaned up after the gate landed.
+echo 'func mlx5_ib_alloc_ucontext +p' | \
+    sudo tee /sys/kernel/debug/dynamic_debug/control >/dev/null 2>&1 || true
 for i in 0 1 2 3 4 5; do
     start_indexed_src_probe "$i" "$SRC_IBDEV" "src${i}"
 done
 
-# Capture src_devx_uid from kernel-side dmesg (libmlx5 default
-# auto-DEVX yields a non-zero uid; we read the truth off mlx5_ib's
-# vfmig_pd_dbg pr_info, mirroring test_pd_adopt.sh's approach).
+# Capture src_devx_uid from the new vfmig_uctx_dbg trace. libmlx5's
+# default ibv_open_device auto-allocates a DEVX uid; we read its
+# value directly from mlx5_ib_alloc_ucontext's debug print.
 src_devx_uid=$(sudo dmesg | \
-    grep -E "vfmig_pd_dbg: alloc_pd ibdev=$SRC_IBDEV .*uid=[0-9]+ udata=1" | \
-    tail -1 | sed -nE 's/.* uid=([0-9]+) .*/\1/p')
+    grep -E "vfmig_uctx_dbg: alloc_ucontext ibdev=$SRC_IBDEV devx_uid=[0-9]+ adopted=0" | \
+    tail -1 | sed -nE 's/.* devx_uid=([0-9]+) .*/\1/p')
 src_devx_uid=${src_devx_uid:-0}
 echo "captured: src_devx_uid=$src_devx_uid"
 
