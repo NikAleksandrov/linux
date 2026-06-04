@@ -797,10 +797,14 @@ non-interference principle for restore-mode-only changes.
 | KS6b.2 | Verify FW accepts `MODIFY_QP(RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` against a real RTS RC QP, with only `path.rmac_47_32 / rmac_31_0` changed and PSN / dest_qpn / sgid_index untouched. | small | high | pending end-to-end run (post-fix `mlx5_vfmig query_qp` + harness rerun -- verdict should flip to `DMAC_IS_PEER`, with `qpc_last_acked_psn` advancing past the stuck WR). |
 | KS6b.3 | Decide on the `rdma_addr_find_l2_eth_by_grh_cached` non-blocking variant. | trivial | medium | **N/A** -- as-built helper uses `neigh_lookup` directly against the port's netdev (synchronous, cache-only, no ARP/NS solicit). See §10. v1's Policy B may revisit. |
 | KS6b.4 | Add the `local_ack_timeout_err` regression check to the `qp_restore_probe` harness: assert delta == 0 across one successful migrated-QP roundtrip after the fix lands. | small | medium | pending. |
-| KS6b.5 | (Optional) Policy B deferred-refresh on first post_send (§5.3). v1 follow-up. | medium | low | deferred. |
+| KS6b.5 | (Optional) Policy B deferred-refresh on first post_send (§5.3). v1 follow-up. | medium | low | **N/A for the v0 harness** -- `mlx5_ib_post_send` is the kverbs `ib_device_ops.post_send` callback and is NOT reached for uverbs-created QPs (the data path goes directly to userspace SQ + UAR doorbell). For our use case Policy B would never fire. Replaced by KS6b.6 below. |
+| KS6b.6 | Dev-branch backup: userspace-triggered `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl driven from the harness AFTER `pin_static_neighbor_*` (see §11). The always-on path inside RESTORE_QP fires too early for the v0 harness ordering and hits Policy A; this ioctl is the manual escape hatch. | small | high | **DONE** -- handler in `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c`, CLI verb `mlx5_vfmig refresh_av_dmac <vf_id> <qpn>`, wrapper script `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/refresh_av_dmac.sh`. Pending end-to-end run. |
 
 KS6b.0 + KS6b.1 unblocked the v0 RC datapath end-to-end (subject to
 KS6b.2 confirmation). KS6b.4 is the post-fix regression guard.
+KS6b.6 backstops KS6b.1 for harness orderings that pin neighbors
+*after* RESTORE_QP returns -- which is the actual shape of the v0
+mlx5_sriov_vfmig criu plugin. See §11.
 
 ## 9. Cross-references
 
@@ -926,6 +930,135 @@ principle be reused by any future code path that needs the same
 operation against a `mlx5_core_qp` -- e.g. a probe ioctl for
 KS6b.2-style validation.
 
+## 11. Dev-branch backup: userspace-triggered refresh ioctl (KS6b.6)
+
+The first end-to-end run with KS6b.1 in place surfaced a harness
+ordering issue rather than a kernel bug: the always-on
+`mlx5_ib_restore_qp_refresh_av_dmac` was being called inside the
+`RESTORE_QP` uobject path **before** the harness's
+`pin_static_neighbor_*` step had populated the destination's ARP /
+NDISC table. `vfmig_lookup_l2_dmac` therefore returned `-ENOENT`
+on every restored RC/UC QP and Policy A (log + skip) silently
+deferred the refresh -- leaving the QPC with the stale
+source-resolved dmac and the data path back at `RETRY_EXC`.
+
+The dmesg signature on both physical hosts after that run:
+
+```
+vfmig: refresh_av_dmac qpn=0xff: deferring -- destination neighbor
+for dgid=0000:0000:0000:0000:0000:ffff:c0a8:6404 not resolved
+(err=-2). First post_send will RETRY_EXC until the operator
+populates the neighbor entry...
+```
+
+(Notice `err=-2` == `-ENOENT` from `neigh_lookup`. The dgid is the
+v4-mapped form of the peer's IPv4. `qpn=0xff` is the migrated QP.)
+
+### 11.1 Why we need a userspace surface and not a kernel-only fix
+
+The natural in-kernel alternative is "Policy B: refresh on first
+post_send". It does not work for our case:
+
+- `mlx5_ib_post_send` is the kverbs `ib_device_ops.post_send`
+  callback, reached only via `ib_post_send()` from kernel-mode
+  RDMA consumers (NVMe-RDMA, IPoIB, RDS).
+- For uverbs-created QPs (i.e. anything our CRIU harness
+  restores), the WQE write + UAR doorbell happen entirely in
+  userspace via the libibverbs-mapped SQ buffer. The kernel sees
+  nothing on the data path.
+
+So the kernel has no synchronous hook between `RESTORE_QP`
+returning and the application's first `ibv_post_send`. The only
+hooks left are control-plane ioctls (modify_qp, query_qp, destroy
+via uverbs) and async events. Neither fires "automatically before
+the first WQE."
+
+A workqueue-driven background retry (the kernel polls
+`neigh_lookup` every N seconds until it succeeds) is a possible
+v1 follow-up but adds a per-QP timer and a periodic poll; the
+explicit ioctl is simpler, exposes structured pre/post output for
+the harness log, and lets the harness drive ordering precisely.
+
+### 11.2 As-built shape
+
+| component | what changed | LOC |
+|---|---|---|
+| `include/uapi/linux/mlx5_vfmig.h` | new `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` (cmd 0x12) + `struct mlx5_vfmig_refresh_av_dmac` carrying `vf_id` / `qpn` inputs and pre-op / lookup / op / post-op output fields. | ~180 (incl. doc comment) |
+| `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c` | `vfmig_lookup_l2_dmac()` static helper (mirror of `mlx5_ib_lookup_l2_dmac` but uses `mlx5_uplink_netdev_get`), `vfmig_path_extract_dmac()` static helper, `vfmig_ioc_refresh_av_dmac()` handler, dispatch wiring. | ~230 |
+| `tools/testing/mlx5_vfmig/tools/mlx5_vfmig.c` | new `do_refresh_av_dmac()` verb-handler with key=value output (including a derived `verdict=` line) and updated usage. | ~110 |
+| `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/refresh_av_dmac.sh` | new wrapper mirroring `check_qp_av_dmac.sh`'s PF/VF derivation; drives the ioctl and decodes the verdict. | ~140 |
+
+**Note: there is intentional code duplication** between
+`mlx5_ib_lookup_l2_dmac` (in `drivers/infiniband/hw/mlx5/qp.c`)
+and `vfmig_lookup_l2_dmac` (in
+`drivers/net/ethernet/mellanox/mlx5/core/vfmig.c`). The bodies are
+~50 LOC each and identical apart from how each side acquires the
+netdev (mlx5_ib uses `ib_device_get_netdev`; mlx5_core uses
+`mlx5_uplink_netdev_get`). A follow-up commit can pull the
+neigh-lookup core down into a `mlx5_core` lib helper exported via
+`EXPORT_SYMBOL_GPL` and have mlx5_ib call it; deferred until the
+runtime fix is verified end-to-end (so the refactor doesn't gate
+the fix). The orchestrators above the lookup don't unify well --
+mlx5_ib's helper goes through `mlx5_core_qp_modify` (which uses
+`qp->uid`), the ioctl runs MODIFY_QP host-priv with explicit
+`uid=0` -- so the ~80 LOC orchestrator duplication is not
+recoverable by a shared helper.
+
+The orchestrator follows the same QUERY_QP -> action -> QUERY_QP
+bracketing pattern as `vfmig_ioc_probe_qp_teardown`. The op-under-
+test errno is reported in `op_status` / `op_syndrome` rather than
+propagated as the ioctl return, so the caller still sees the
+post-op snapshot even on FW reject. Pre-op and lookup failures
+short-circuit with the rest of the output zeroed.
+
+### 11.3 No module-parameter gate
+
+An earlier draft of this section gated the ioctl on a default-off
+`vfmig_av_dmac_refresh_enabled` module parameter. Dropped: the
+ioctl is unconditionally available, on the principle that if we
+don't want the surface we drop the patch entirely rather than ship
+a feature behind a knob nobody flips. The "EXPERIMENTAL DEV-BACKUP"
+disclaimer in the UAPI doc-comment carries the same warning that
+the other PROBE_* / QUERY_* ioctls already use ("can be removed
+without breaking any in-tree consumer").
+
+### 11.4 Harness recipe
+
+On each physical host, after CRIU restore returns and AFTER
+`pin_static_neighbor_*` runs:
+
+```sh
+sudo PF=$PF_BDF tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/\
+refresh_av_dmac.sh <vf_id> <qpn>
+```
+
+Expected post-fix verdict on both hosts:
+
+```
+*** VERDICT=REFRESHED_OK ***
+```
+
+Cross-check by re-running `check_qp_av_dmac.sh` -- it should
+flip from `DMAC_IS_LOCAL` to `DMAC_IS_PEER` for the same
+(vf_id, qpn). Then the application data path should make
+forward progress.
+
+If a host reports `VERDICT=NEIGH_UNRESOLVED` after the
+`pin_static_neighbor_*` step, the static neighbor wasn't pinned
+on the right interface -- inspect `ip neigh show dev $IFACE` and
+re-run the pin step against the VF's RoCE netdev (typically
+visible at `/sys/bus/pci/devices/$VF_BDF/net/<iface>`).
+
+### 11.5 Follow-up: `lookup_l2_dmac` deduplication
+
+Tracked TODO -- pull the neigh-lookup core (which takes an
+already-acquired `net_device *` plus the dgid bytes) down into a
+new exported helper in
+`drivers/net/ethernet/mellanox/mlx5/core/lib/`, and have both
+`mlx5_ib_lookup_l2_dmac` and `vfmig_lookup_l2_dmac` reduce to a
+~15-LOC wrapper that does its idiomatic netdev acquisition and
+delegates. Defer until the v0 runtime fix is verified end-to-end.
+
 ## Changelog
 
 - 2026-06-04: initial draft, filed by the CRIU agent after the
@@ -956,3 +1089,20 @@ KS6b.2-style validation.
   KS6b.1 marked DONE; KS6b.2 (FW acceptance via end-to-end harness
   rerun + verdict flip to `DMAC_IS_PEER`) and KS6b.4 (regression
   guard) remain.
+- 2026-06-04 (later evening): first end-to-end run with KS6b.1 in
+  place hit the harness-ordering issue documented in §11 -- the
+  always-on path runs inside `RESTORE_QP` BEFORE the harness pins
+  static neighbors, so `vfmig_lookup_l2_dmac` returns `-ENOENT`
+  and Policy A defers on every restored QP. KS6b.5 (Policy B on
+  first `mlx5_ib_post_send`) ruled out as architecturally
+  unreachable for uverbs QPs. New KS6b.6 added: dev-branch backup
+  ioctl `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` (cmd 0x12) that re-drives
+  the same QUERY_QP -> neigh_lookup -> MODIFY_QP sequence from
+  userspace, callable AFTER `pin_static_neighbor_*` runs.
+  Implementation landed in `drivers/net/ethernet/mellanox/mlx5/
+  core/vfmig.c` (~230 LOC handler), `tools/testing/mlx5_vfmig/
+  tools/mlx5_vfmig.c` (`refresh_av_dmac` verb), and
+  `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/
+  refresh_av_dmac.sh` wrapper. Module-parameter gate considered
+  and rejected (see §11.3). KS6b.6 marked DONE; KS6b.2 / KS6b.4
+  pending end-to-end harness rerun.
