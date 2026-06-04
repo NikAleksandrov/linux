@@ -74,6 +74,22 @@ Until we have mid-failure data, the "stale dmac" framing is
 **tentative**. The harness change to capture it is documented in
 Section 6.
 
+> **Update (post-initial-draft):** the cheaper diagnostic shortcut
+> -- "just dump `path.rmac_*` from the FW QPC and compare to
+> `ip neigh`" -- is now wired up and ready to run. See
+> [§6.0 Cheapest diagnostic: cdev `query_qp` + `check_qp_av_dmac.sh`](#60-cheapest-diagnostic-cdev-query_qp--check_qp_av_dmacsh)
+> below. Run that on each physical host post-restore (and before
+> any post-restore traffic) to lock or refute the dmac theory in
+> seconds, *without* needing the full §6 tcpdump/pause-step
+> capture flow.
+>
+> The Section-2 RETRY_EXC CQE itself already eliminates one alt
+> hypothesis: if a CQE was generated, FW DID receive the WR. So
+> the bug is downstream of FW receiving the SQ doorbell. The
+> cdev `query_qp` lookup distinguishes the two remaining
+> alternatives (stale dmac in QPC vs FW egressed correctly but
+> peer didn't process) in one ioctl roundtrip.
+
 The minimal set we need, in priority order:
 
 1. `port_xmit_packets` and `tx_packets_phy` deltas across one failed
@@ -402,20 +418,44 @@ the existing FW-state-adopt block, before
 
 ### 5.2 Why `IBV_QP_AV` modify in RTS is the right primitive
 
-The IB spec table for QP state transitions (Table 3-2 in IBA 1.4)
-permits `QP_AV` modify in RTR->RTR and RTS->RTS for RC and UC. mlx5
-honors this: `mlx5_ib_modify_qp` -> `__mlx5_ib_modify_qp` ->
-`modify_raw_packet_qp` / `mlx5_modify_qp` accepts `IB_QP_AV` with
-no state change, and the underlying `MODIFY_QP(opcode=2RTR2RTR or
-2RTS2RTS)` FW command re-runs `mlx5_set_path` -- which is the same
-helper that resolved the dmac at original `MODIFY_QP_TO_RTR` time.
-By going through this primitive we re-use every consistency check
-that the existing path enforces (sgid_index validity, port_num
-match, RoCEv2 traffic-class preservation, etc.).
-
-The alternative -- writing the QPC's `path.rmac_*` fields directly
-via a raw FW command -- bypasses `mlx5_set_path` and would re-
-implement (or skip) those checks. Strictly worse.
+> **Erratum -- this section's claim is wrong as written, and the
+> correction below changes the §5.1 sketch.** The IB spec table
+> for QP state transitions in `drivers/infiniband/core/verbs.c`
+> (`qp_state_table[IB_QPS_RTS][IB_QPS_RTS]`) permits `IB_QP_ALT_PATH`
+> (alternate path) but not primary `IB_QP_AV` for any QP type
+> including RC/UC. mlx5 enforces this gate directly via
+> `ib_modify_qp_is_ok` in `__mlx5_ib_modify_qp`, before any FW
+> command issues. So `mlx5_ib_modify_qp(qp, &attr, IB_QP_AV)`
+> against an RTS QP returns `-EINVAL` from the verbs layer
+> without reaching `mlx5_set_path`. The same gate applies to
+> RTR->RTR.
+>
+> The FW itself **does** support primary-AV update at RTS: the
+> `RTS2RTS_QP` opcode accepts an `opt_param_mask` with
+> `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` set, and mlx5 already wires
+> up the IB_QP_AV -> PRIMARY_ADDR_PATH optpar mapping
+> (`drivers/infiniband/hw/mlx5/qp.c`, the `case IB_QP_AV` in
+> `set_qp_state_optpar`'s caller table). Only the spec-strict
+> verbs validation gate is in the way.
+>
+> The corrected fix uses a **direct `mlx5_cmd_exec(MODIFY_QP)`**
+> issued from inside `mlx5_ib_restore_qp`, bypassing the verbs
+> validation. This matches the gated-restore pattern we already
+> have for the PD-wipe workaround
+> (`pd_registration_wipe.md`'s `mlx5_ib_dealloc_pd` gate): the
+> primitive is mlx5-private, gated on the restore-only path,
+> with all consistency checks done locally (we still call
+> `mlx5_set_path` to fill in the synthesized qpc blob from a
+> rebuilt `rdma_ah_attr`, so sgid_index validity / port_num /
+> RoCEv2 traffic-class preservation are all re-validated --
+> we just don't go through the IB-spec verbs gate).
+>
+> The original §5.2 argument "writing path.rmac_* fields
+> directly via a raw FW command bypasses mlx5_set_path -- strictly
+> worse" was based on the false premise that the verbs path was
+> open. With the verbs path closed, the FW-direct route is the
+> *only* path; we still call `mlx5_set_path` into the synthesized
+> qpc, so the consistency checks are preserved.
 
 ### 5.3 What to do when the neighbor entry isn't resolved yet
 
@@ -472,6 +512,79 @@ The original capture failed because diagnostics ran *after*
 manual pause window between `discover_restored_vf_*` and
 `post_recv_*_after_restore`, during which a one-shot snapshot
 script collects everything we need on both physical hosts.
+
+### 6.0 Cheapest diagnostic: cdev `query_qp` + `check_qp_av_dmac.sh`
+
+Before any of the heavyweight §6.1-§6.3 captures (YAML pause,
+tcpdump, ethtool, hw_counters), the dmac theory can be locked
+or refuted in **one ioctl roundtrip per host** using the cdev's
+existing `MLX5_VFMIG_IOC_QUERY_QP`. The kernel side already pulls
+the entire 64-byte `primary_address_path` out of the FW QPC; the
+userspace tool now decodes the AV subfields locally:
+
+```text
+$ sudo mlx5_vfmig <pf-bdf> query_qp <vf_id> <qpn>
+...
+qpc_primary_address_path=00000000c80fffff...   # 64-byte hex blob
+av_dmac=02:00:f0:04:00:01                       # path.rmac_47_32 || rmac_31_0
+av_dgid=fe80:0000:0000:0000:0000:00ff:fe04:0001 # rgid_rip[16]
+av_dgid_ipv4=192.168.100.5                      # if RoCEv2-IPv4
+av_sgid_index=3
+av_hop_limit=64
+av_vhca_port_num=1
+av_grh=1
+```
+
+The decode is done in userspace from the existing blob (no kernel
+rebuild needed). A runtime self-check cross-decodes pkey_index from
+both the IFC accessor and the raw blob; mismatch aborts the run
+loud rather than silently emitting a wrong dmac.
+
+The harness `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/check_qp_av_dmac.sh`
+wraps the call. It auto-derives IBDEV / IFACE from PF + vf_id,
+queries the QPC, reads the local NIC MAC from sysfs, looks up
+`ip neigh show dev <iface> <av_dgid_ipv4>` for the peer's expected
+MAC, and emits a verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `DMAC_IS_LOCAL` | `av.dmac == local_NIC_mac`. Frames are self-addressed at L2 → fabric drops → no ACK → RETRY_EXC. **Stale-dmac theory CONFIRMED.** Kernel-side restore-time refresh fix is justified. |
+| `DMAC_IS_PEER`  | `av.dmac == peer_mac` from `ip neigh`. L2 destination is correct. **Stale-dmac theory REFUTED.** Look elsewhere (peer RQ state, FW egress, SQ-buf umem mapping). |
+| `DMAC_AMBIGUOUS` | Neither match. Likely `NUD_INCOMPLETE` neighbor, IPv6 dgid (no v4 decode path), or third bug. Inspect manually. |
+
+Operator runbook (run on each physical host, post-restore,
+before any post-restore traffic):
+
+```text
+# Discover the restored QPN (or read it from the test framework's
+# pre-checkpoint state dump):
+$ rdma resource show qp link mlx5_2 -dd | grep "$peer_qpn_hint"
+
+# Run the diagnostic:
+$ sudo PF=0000:08:00.0 ./check_qp_av_dmac.sh <vf_id> <qpn>
+```
+
+This bypasses the §6.1-§6.3 capture flow entirely for the
+specific question "is `av.dmac` stale?". The full capture is still
+useful if §6.0 returns `DMAC_IS_PEER` (we then need pcap/PHY
+counters to localize the alternative bug), but most-likely-case
+the §6.0 verdict is enough to direct the next action.
+
+> **Caveat that comes out of the kernel walk-through:** if §6.0
+> returns `DMAC_IS_LOCAL`, the proposed §5.1 fix shape needs one
+> correction. `mlx5_ib_modify_qp(qp, &attr, IB_QP_AV)` against
+> an RTS QP is **rejected by the verbs layer** before reaching
+> `mlx5_set_path` -- `ib_modify_qp_is_ok`'s `qp_state_table[RTS][RTS]`
+> permits `IB_QP_ALT_PATH` (alternate path) but not primary
+> `IB_QP_AV`, for any QP type. The fix needs a direct
+> `mlx5_cmd_exec(MODIFY_QP, opcode=RTS2RTS,
+> opt_param_mask=PRIMARY_ADDR_PATH)` issued from inside
+> `mlx5_ib_restore_qp`, paralleling the gated-restore pattern we
+> already use for the PD-wipe workaround. The FW *does* support
+> primary-AV update at RTS via the `RTS2RTS_QP` opcode +
+> `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` optpar bit (mlx5 already
+> wires up that optpar mapping at `qp.c:set_qp_state_optpar` for
+> `IB_QP_AV`); only the spec-strict verbs gate stops it.
 
 ### 6.1 YAML pause step
 
@@ -668,15 +781,17 @@ non-interference principle for restore-mode-only changes.
 
 | # | ask | size | priority |
 |---|---|---|---|
-| KS6b.1 | Implement `mlx5_ib_restore_qp_refresh_dmac` per ?5.1 with Policy A (?5.3). Call from `mlx5_ib_restore_qp` after the existing `LOAD_VHCA_STATE` adopt block. Skip non-RC/UC, non-RoCEv2, non-userspace QPs. ~80 lines including helper. | small | high (gates v0 RC datapath end-to-end) |
-| KS6b.2 | Verify `mlx5_ib_modify_qp(qp, &attr, IB_QP_AV)` against an RTS RC QP works as expected (re-runs `mlx5_set_path`, writes `path.rmac_47_32 / rmac_31_0` only, leaves PSN / dest_qpn untouched). Quick FW trace or empirical probe; this is the assumption the whole fix rests on. | trivial | high |
-| KS6b.3 | Decide on the `rdma_addr_find_l2_eth_by_grh_cached` non-blocking variant: either add it (small core/addr.c addition) or accept the existing blocking helper's worst-case ~5s pause inside RESTORE_QP. Blocking is fine for the harness; a non-blocking variant matters once we wire up Policy B (?5.3). | trivial | medium |
+| KS6b.0 | **(prerequisite)** Run `check_qp_av_dmac.sh` on each physical host post-restore (see §6.0). Verdict locks or refutes the dmac theory in seconds. KS6b.1+ only proceed if verdict is `DMAC_IS_LOCAL`. | trivial | **highest** (gates the rest of this list) |
+| KS6b.1 | Implement `mlx5_ib_restore_qp_refresh_dmac` per §5.1 with Policy A (§5.3) but using the **corrected** primitive: a direct `mlx5_cmd_exec(MODIFY_QP, opcode=RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` from inside `mlx5_ib_restore_qp`, NOT `mlx5_ib_modify_qp(IB_QP_AV)`. The verbs path is closed for primary-AV at RTS (see §5.2 erratum). Skip non-RC/UC, non-RoCEv2, non-userspace QPs. Still call `mlx5_set_path` into the synthesized qpc blob to preserve the existing consistency checks. ~120 lines including helper. | small | high (gates v0 RC datapath end-to-end) |
+| KS6b.2 | Verify FW accepts `MODIFY_QP(RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` against a real RTS RC QP, with only `path.rmac_47_32 / rmac_31_0` changed and PSN / dest_qpn / sgid_index untouched. Quickest test: drop a probe in `vfmig.c` (mirror `PROBE_QP_TEARDOWN`'s shape, MODIFY_QP cell) and assert pre/post `qpc_next_send_psn`, `qpc_remote_qpn`, etc. equal. This is the "FW does what we expect" check the whole fix rests on. | small | high |
+| KS6b.3 | Decide on the `rdma_addr_find_l2_eth_by_grh_cached` non-blocking variant: either add it (small core/addr.c addition) or accept the existing blocking helper's worst-case ~5s pause inside RESTORE_QP. Blocking is fine for the harness; a non-blocking variant matters once we wire up Policy B (§5.3). | trivial | medium |
 | KS6b.4 | Add the `local_ack_timeout_err` regression check to the `qp_restore_probe` harness: assert delta == 0 across one successful migrated-QP roundtrip after the fix lands. | small | medium |
-| KS6b.5 | (Optional) Policy B deferred-refresh on first post_send (?5.3). v1 follow-up. | medium | low |
+| KS6b.5 | (Optional) Policy B deferred-refresh on first post_send (§5.3). v1 follow-up. | medium | low |
 
-KS6b.1 + KS6b.2 unblock the v0 RC datapath end-to-end. KS6b.3 is a
-core-side addition that can land either before or after KS6b.1
-depending on the policy choice.
+KS6b.0 must run first: there is no point implementing KS6b.1 against
+a misdiagnosed bug. KS6b.1 + KS6b.2 unblock the v0 RC datapath
+end-to-end. KS6b.3 is a core-side addition that can land either
+before or after KS6b.1 depending on the policy choice.
 
 ## 9. Cross-references
 
@@ -693,4 +808,15 @@ depending on the policy choice.
 
 - 2026-06-04: initial draft, filed by the CRIU agent after the
   first end-to-end run with QP restore. Diagnosis tentative;
-  awaiting mid-failure capture per ?6.
+  awaiting mid-failure capture per §6.
+- 2026-06-04 (later): added §6.0 cheap diagnostic
+  (`tools/mlx5_vfmig query_qp` + `check_qp_av_dmac.sh`) that
+  decodes `path.rmac_*` from the existing `MLX5_VFMIG_IOC_QUERY_QP`
+  ioctl and emits a `DMAC_IS_LOCAL` / `DMAC_IS_PEER` /
+  `DMAC_AMBIGUOUS` verdict in seconds. Added §5.2 erratum: the
+  proposed `mlx5_ib_modify_qp(IB_QP_AV)` primitive is closed by
+  the verbs `qp_state_table` for RTS->RTS primary AV; the fix
+  needs a direct `mlx5_cmd_exec(MODIFY_QP, RTS2RTS,
+  PRIMARY_ADDR_PATH)` from inside `mlx5_ib_restore_qp` instead.
+  Reordered Kernel Asks: KS6b.0 (run the diagnostic) is a
+  prerequisite before any kernel code is written.

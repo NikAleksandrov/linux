@@ -81,9 +81,18 @@ static int do_probe_uid(int fd, unsigned int vf_id)
  * design/uobject_restore.md to confirm pending RQ WRs and QP state
  * survive LOAD_VHCA_STATE intrinsically.
  *
+ * Also used by the §S6b stale-dmac diagnostic
+ * (design/qp_av_dmac_swap.md): the decoded `av_dmac` / `av_dgid` /
+ * `av_sgid_index` / `av_vhca_port_num` lines emitted at the tail of
+ * the output let a shell harness compare a restored QP's resolved
+ * L2 destination against the local NIC's MAC and the destination
+ * netdev's `ip neigh` entry. If av_dmac equals the local NIC MAC
+ * the QPC is self-addressed at L2 and the dmac-stale theory is
+ * confirmed; if it equals the peer's MAC, the bug is elsewhere.
+ *
  * Output format is intentionally shell-eval-able (one `key=value`
- * per line) so test_fw_id_continuity.sh can capture the result into
- * named variables.
+ * per line) so test_fw_id_continuity.sh and
+ * check_qp_av_dmac.sh can capture the result into named variables.
  */
 static int do_query_qp(int fd, unsigned int vf_id, unsigned int qpn)
 {
@@ -159,6 +168,111 @@ static int do_query_qp(int fd, unsigned int vf_id, unsigned int qpn)
 	for (size_t i = 0; i < sizeof(arg.qpc_primary_address_path); i++)
 		printf("%02x", arg.qpc_primary_address_path[i]);
 	printf("\n");
+
+	/*
+	 * AV decode: pull the AV subfields out of the raw blob so a
+	 * shell harness can grep them as named key=value pairs without
+	 * decoding ads_bits itself. Layout per
+	 * include/linux/mlx5/mlx5_ifc.h struct mlx5_ifc_ads_bits, big-
+	 * endian dword storage:
+	 *
+	 *   DW1 (offset 0x04..0x08):
+	 *     plane_index[8] grh[1] mlid[7] rlid[16]
+	 *     -> grh bit  = bit 7 of byte 0x05
+	 *
+	 *   DW2 (offset 0x08..0x0c), big-endian dword:
+	 *     [bits 31..27] ack_timeout
+	 *     [bits 26..24] reserved_at_45
+	 *     [bits 23..16] src_addr_index   -> byte 0x09
+	 *     [bits 15..12] reserved_at_50
+	 *     [bits 11..8 ] stat_rate
+	 *     [bits  7..0 ] hop_limit         -> byte 0x0b
+	 *
+	 *   rgid_rip[16] (offset 0x10..0x20):
+	 *     16 bytes of dgid in normal byte order
+	 *
+	 *   DW9 (offset 0x24..0x28):
+	 *     dei_cfi[1] eth_prio[3] sl[4] vhca_port_num[8] rmac_47_32[16]
+	 *     -> vhca_port_num = byte 0x25
+	 *     -> rmac[0..1]    = bytes 0x26..0x27
+	 *
+	 *   DW10 (offset 0x28..0x2c):
+	 *     rmac_31_0[32]
+	 *     -> rmac[2..5]    = bytes 0x28..0x2b
+	 *
+	 * The decoded fields are what the §S6b stale-dmac diagnostic
+	 * (tools/testing/mlx5_vfmig/design/qp_av_dmac_swap.md) needs:
+	 * compare av_dmac against the local NIC's MAC -- if equal, the
+	 * QPC is self-addressed at L2 and the dmac-stale theory is
+	 * confirmed.
+	 */
+	{
+		const unsigned char *p = arg.qpc_primary_address_path;
+		unsigned char dmac[6];
+		const unsigned char *dgid = &p[0x10];
+		unsigned int sgid_index = p[0x09];
+		unsigned int hop_limit  = p[0x0b];
+		unsigned int port_num   = p[0x25];
+		unsigned int grh        = (p[0x05] >> 7) & 0x1;
+		/*
+		 * Self-check: pkey_index occupies the low 16 bits of DW0
+		 * (bytes 0x02..0x03 in big-endian dword storage). The
+		 * kernel-side handler already decoded the same field via
+		 * MLX5_GET(qpc, qpc, primary_address_path.pkey_index)
+		 * into arg.qpc_pkey_index. If our manual byte-indexing
+		 * disagrees, the IFC layout we've coded against has
+		 * shifted -- bail loudly rather than silently produce a
+		 * wrong dmac decode that would misdirect the §S6b
+		 * diagnostic.
+		 */
+		unsigned int pkey_decoded = ((unsigned int)p[0x02] << 8) | p[0x03];
+		if (pkey_decoded != arg.qpc_pkey_index) {
+			fprintf(stderr,
+				"INTERNAL ERROR: ads_bits offset self-check "
+				"failed: pkey from blob (bytes 0x02,0x03 = "
+				"0x%04x) != pkey from kernel IFC decode "
+				"(0x%04x). The mlx5_ifc_ads_bits layout has "
+				"shifted; the av_dmac/av_dgid/av_sgid_index "
+				"decode below is UNTRUSTWORTHY. Refresh the "
+				"byte offsets in this tool against "
+				"include/linux/mlx5/mlx5_ifc.h before "
+				"shipping a verdict.\n",
+				pkey_decoded, arg.qpc_pkey_index);
+			return 1;
+		}
+
+		dmac[0] = p[0x26];
+		dmac[1] = p[0x27];
+		dmac[2] = p[0x28];
+		dmac[3] = p[0x29];
+		dmac[4] = p[0x2a];
+		dmac[5] = p[0x2b];
+
+		printf("av_dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+		       dmac[0], dmac[1], dmac[2], dmac[3], dmac[4], dmac[5]);
+		printf("av_dgid=");
+		for (int i = 0; i < 16; i++) {
+			printf("%02x", dgid[i]);
+			if (i % 2 == 1 && i != 15)
+				printf(":");
+		}
+		printf("\n");
+		/*
+		 * RoCEv2-IPv4 GIDs are ::ffff:<a.b.c.d>. Decode as a
+		 * convenience so the harness can grep one line and
+		 * cross-check against `ip neigh show`.
+		 */
+		if (dgid[0] == 0 && dgid[1] == 0 && dgid[2] == 0 &&
+		    dgid[3] == 0 && dgid[4] == 0 && dgid[5] == 0 &&
+		    dgid[6] == 0 && dgid[7] == 0 && dgid[8] == 0 &&
+		    dgid[9] == 0 && dgid[10] == 0xff && dgid[11] == 0xff)
+			printf("av_dgid_ipv4=%u.%u.%u.%u\n",
+			       dgid[12], dgid[13], dgid[14], dgid[15]);
+		printf("av_sgid_index=%u\n",     sgid_index);
+		printf("av_hop_limit=%u\n",      hop_limit);
+		printf("av_vhca_port_num=%u\n",  port_num);
+		printf("av_grh=%u\n",            grh);
+	}
 	return 0;
 }
 
