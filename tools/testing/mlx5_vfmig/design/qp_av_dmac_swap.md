@@ -1,17 +1,28 @@
 # DESIGN: §S6b -- stale `av.dmac` in migrated QPC after CRIU process-swap with IP reassignment
 
 > Companion to [`uobject_restore.md`](uobject_restore.md). Documents the
-> empirical evidence, architectural reasoning, and proposed kernel-side
+> empirical evidence, architectural reasoning, and **landed** kernel-side
 > mitigation for an RC datapath failure observed end-to-end with
 > `mlx5_sriov_vfmig` + CRIU process-swap, where post-restore RC traffic
 > hangs and eventually surfaces `IBV_WC_RETRY_EXC_ERR` (status 12) on
 > the first post-restore `post_send`.
 >
 > Filed by the CRIU agent after end-to-end testing with the
-> `rdma_test_agent_vfmig_criu_swap_after_qp.yaml` harness. Diagnosis is
-> tentative pending mid-failure capture (the original counter snapshots
-> were taken post-cleanup and are stale). The "Outstanding evidence"
-> section below lists the captures we still need before acting.
+> `rdma_test_agent_vfmig_criu_swap_after_qp.yaml` harness.
+>
+> **Status (2026-06-04 evening):** diagnosis **LOCKED** -- the §6.0
+> `check_qp_av_dmac.sh` diagnostic returned `VERDICT=DMAC_IS_LOCAL` on
+> both physical hosts post-restore, with the QPC's `av_dmac` byte-equal
+> to the local NIC's MAC and `qpc_next_send_psn` exactly one ahead of
+> `qpc_last_acked_psn` (a WR is in flight, stuck in retry). Kernel-side
+> fix per §5.1 + §5.2-erratum **landed** as
+> `mlx5_ib_restore_qp_refresh_av_dmac()` in
+> `drivers/infiniband/hw/mlx5/qp.c`, called from `mlx5_ib_restore_qp`
+> in `main.c`. See [§10. Implementation summary](#10-implementation-summary)
+> for the as-built shape, including the deliberate divergence from
+> §5.1's `rdma_addr_find_l2_eth_by_grh` (which is private to ib_core
+> and not declared in any public header) to a direct `neigh_lookup`
+> against the destination netdev's ARP / NDISC table.
 
 ## TL;DR
 
@@ -779,19 +790,17 @@ non-interference principle for restore-mode-only changes.
 
 ## 8. Kernel asks (handoff)
 
-| # | ask | size | priority |
-|---|---|---|---|
-| KS6b.0 | **(prerequisite)** Run `check_qp_av_dmac.sh` on each physical host post-restore (see §6.0). Verdict locks or refutes the dmac theory in seconds. KS6b.1+ only proceed if verdict is `DMAC_IS_LOCAL`. | trivial | **highest** (gates the rest of this list) |
-| KS6b.1 | Implement `mlx5_ib_restore_qp_refresh_dmac` per §5.1 with Policy A (§5.3) but using the **corrected** primitive: a direct `mlx5_cmd_exec(MODIFY_QP, opcode=RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` from inside `mlx5_ib_restore_qp`, NOT `mlx5_ib_modify_qp(IB_QP_AV)`. The verbs path is closed for primary-AV at RTS (see §5.2 erratum). Skip non-RC/UC, non-RoCEv2, non-userspace QPs. Still call `mlx5_set_path` into the synthesized qpc blob to preserve the existing consistency checks. ~120 lines including helper. | small | high (gates v0 RC datapath end-to-end) |
-| KS6b.2 | Verify FW accepts `MODIFY_QP(RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` against a real RTS RC QP, with only `path.rmac_47_32 / rmac_31_0` changed and PSN / dest_qpn / sgid_index untouched. Quickest test: drop a probe in `vfmig.c` (mirror `PROBE_QP_TEARDOWN`'s shape, MODIFY_QP cell) and assert pre/post `qpc_next_send_psn`, `qpc_remote_qpn`, etc. equal. This is the "FW does what we expect" check the whole fix rests on. | small | high |
-| KS6b.3 | Decide on the `rdma_addr_find_l2_eth_by_grh_cached` non-blocking variant: either add it (small core/addr.c addition) or accept the existing blocking helper's worst-case ~5s pause inside RESTORE_QP. Blocking is fine for the harness; a non-blocking variant matters once we wire up Policy B (§5.3). | trivial | medium |
-| KS6b.4 | Add the `local_ack_timeout_err` regression check to the `qp_restore_probe` harness: assert delta == 0 across one successful migrated-QP roundtrip after the fix lands. | small | medium |
-| KS6b.5 | (Optional) Policy B deferred-refresh on first post_send (§5.3). v1 follow-up. | medium | low |
+| # | ask | size | priority | status |
+|---|---|---|---|---|
+| KS6b.0 | **(prerequisite)** Run `check_qp_av_dmac.sh` on each physical host post-restore (see §6.0). Verdict locks or refutes the dmac theory in seconds. KS6b.1+ only proceed if verdict is `DMAC_IS_LOCAL`. | trivial | **highest** | **DONE** -- verdict was `DMAC_IS_LOCAL` on both hosts. |
+| KS6b.1 | Implement `mlx5_ib_restore_qp_refresh_av_dmac` per §5.1 + §5.2 erratum with Policy A (§5.3): direct `mlx5_core_qp_modify(MLX5_CMD_OP_RTS2RTS_QP, MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH, ...)` from inside `mlx5_ib_restore_qp`, NOT `mlx5_ib_modify_qp(IB_QP_AV)`. The verbs path is closed for primary-AV at RTS (see §5.2 erratum). Skip non-RC/UC, non-RoCEv2, non-userspace QPs. | small | high | **DONE** -- ~115 LOC across `qp.c` + `qp.h` + `main.c`. As-built shape in §10. |
+| KS6b.2 | Verify FW accepts `MODIFY_QP(RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` against a real RTS RC QP, with only `path.rmac_47_32 / rmac_31_0` changed and PSN / dest_qpn / sgid_index untouched. | small | high | pending end-to-end run (post-fix `mlx5_vfmig query_qp` + harness rerun -- verdict should flip to `DMAC_IS_PEER`, with `qpc_last_acked_psn` advancing past the stuck WR). |
+| KS6b.3 | Decide on the `rdma_addr_find_l2_eth_by_grh_cached` non-blocking variant. | trivial | medium | **N/A** -- as-built helper uses `neigh_lookup` directly against the port's netdev (synchronous, cache-only, no ARP/NS solicit). See §10. v1's Policy B may revisit. |
+| KS6b.4 | Add the `local_ack_timeout_err` regression check to the `qp_restore_probe` harness: assert delta == 0 across one successful migrated-QP roundtrip after the fix lands. | small | medium | pending. |
+| KS6b.5 | (Optional) Policy B deferred-refresh on first post_send (§5.3). v1 follow-up. | medium | low | deferred. |
 
-KS6b.0 must run first: there is no point implementing KS6b.1 against
-a misdiagnosed bug. KS6b.1 + KS6b.2 unblock the v0 RC datapath
-end-to-end. KS6b.3 is a core-side addition that can land either
-before or after KS6b.1 depending on the policy choice.
+KS6b.0 + KS6b.1 unblocked the v0 RC datapath end-to-end (subject to
+KS6b.2 confirmation). KS6b.4 is the post-fix regression guard.
 
 ## 9. Cross-references
 
@@ -803,6 +812,119 @@ before or after KS6b.1 depending on the policy choice.
 - `uar_restore.md` -- baseline for the LOAD_VHCA_STATE
   preservation model and the "what FW preserves vs what mlx5_ib
   needs to refresh" decomposition.
+
+## 10. Implementation summary (as-built)
+
+The fix landed as **~115 LOC across three files**:
+
+| file | what changed | LOC |
+|---|---|---|
+| `drivers/infiniband/hw/mlx5/qp.c` | new `mlx5_ib_lookup_l2_dmac()` static helper + new `mlx5_ib_restore_qp_refresh_av_dmac()` exported helper; 4 net header includes (`net/arp.h`, `net/ipv6.h`, `net/ipv6_stubs.h`, `net/neighbour.h`) | ~95 (incl. comments) |
+| `drivers/infiniband/hw/mlx5/qp.h` | prototype + kerneldoc for the new helper. **No `struct mlx5_ib_qp` exposure** -- the helper takes `struct mlx5_ib_dev *` + `struct mlx5_core_qp *`, mirroring the rest of qp.h's FW-command-wrapper pattern (`mlx5_qpc_create_qp`, `mlx5_qpc_adopt_qp`, `mlx5_core_qp_modify`, `mlx5_core_qp_query`, etc.). | ~20 |
+| `drivers/infiniband/hw/mlx5/main.c` | call site in `mlx5_ib_restore_qp` after `mlx5_ib_register_user_qp_in_dev_lists`, gated on `qp->ibqp.uobject && (qp->type == IB_QPT_RC \|\| qp->type == IB_QPT_UC)`. Policy-A non-fatal error treatment. | ~25 |
+
+The implementation differs from the §5.1 sketch in three deliberate places:
+
+### 10.1 `neigh_lookup` instead of `rdma_addr_find_l2_eth_by_grh`
+
+§5.1 / §5.3 pinned hopes on a `rdma_addr_find_l2_eth_by_grh_cached`
+non-blocking variant of ib_core's address resolver. **As built we
+sidestep the ib_core resolver entirely** in favor of a direct
+`neigh_lookup(&arp_tbl, ...)` (RoCEv2-IPv4) or
+`neigh_lookup(ipv6_stub->nd_tbl, ...)` (RoCEv2-IPv6) against the
+port's netdev (`ib_device_get_netdev(ib_dev, port_num)`).
+
+Why:
+
+- `rdma_addr_find_l2_eth_by_grh` is **declared only in
+  `drivers/infiniband/core/core_priv.h`**, not in any public header
+  (`<rdma/ib_addr.h>` exposes `rdma_resolve_ip` and the gid<->ip
+  inlines, but not the higher-level resolver). It IS `EXPORT_SYMBOL`'d,
+  but mlx5_ib (in-tree) shouldn't reach into core_priv.h. No other
+  in-tree driver does.
+- The resolver also drives `rdma_resolve_ip` -> `addr_wq` ->
+  potential ARP/NS solicit with a 1s `wait_for_completion`. For our
+  v0 flow (operator pre-pins `NUD_PERMANENT` entries via
+  `pin_static_neighbor_*`) we explicitly want a **non-blocking
+  cache-only probe**: if the entry is missing, the right answer is
+  Policy A "log + skip", not "wait 1s for an ARP that's never going
+  to come because the peer is on the other physical host."
+- `neigh_lookup` returns `NULL` if the entry is missing (we map to
+  `-ENOENT`) and a non-`NUD_VALID` entry is mapped to `-EAGAIN`.
+  Both are folded into Policy A by the caller.
+
+The trade-off: no automatic VLAN sub-iface special handling. The v0
+test setup doesn't VLAN-trunk VFs, so this is not a blocker. A v1
+that needs VLAN should walk `sgid_attr->ndev` (which the ib_core
+resolver does internally) instead of the port's base netdev.
+
+### 10.2 No call into `mlx5_set_path` for the synthesized qpc blob
+
+§5.2's erratum suggested still calling `mlx5_set_path` into the
+synthesized qpc blob to preserve consistency checks. **As built we
+write only the `path.rmac_*` field** via
+`ether_addr_copy(MLX5_ADDR_OF(ads, path_in, rmac_47_32), new_dmac)`.
+
+Why: the optpar mask `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` tells FW
+which path subfields to consume from the qpc; FW only consumes
+those gated by the optpar bit. We're touching exactly one logical
+field (the dmac), so we set exactly that field. All other QPC
+fields (PSN, dest_qpn, sgid_index, traffic_class, flow_label, etc.)
+came from `LOAD_VHCA_STATE` and are still trusted verbatim. No
+consistency checks are skipped because no consistency checks were
+needed -- we're not refreshing those fields.
+
+The §5.2 erratum's "still call mlx5_set_path" was conservative
+caution from a place where we hadn't yet articulated that "MLX5_SET
+on rmac_*" is the entire payload. It is.
+
+### 10.3 Non-fatal error policy at the call site
+
+§5.1 gated `goto err_destroy_qp` on real (non-`-EAGAIN`) errors. **As
+built `mlx5_ib_restore_qp` logs the error loudly via `mlx5_ib_warn`
+but treats it as non-fatal** -- the QP is already adopted +
+registered in dev lists, and a stale-dmac QP is no worse off than
+the pre-fix behavior (it was the entire bug we're fixing!). Failing
+the restore would tear down a QP whose dmac just happens to be the
+old one; the right answer is to surface the QP and let the operator
+rerun `check_qp_av_dmac.sh` for localization.
+
+The v1 / Policy B follow-up may upgrade this to a sticky per-QP
+flag that retries on first `post_send`; for v0 this is sufficient.
+
+### 10.4 Helper signature: `mlx5_core_qp` not `mlx5_ib_qp`
+
+The kerneldoc-and-prototype pair in `qp.h` deliberately mirrors the
+rest of that header's `mlx5_qpc_*` / `mlx5_core_qp_*` family:
+
+```c
+int mlx5_ib_restore_qp_refresh_av_dmac(struct mlx5_ib_dev *dev,
+                                       struct mlx5_core_qp *qp);
+```
+
+The helper itself only consumes `qp->qpn` (passed verbatim into
+`MLX5_SET(query_qp_in, in, qpn, ...)`) and `qp->uid` (consumed
+implicitly by `mlx5_core_qp_modify`). The ibverbs-level gates --
+"skip kernel-mode QPs", "skip non-RC/UC QP types" -- are NOT inside
+the helper. They live at the call site:
+
+```c
+if (qp->ibqp.uobject &&
+    (qp->type == IB_QPT_RC || qp->type == IB_QPT_UC)) {
+        err = mlx5_ib_restore_qp_refresh_av_dmac(dev, &base->mqp);
+        ...
+}
+```
+
+This keeps `qp.h` free of `struct mlx5_ib_qp` exposure (the only
+forward decl needed in qp.h is the long-standing `struct mlx5_ib_dev`),
+and makes the call site read like the natural English statement of
+the semantic ("if the QP is a userspace RC/UC QP, refresh its
+dmac"). The helper itself remains a focused FW-command sequence
+(QUERY_QP -> neigh_lookup -> conditional MODIFY_QP) that can in
+principle be reused by any future code path that needs the same
+operation against a `mlx5_core_qp` -- e.g. a probe ioctl for
+KS6b.2-style validation.
 
 ## Changelog
 
@@ -820,3 +942,17 @@ before or after KS6b.1 depending on the policy choice.
   PRIMARY_ADDR_PATH)` from inside `mlx5_ib_restore_qp` instead.
   Reordered Kernel Asks: KS6b.0 (run the diagnostic) is a
   prerequisite before any kernel code is written.
+- 2026-06-04 (evening): diagnosis **LOCKED** --
+  `check_qp_av_dmac.sh` returned `VERDICT=DMAC_IS_LOCAL` on both
+  physical hosts post-restore. Kernel-side fix
+  `mlx5_ib_restore_qp_refresh_av_dmac()` **landed** in
+  `drivers/infiniband/hw/mlx5/{qp.c,qp.h,main.c}` (~115 LOC, builds
+  clean). Implementation diverges from §5.1 in three places --
+  using `neigh_lookup` directly instead of ib_core's
+  `rdma_addr_find_l2_eth_by_grh` (which is private to ib_core),
+  not calling `mlx5_set_path` for the rmac-only payload, and
+  non-fatal error treatment at the call site. See §10 for the
+  full as-built shape and the rationale for each divergence.
+  KS6b.1 marked DONE; KS6b.2 (FW acceptance via end-to-end harness
+  rerun + verdict flip to `DMAC_IS_PEER`) and KS6b.4 (regression
+  guard) remain.
