@@ -653,6 +653,122 @@ static int do_probe_mr_destroy(int fd, unsigned int vf_id,
 }
 
 /*
+ * EXPERIMENTAL: dev-branch backup for the criu-on-host stale-dmac
+ * case (see tools/testing/mlx5_vfmig/design/qp_av_dmac_swap.md and
+ * the always-on mlx5_ib_restore_qp_refresh_av_dmac path). Re-resolves
+ * the supplied QP's primary-AV DMAC against the destination netdev's
+ * neighbor table and issues MODIFY_QP(RTS2RTS, PRIMARY_ADDR_PATH) to
+ * write the new DMAC into the QPC if it differs from the (stale)
+ * source-preserved value.
+ *
+ * Output format: one key=value per line for shell ingestion. The
+ * notable derived signal is `verdict`, which the harness greps:
+ *
+ *   verdict=ALREADY_OK      lookup succeeded, dmac unchanged (this
+ *                           is the "true VM-LM" steady state -- the
+ *                           source-preserved dmac is still correct).
+ *   verdict=REFRESHED_OK    lookup succeeded, MODIFY_QP succeeded,
+ *                           post-op dmac matches the resolved one.
+ *                           THIS IS THE PASS LANE FOR THE STALE-
+ *                           DMAC FIX. Datapath should now make
+ *                           forward progress.
+ *   verdict=NEIGH_UNRESOLVED neigh_lookup returned -ENOENT/-EAGAIN
+ *                           on the destination netdev. The harness
+ *                           must populate the neighbor entry (e.g.
+ *                           `ip neigh add ... lladdr ... nud
+ *                           permanent`) and retry.
+ *   verdict=MODIFY_FAILED   neigh_lookup succeeded but MODIFY_QP
+ *                           was rejected by FW. Inspect op_status /
+ *                           op_syndrome.
+ *   verdict=POST_QUERY_FAILED bracketing post-op QUERY_QP failed.
+ *                           op may have succeeded or failed; check
+ *                           op_status. Rare.
+ *   verdict=PRE_QUERY_FAILED pre-op QUERY_QP failed. Most likely
+ *                           the qpn doesn't exist on the VF; check
+ *                           pre_query_status / pre_query_syndrome.
+ */
+static int do_refresh_av_dmac(int fd, unsigned int vf_id, unsigned int qpn)
+{
+	struct mlx5_vfmig_refresh_av_dmac arg = {
+		.vf_id = vf_id,
+		.qpn   = qpn,
+	};
+	const char *verdict;
+	int i;
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_REFRESH_AV_DMAC, &arg) < 0) {
+		if (errno == ENODEV)
+			fprintf(stderr,
+				"vf %u: not bound to mlx5_core "
+				"(REFRESH_AV_DMAC requires the VF mdev "
+				"to be interface-up)\n", vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"REFRESH_AV_DMAC: invalid arg "
+				"(vf_id=%u qpn=0x%x). qpn 24 bits.\n",
+				vf_id, qpn);
+		else
+			perror("REFRESH_AV_DMAC");
+		return 1;
+	}
+
+	printf("vf_id=%u\n", vf_id);
+	printf("qpn=0x%06x\n", qpn);
+
+	printf("pre_query_status=0x%08x\n", arg.pre_query_status);
+	printf("pre_query_syndrome=0x%08x\n", arg.pre_query_syndrome);
+	printf("pre_qpc_state=%u\n", arg.pre_qpc_state);
+	printf("pre_vhca_port_num=%u\n", arg.pre_vhca_port_num);
+	printf("pre_sgid_index=%u\n", arg.pre_sgid_index);
+	printf("pre_dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+	       arg.pre_dmac[0], arg.pre_dmac[1], arg.pre_dmac[2],
+	       arg.pre_dmac[3], arg.pre_dmac[4], arg.pre_dmac[5]);
+	printf("pre_dgid=");
+	for (i = 0; i < 16; i++)
+		printf("%02x%s", arg.pre_dgid[i],
+		       (i == 15) ? "\n" : ((i % 2 == 1) ? ":" : ""));
+
+	printf("lookup_status=%d\n", arg.lookup_status);
+	printf("resolved_dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+	       arg.resolved_dmac[0], arg.resolved_dmac[1],
+	       arg.resolved_dmac[2], arg.resolved_dmac[3],
+	       arg.resolved_dmac[4], arg.resolved_dmac[5]);
+	printf("dmac_changed=%u\n", arg.dmac_changed);
+
+	printf("op_status=0x%08x\n", arg.op_status);
+	printf("op_syndrome=0x%08x\n", arg.op_syndrome);
+	printf("op_accept=%u\n",
+	       (arg.dmac_changed && (int)arg.op_status == 0 &&
+		arg.op_syndrome == 0) ? 1 : 0);
+
+	printf("post_query_status=0x%08x\n", arg.post_query_status);
+	printf("post_query_syndrome=0x%08x\n", arg.post_query_syndrome);
+	printf("post_qpc_state=%u\n", arg.post_qpc_state);
+	printf("post_dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+	       arg.post_dmac[0], arg.post_dmac[1], arg.post_dmac[2],
+	       arg.post_dmac[3], arg.post_dmac[4], arg.post_dmac[5]);
+
+	if (arg.pre_query_status)
+		verdict = "PRE_QUERY_FAILED";
+	else if (arg.lookup_status == -2)	/* -ENOENT */
+		verdict = "NEIGH_UNRESOLVED";
+	else if (arg.lookup_status == -11)	/* -EAGAIN */
+		verdict = "NEIGH_UNRESOLVED";
+	else if (arg.lookup_status)
+		verdict = "NEIGH_UNRESOLVED";
+	else if (!arg.dmac_changed)
+		verdict = "ALREADY_OK";
+	else if ((int)arg.op_status || arg.op_syndrome)
+		verdict = "MODIFY_FAILED";
+	else if (arg.post_query_status)
+		verdict = "POST_QUERY_FAILED";
+	else
+		verdict = "REFRESHED_OK";
+	printf("verdict=%s\n", verdict);
+	return 0;
+}
+
+/*
  * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND CLI wrapper. user_mr_dma
  * stage-2 success-criterion accessor: post-LOAD, asks the PF how
  * many awaiting_bind placeholders landed in the VF's
@@ -1041,6 +1157,11 @@ static void usage(const char *argv0)
 		"                    (experimental, §S3b DESTROY_CQ cross-uid probe)\n"
 		"  probe_mr_destroy  <vf_id> <mkey_index> <uid_hint>\n"
 		"                    (experimental, §S3b DESTROY_MKEY cross-uid probe)\n"
+		"  refresh_av_dmac   <vf_id> <qpn>\n"
+		"                    (experimental, dev-branch backup for §S6b\n"
+		"                     stale-dmac case: re-resolve restored QP's\n"
+		"                     primary-AV DMAC against the VF netdev's\n"
+		"                     ARP/NDISC table and write it via MODIFY_QP)\n"
 		"  query_awaiting_bind <vf_id>  (user_mr_dma stage-2)\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
@@ -1171,6 +1292,12 @@ int main(int argc, char **argv)
 				strtoul(argv[3], NULL, 0),
 				strtoul(argv[4], NULL, 0),
 				strtoul(argv[5], NULL, 0));
+	} else if (verb_eq(verb, "refresh_av_dmac")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_refresh_av_dmac(fd,
+				strtoul(argv[3], NULL, 0),
+				strtoul(argv[4], NULL, 0));
 	} else if (verb_eq(verb, "query_awaiting_bind")) {
 		if (argc != 4)
 			goto badargs;
