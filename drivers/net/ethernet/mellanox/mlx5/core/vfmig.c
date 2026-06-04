@@ -43,15 +43,18 @@
 #include <linux/crc32.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/idr.h>
+#include <linux/in6.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/netdevice.h>
 #include <linux/pci.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
@@ -59,10 +62,16 @@
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/driver.h>
 #include <linux/mlx5/mlx5_ifc.h>
+#include <linux/mlx5/qp.h>
 #include <linux/mlx5/vport.h>
+#include <net/addrconf.h>
+#include <net/arp.h>
+#include <net/ipv6_stubs.h>
+#include <net/neighbour.h>
 #include <uapi/linux/mlx5_vfmig.h>
 
 #include "mlx5_core.h"
+#include "lib/mlx5.h"
 #include "vfmig.h"
 #include "vfmig_iova.h"
 
@@ -2235,6 +2244,356 @@ static long vfmig_ioc_probe_mr_destroy(struct mlx5_vfmig_pf *vfmig,
 		       "vfmig: probe_mr_destroy: vf %u mkey_idx 0x%x post-op MKC ALIVE free=%u (uid_hint=0x%x op_status=0x%x op_syndrome=0x%x)\n",
 		       arg.vf_id, arg.mkey_index, arg.post_mkc_free,
 		       arg.uid_hint, arg.op_status, arg.op_syndrome);
+
+out_copy:
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		err = -EFAULT;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	return err;
+}
+
+/*
+ * Synchronous, cache-only L2 DMAC resolver against the destination
+ * VF's uplink netdev. Mirrors mlx5_ib_lookup_l2_dmac in qp.c, with
+ * one rationale-equivalent simplification: we use
+ * mlx5_uplink_netdev_get(vf_mdev) to grab the VF's RoCE netdev
+ * directly, avoiding the ib_device round-trip (we are in mlx5_core
+ * here, not mlx5_ib).
+ *
+ * Behaviour:
+ *   - 0 on found + NUD_VALID    -- @dmac_out populated
+ *   - -ENOENT on no neighbor entry, no IPv6 stack loaded, or no
+ *     netdev attached to the VF mdev
+ *   - -EAGAIN on entry present but not yet NUD_VALID (caller maps
+ *     the same way mlx5_ib's Policy A does: log + skip)
+ *
+ * Triggers no ARP / NS solicitation: missing entry -> -ENOENT,
+ * not "wait 1s for an ARP that's not coming."
+ */
+static int vfmig_lookup_l2_dmac(struct mlx5_core_dev *vf_mdev,
+				const u8 *dgid_raw, u8 *dmac_out)
+{
+	struct net_device *ndev;
+	struct neighbour *n;
+	int err = 0;
+
+	ndev = mlx5_uplink_netdev_get(vf_mdev);
+	if (!ndev)
+		return -ENODEV;
+
+	if (ipv6_addr_v4mapped((const struct in6_addr *)dgid_raw)) {
+		__be32 dst_ip4;
+
+		memcpy(&dst_ip4, dgid_raw + 12, sizeof(dst_ip4));
+		n = neigh_lookup(&arp_tbl, &dst_ip4, ndev);
+	} else {
+		const struct in6_addr *dst_ip6 =
+			(const struct in6_addr *)dgid_raw;
+
+		/*
+		 * ipv6_stub is always non-NULL (initialized to an
+		 * EAFNOSUPPORT-stub on CONFIG_IPV6=n), but nd_tbl is
+		 * only populated when the IPv6 stack is built in or
+		 * loaded. Treat absent IPv6 stack as "no entry".
+		 */
+		if (!ipv6_stub->nd_tbl) {
+			err = -ENOENT;
+			goto out_put_ndev;
+		}
+		n = neigh_lookup(ipv6_stub->nd_tbl, dst_ip6, ndev);
+	}
+
+	if (!n) {
+		err = -ENOENT;
+		goto out_put_ndev;
+	}
+
+	read_lock_bh(&n->lock);
+	if (n->nud_state & NUD_VALID)
+		memcpy(dmac_out, n->ha, ETH_ALEN);
+	else
+		err = -EAGAIN;
+	read_unlock_bh(&n->lock);
+	neigh_release(n);
+
+out_put_ndev:
+	mlx5_uplink_netdev_put(vf_mdev, ndev);
+	return err;
+}
+
+/*
+ * Decode the 6-byte DMAC out of the QPC primary_address_path blob
+ * (rmac_47_32 || rmac_31_0). mlx5_ifc_ads_bits lays the two halves
+ * out as a contiguous big-endian 6-byte field, so the standard
+ * MLX5_GET extractors give us the right bytes; we just stitch them
+ * back into a flat array.
+ */
+static void vfmig_path_extract_dmac(const void *path, u8 *dmac_out)
+{
+	u16 hi = MLX5_GET(ads, path, rmac_47_32);
+	u32 lo = MLX5_GET(ads, path, rmac_31_0);
+
+	dmac_out[0] = (hi >> 8) & 0xff;
+	dmac_out[1] =  hi       & 0xff;
+	dmac_out[2] = (lo >> 24) & 0xff;
+	dmac_out[3] = (lo >> 16) & 0xff;
+	dmac_out[4] = (lo >>  8) & 0xff;
+	dmac_out[5] =  lo        & 0xff;
+}
+
+/*
+ * MLX5_VFMIG_IOC_REFRESH_AV_DMAC handler -- experimental, dev-branch
+ * backup for the criu-on-host stale-dmac case. Companion to the
+ * always-on mlx5_ib_restore_qp_refresh_av_dmac path.
+ *
+ * The always-on path (drivers/infiniband/hw/mlx5/qp.c) runs from
+ * inside the RESTORE_QP uobject path and falls back to Policy A
+ * (log + skip) when the destination's neighbor entry for the peer
+ * dgid isn't yet resolved at restore time. For the v0
+ * mlx5_sriov_vfmig criu plugin the harness pins neighbors AFTER
+ * RESTORE_QP returns, so the always-on path will hit Policy A on
+ * every restored RC/UC QP. This ioctl is the manual escape hatch:
+ * the harness pins neighbors, then issues this ioctl per restored
+ * QP, and the dmac is re-resolved against the now-populated ARP /
+ * NDISC table.
+ *
+ * Sequence (mirrors PROBE_QP_TEARDOWN's bracketing pattern):
+ *   1. QUERY_QP -- pre-op snapshot. Capture qpc.path.{vhca_port_num,
+ *      src_addr_index, rgid_rip (dgid), rmac_*} into the @pre_*
+ *      out fields.
+ *   2. neigh_lookup against the VF's uplink netdev for the peer
+ *      MAC. Result + lladdr in @lookup_status / @resolved_dmac.
+ *   3. If resolved_dmac == pre_dmac the QPC is already correct;
+ *      we set @dmac_changed=0, leave @op_* / @post_* zeroed, and
+ *      return success without disturbing the QP.
+ *   4. Otherwise issue MODIFY_QP(opcode=RTS2RTS_QP,
+ *      opt_param_mask=PRIMARY_ADDR_PATH) with a qpc blob carrying
+ *      only path.rmac_*; opt_param_mask gates which subfields FW
+ *      consumes so all other QPC fields stay untouched. Result
+ *      in @op_status / @op_syndrome. The op runs uid=0 (host-
+ *      privileged) -- LOAD_VHCA_STATE wipes the QPC's owning-uid
+ *      registration on the destination, and uid=0 against the
+ *      VF mdev's cmdif is the same uid lane the always-on
+ *      mlx5_ib helper takes via mlx5_core_qp_modify with qp->uid
+ *      sourced from the kernel-side mlx5_ib_qp.
+ *   5. Bracketing post-op QUERY_QP -- caller can verify
+ *      post_dmac == resolved_dmac on success.
+ *
+ * The op-under-test errno does NOT propagate as the ioctl return:
+ * a FW reject is recorded in @op_status / @op_syndrome and the
+ * call returns 0 so the caller still sees @post_* and the
+ * pre-op snapshot.
+ *
+ * Locking, VF mdev lookup, cmdif-uid handling: same shape as
+ * vfmig_ioc_probe_qp_teardown / vfmig_ioc_query_qp.
+ */
+static long vfmig_ioc_refresh_av_dmac(struct mlx5_vfmig_pf *vfmig,
+				      void __user *uarg)
+{
+	u32 q_in[MLX5_ST_SZ_DW(query_qp_in)] = {};
+	u32 q_out[MLX5_ST_SZ_DW(query_qp_out)];
+	u32 m_in[MLX5_ST_SZ_DW(rts2rts_qp_in)] = {};
+	u32 m_out[MLX5_ST_SZ_DW(rts2rts_qp_out)] = {};
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_refresh_av_dmac arg;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	struct device_driver *drv;
+	const void *path_q;
+	void *path_m;
+	void *qpc_q;
+	void *qpc_m;
+	int err, op_err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (memchr_inv(arg.reserved_in, 0, sizeof(arg.reserved_in)))
+		return -EINVAL;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		return -EINVAL;
+	if (arg.qpn & 0xff000000)		/* qpn is 24 bits */
+		return -EINVAL;
+
+	/*
+	 * Zero all output fields up-front so partial-fill paths (e.g.
+	 * pre-query failure -> we skip lookup + op + post-query)
+	 * don't leak stack contents to userspace.
+	 */
+	arg.pre_query_status = 0;
+	arg.pre_query_syndrome = 0;
+	arg.pre_qpc_state = 0;
+	arg.pre_vhca_port_num = 0;
+	memset(arg.reserved_pre0, 0, sizeof(arg.reserved_pre0));
+	arg.pre_sgid_index = 0;
+	memset(arg.pre_dmac, 0, sizeof(arg.pre_dmac));
+	memset(arg.reserved_pre1, 0, sizeof(arg.reserved_pre1));
+	memset(arg.pre_dgid, 0, sizeof(arg.pre_dgid));
+	arg.lookup_status = 0;
+	memset(arg.resolved_dmac, 0, sizeof(arg.resolved_dmac));
+	arg.dmac_changed = 0;
+	arg.reserved_lookup = 0;
+	arg.op_status = 0;
+	arg.op_syndrome = 0;
+	arg.post_query_status = 0;
+	arg.post_query_syndrome = 0;
+	arg.post_qpc_state = 0;
+	arg.reserved_post0 = 0;
+	memset(arg.post_dmac, 0, sizeof(arg.post_dmac));
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: refresh_av_dmac: vf %u not bound to %s (driver=%s)\n",
+			       arg.vf_id, KBUILD_MODNAME,
+			       drv ? drv->name : "<unbound>");
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: refresh_av_dmac: vf %u mdev not interface-up\n",
+			       arg.vf_id);
+		err = -ENODEV;
+		goto out_unlock;
+	}
+
+	/* ---- Step 1: pre-op QUERY_QP ---- */
+	memset(q_out, 0, sizeof(q_out));
+	MLX5_SET(query_qp_in, q_in, opcode, MLX5_CMD_OP_QUERY_QP);
+	MLX5_SET(query_qp_in, q_in, qpn, arg.qpn);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.pre_query_status = (u32)(int)err;
+		arg.pre_query_syndrome = MLX5_GET(query_qp_out, q_out,
+						  syndrome);
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: refresh_av_dmac: vf %u qpn 0x%x pre QUERY_QP err %d syndrome 0x%x -- skipping lookup + op + post-query\n",
+			       arg.vf_id, arg.qpn, err,
+			       arg.pre_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+
+	qpc_q  = MLX5_ADDR_OF(query_qp_out, q_out, qpc);
+	path_q = MLX5_ADDR_OF(qpc, qpc_q, primary_address_path);
+
+	arg.pre_qpc_state    = MLX5_GET(qpc, qpc_q, state);
+	arg.pre_vhca_port_num = MLX5_GET(ads, path_q, vhca_port_num);
+	arg.pre_sgid_index   = MLX5_GET(ads, path_q, src_addr_index);
+	memcpy(arg.pre_dgid, MLX5_ADDR_OF(ads, path_q, rgid_rip),
+	       sizeof(arg.pre_dgid));
+	vfmig_path_extract_dmac(path_q, arg.pre_dmac);
+
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: refresh_av_dmac: vf %u qpn 0x%x pre-op state=%u port=%u sgid_index=%u dmac=%pM dgid=%pI6\n",
+		      arg.vf_id, arg.qpn, arg.pre_qpc_state,
+		      arg.pre_vhca_port_num, arg.pre_sgid_index,
+		      arg.pre_dmac, arg.pre_dgid);
+
+	/*
+	 * The always-on mlx5_ib helper bails out for non-Ethernet
+	 * link layer (dmac is meaningless on IB). Mirror that here
+	 * via the per-VF mdev's GEN cap port_type, which is the
+	 * mlx5_core-side analogue of rdma_port_get_link_layer.
+	 */
+	if (MLX5_CAP_GEN(vf_mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) {
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: refresh_av_dmac: vf %u qpn 0x%x port_type=%u (not Ethernet); refresh is a no-op\n",
+			      arg.vf_id, arg.qpn,
+			      MLX5_CAP_GEN(vf_mdev, port_type));
+		goto out_copy;
+	}
+
+	/* ---- Step 2: neighbor lookup against the VF's uplink netdev ---- */
+	{
+		u8 new_dmac[ETH_ALEN] = {};
+		int lerr;
+
+		lerr = vfmig_lookup_l2_dmac(vf_mdev, arg.pre_dgid, new_dmac);
+		arg.lookup_status = (s32)lerr;
+
+		if (lerr) {
+			mlx5_core_info(pf_mdev,
+				       "vfmig: refresh_av_dmac: vf %u qpn 0x%x neigh lookup for dgid=%pI6 failed (err=%d) -- pin the neighbor entry (e.g. `ip neigh add ... lladdr ... nud permanent`) and retry\n",
+				       arg.vf_id, arg.qpn, arg.pre_dgid,
+				       lerr);
+			goto out_copy;
+		}
+
+		memcpy(arg.resolved_dmac, new_dmac, ETH_ALEN);
+
+		if (ether_addr_equal(arg.pre_dmac, new_dmac)) {
+			mlx5_core_dbg(pf_mdev,
+				      "vfmig: refresh_av_dmac: vf %u qpn 0x%x dmac %pM already correct; no MODIFY_QP issued\n",
+				      arg.vf_id, arg.qpn, arg.pre_dmac);
+			arg.dmac_changed = 0;
+			goto out_copy;
+		}
+
+		arg.dmac_changed = 1;
+
+		/* ---- Step 3: MODIFY_QP(RTS2RTS, PRIMARY_ADDR_PATH) ---- */
+		MLX5_SET(rts2rts_qp_in, m_in, opcode,
+			 MLX5_CMD_OP_RTS2RTS_QP);
+		MLX5_SET(rts2rts_qp_in, m_in, qpn, arg.qpn);
+		MLX5_SET(rts2rts_qp_in, m_in, opt_param_mask,
+			 MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH);
+
+		qpc_m  = MLX5_ADDR_OF(rts2rts_qp_in, m_in, qpc);
+		path_m = MLX5_ADDR_OF(qpc, qpc_m, primary_address_path);
+		ether_addr_copy(MLX5_ADDR_OF(ads, path_m, rmac_47_32),
+				new_dmac);
+
+		op_err = mlx5_cmd_exec(vf_mdev, m_in, sizeof(m_in),
+				       m_out, sizeof(m_out));
+		arg.op_syndrome = MLX5_GET(rts2rts_qp_out, m_out, syndrome);
+		arg.op_status   = (u32)(int)op_err;
+		mlx5_core_info(pf_mdev,
+			       "vfmig: refresh_av_dmac: vf %u qpn 0x%x MODIFY_QP(RTS2RTS, PRIMARY_ADDR_PATH) %pM -> %pM dgid=%pI6 -> err=%d syndrome=0x%x\n",
+			       arg.vf_id, arg.qpn, arg.pre_dmac, new_dmac,
+			       arg.pre_dgid, op_err, arg.op_syndrome);
+	}
+
+	/* ---- Step 4: post-op QUERY_QP ---- */
+	memset(q_in, 0, sizeof(q_in));
+	memset(q_out, 0, sizeof(q_out));
+	MLX5_SET(query_qp_in, q_in, opcode, MLX5_CMD_OP_QUERY_QP);
+	MLX5_SET(query_qp_in, q_in, qpn, arg.qpn);
+	err = mlx5_cmd_exec(vf_mdev, q_in, sizeof(q_in), q_out, sizeof(q_out));
+	if (err) {
+		arg.post_query_status = (u32)(int)err;
+		arg.post_query_syndrome = MLX5_GET(query_qp_out, q_out,
+						   syndrome);
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: refresh_av_dmac: vf %u qpn 0x%x post QUERY_QP err %d syndrome 0x%x\n",
+			       arg.vf_id, arg.qpn, err,
+			       arg.post_query_syndrome);
+		err = 0;
+		goto out_copy;
+	}
+	qpc_q  = MLX5_ADDR_OF(query_qp_out, q_out, qpc);
+	path_q = MLX5_ADDR_OF(qpc, qpc_q, primary_address_path);
+	arg.post_qpc_state = MLX5_GET(qpc, qpc_q, state);
+	vfmig_path_extract_dmac(path_q, arg.post_dmac);
+
+	mlx5_core_info(pf_mdev,
+		       "vfmig: refresh_av_dmac: vf %u qpn 0x%x post-op state=%u dmac=%pM (resolved=%pM op_status=0x%x op_syndrome=0x%x)\n",
+		       arg.vf_id, arg.qpn, arg.post_qpc_state,
+		       arg.post_dmac, arg.resolved_dmac,
+		       arg.op_status, arg.op_syndrome);
 
 out_copy:
 	if (copy_to_user(uarg, &arg, sizeof(arg)))
@@ -5007,6 +5366,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_PROBE_MR_DESTROY:
 		ret = vfmig_ioc_probe_mr_destroy(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_REFRESH_AV_DMAC:
+		ret = vfmig_ioc_refresh_av_dmac(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;
