@@ -33,6 +33,36 @@ int mlx5_qpc_create_qp(struct mlx5_ib_dev *dev, struct mlx5_core_qp *qp,
  * empirical justification (K7 STRONG PASS).
  */
 int mlx5_qpc_adopt_qp(struct mlx5_ib_dev *dev, struct mlx5_core_qp *qp);
+/*
+ * §S6b CRIU restore companion to mlx5_ib_restore_qp -- re-resolve
+ * av.dmac on a RoCEv2 user-mode QP whose QPC LOAD'd in with the
+ * source's resolved peer-MAC, then issue MODIFY_QP(RTS2RTS_QP,
+ * opt=PRIMARY_ADDR_PATH) to write the destination-resolved dmac
+ * into the QPC. Empirically justified by the §S6b stale-dmac
+ * verdict in tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/
+ * check_qp_av_dmac.sh; rationale documented in
+ * design/qp_av_dmac_swap.md (in particular §5.2's erratum on why
+ * mlx5_ib_modify_qp(IB_QP_AV) is the wrong primitive at RTS).
+ *
+ * Operates entirely in mlx5_core_qp terms (qpn + uid out of qp,
+ * port_num + dgid + sgid_index pulled fresh from FW QUERY_QP). The
+ * caller is responsible for the ibverbs-level gates (skip non-RC/
+ * UC, skip kernel-mode QPs, etc.); see the §10.4 callsite shape in
+ * design/qp_av_dmac_swap.md.
+ *
+ * Skips internally only the cases this helper can detect itself
+ * from QUERY_QP output -- in particular, IB-link-layer ports (no
+ * L2 dmac to refresh) -- or that surface from the L2 lookup
+ * (NUD_INCOMPLETE / missing neighbor entry, mapped to Policy A
+ * "log + return 0").
+ *
+ * Returns 0 on success or skipped; negative errno on real failure
+ * (FW transport error, MODIFY_QP rejected, etc.). Caller may treat
+ * non-zero as non-fatal: the QP is already adopted and the
+ * connection is no worse off than the pre-fix behavior.
+ */
+int mlx5_ib_restore_qp_refresh_av_dmac(struct mlx5_ib_dev *dev,
+				       struct mlx5_core_qp *qp);
 int mlx5_core_qp_modify(struct mlx5_ib_dev *dev, u16 opcode, u32 opt_param_mask,
 			void *qpc, struct mlx5_core_qp *qp, u32 *ece);
 int mlx5_core_destroy_qp(struct mlx5_ib_dev *dev, struct mlx5_core_qp *qp);

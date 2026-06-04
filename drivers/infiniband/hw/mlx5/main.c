@@ -3939,6 +3939,39 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	 * back via RESP_QPN). */
 	ibqp->qp_num = req.qpn;
 
+	/*
+	 * §S6b dmac refresh -- design/qp_av_dmac_swap.md.
+	 *
+	 * LOAD_VHCA_STATE preserved the source's resolved peer-MAC
+	 * into the QPC's path.rmac_*. For CRIU-on-host swap workloads
+	 * (where the VF stays put but peer IPs are reassigned to
+	 * simulate VM mobility), that preserved MAC is now the LOCAL
+	 * NIC's own MAC; outgoing RoCEv2 frames are self-addressed at
+	 * L2 and silently dropped, surfacing as IBV_WC_RETRY_EXC_ERR
+	 * on the first post_send.
+	 *
+	 * Apply only to RC/UC user-mode QPs: UD AHs carry their dmac
+	 * out-of-band so the QPC's rmac is meaningless there; XRC and
+	 * DC are out of scope for v0; kernel-mode QPs aren't restored
+	 * by this path. The helper itself further skips IB-link-layer
+	 * ports (no L2 dmac to refresh) and Policy-A-logs missing /
+	 * NUD_INCOMPLETE neighbor entries. Non-zero return is logged
+	 * but treated as non-fatal -- the QP has already been adopted
+	 * and a stale-dmac QP is no worse off than the pre-fix
+	 * behavior, so surface the QP to userspace either way and let
+	 * the operator rerun check_qp_av_dmac.sh to localize.
+	 */
+	if (qp->ibqp.uobject &&
+	    (qp->type == IB_QPT_RC || qp->type == IB_QPT_UC)) {
+		err = mlx5_ib_restore_qp_refresh_av_dmac(dev, &base->mqp);
+		if (err) {
+			mlx5_ib_warn(dev,
+				     "vfmig: restore_qp qpn=0x%x: av.dmac refresh failed (%d); restore proceeds with stale dmac. The data path will RETRY_EXC until the operator manually refreshes via post-restore ibv_modify_qp or until the kernel-side resolver succeeds.\n",
+				     req.qpn, err);
+			err = 0;
+		}
+	}
+
 	mlx5_ib_dbg(dev,
 		    "vfmig_qp_dbg: restore_qp ibdev=%s qpn=0x%x type=%d state=%d uid=%u uidx=0x%x flags_en=0x%x target_handle=0x%x cap={s_wr=%u r_wr=%u s_sge=%u r_sge=%u inl=%u} buf_size=%zu db_user_virt=0x%lx\n",
 		    dev_name(&ibqp->device->dev), req.qpn, qp->type,
