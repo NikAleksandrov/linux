@@ -738,18 +738,30 @@ int mlx5_ib_restore_qp_refresh_av_dmac(struct mlx5_ib_dev *dev,
 	}
 
 	/*
-	 * Build a qpc blob with only path.rmac_* set; opt_param_mask
-	 * gates which fields the FW consumes, so the rest can be zero.
-	 * mlx5_set_path uses ether_addr_copy on rmac_47_32 (treating
-	 * rmac_47_32 + rmac_31_0 as a contiguous 6-byte field, which is
-	 * how mlx5_ifc_ads_bits actually lays them out big-endian); we
-	 * mirror that here.
+	 * Build a qpc blob whose primary_address_path matches the
+	 * QPC the FW is currently holding except for rmac_*. That way
+	 * any FW-side internal-consistency check on the modify blob
+	 * (sgid_index references a populated GID slot, vhca_port_num
+	 * matches the QPC's bound port, dgid is well-formed, ...) is
+	 * trivially satisfied: every subfield except rmac_* is the
+	 * exact byte sequence FW just gave us via QUERY_QP.
+	 *
+	 * Earlier revisions wrote ONLY rmac_* into a kzalloc'd qpc and
+	 * leaned on opt_param_mask=PRIMARY_ADDR_PATH to gate which
+	 * subfields FW consumed. CX-7 28.x firmware rejected that
+	 * payload with -EINVAL + syndrome 0x498c8b on a real restored
+	 * RTS QPC, so we fall back to "copy the full path, override
+	 * rmac_*". opt_param_mask still tells FW which subfields to
+	 * write through into the live QPC, so this is functionally
+	 * a no-op for fields that aren't rmac_* but it gives FW a
+	 * fully-formed path to validate against.
 	 */
 	qpc_modify = kzalloc(MLX5_ST_SZ_BYTES(qpc), GFP_KERNEL);
 	if (!qpc_modify)
 		return -ENOMEM;
 
 	path_in = MLX5_ADDR_OF(qpc, qpc_modify, primary_address_path);
+	memcpy(path_in, path_out, MLX5_ST_SZ_BYTES(ads));
 	ether_addr_copy(MLX5_ADDR_OF(ads, path_in, rmac_47_32), new_dmac);
 
 	err = mlx5_core_qp_modify(dev, MLX5_CMD_OP_RTS2RTS_QP,
