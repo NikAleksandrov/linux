@@ -2545,7 +2545,21 @@ static long vfmig_ioc_refresh_av_dmac(struct mlx5_vfmig_pf *vfmig,
 
 		arg.dmac_changed = 1;
 
-		/* ---- Step 3: MODIFY_QP(RTS2RTS, PRIMARY_ADDR_PATH) ---- */
+		/* ---- Step 3: MODIFY_QP(RTS2RTS, PRIMARY_ADDR_PATH) ----
+		 *
+		 * Build a qpc blob whose primary_address_path matches the
+		 * QPC the FW just gave us back from QUERY_QP except for
+		 * rmac_*. CX-7 28.x firmware rejected the rmac-only
+		 * payload (opt_param_mask=PRIMARY_ADDR_PATH gates which
+		 * subfields are *written* but evidently the path is still
+		 * validated as a whole) with -EINVAL + syndrome
+		 * 0x498c8b on a real restored RTS QPC. Copying the full
+		 * path from the pre-query and overriding rmac_* keeps the
+		 * payload identical to the live QPC except for the field
+		 * we're trying to update -- so any FW-side internal
+		 * consistency check on path.{vhca_port_num, src_addr_index,
+		 * dgid, dei_cfi+eth_prio+sl, ...} is trivially satisfied.
+		 */
 		MLX5_SET(rts2rts_qp_in, m_in, opcode,
 			 MLX5_CMD_OP_RTS2RTS_QP);
 		MLX5_SET(rts2rts_qp_in, m_in, qpn, arg.qpn);
@@ -2554,6 +2568,7 @@ static long vfmig_ioc_refresh_av_dmac(struct mlx5_vfmig_pf *vfmig,
 
 		qpc_m  = MLX5_ADDR_OF(rts2rts_qp_in, m_in, qpc);
 		path_m = MLX5_ADDR_OF(qpc, qpc_m, primary_address_path);
+		memcpy(path_m, path_q, MLX5_ST_SZ_BYTES(ads));
 		ether_addr_copy(MLX5_ADDR_OF(ads, path_m, rmac_47_32),
 				new_dmac);
 
