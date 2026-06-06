@@ -1,28 +1,71 @@
 # DESIGN: §S6b -- stale `av.dmac` in migrated QPC after CRIU process-swap with IP reassignment
 
+> ## STATUS (2026-06-06): KS6b kernel mitigation **REVERTED** as architecturally infeasible
+>
+> The kernel-side fix described as "landed" in earlier revisions of
+> this document has been **reverted**. Both surfaces --
+> `mlx5_ib_restore_qp_refresh_av_dmac()` (always-on, KS6b.1, commit
+> `5166e228c223`) and `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` (userspace
+> ioctl backstop, KS6b.6, commit `b70b6624084a`) -- drove the same
+> `MODIFY_QP(RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` sequence
+> from inside the kernel after `LOAD_VHCA_STATE` had restored the
+> QPC. CX-7 28.x firmware **rejects** that opcode + optpar
+> combination unconditionally (-EINVAL syndrome `0x00498c8b`),
+> regardless of how the modify blob's primary_address_path is
+> shaped. The follow-up Patch B (commits `66edef3f790f` /
+> `fe188a601af9`) that mirrored a fully-formed primary path from a
+> pre-op QUERY_QP into the modify blob did **not** change the
+> verdict, confirming that the rejection is about the
+> opcode + optpar pairing itself, not about path internal
+> consistency.
+>
+> The structural reason is captured below in **§12. Post-mortem**:
+> mlx5_ib's own `opt_mask[cur][new][qp_type]` allowlist -- the
+> table `__mlx5_ib_modify_qp` AND-masks the user-requested optpar
+> with -- never contains `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` for
+> *any* state-pair / qp-type triple. The verbs layer's
+> `ib_modify_qp_is_ok` independently rejects `IB_QP_AV` at RTS for
+> RC. Both gates agree with the firmware: post-RTR primary-AV
+> refresh is not a supported operation on this driver / FW
+> combination.
+>
+> §S6b's stale-dmac problem is **not solved**. Ownership has moved
+> to [`vf_prerestore_split.md`](vf_prerestore_split.md) **KS7.1**
+> (pre-RESTORE_QP DMAC fixup in the saved QPC blob) -- the only
+> mechanism that doesn't require an unsupported state transition
+> to land a corrected DMAC.
+>
+> The remainder of this document is preserved as a record of the
+> investigation, the diagnostic tooling that *did* land
+> (`check_qp_av_dmac.sh`, `tools/mlx5_vfmig query_qp`, kept in
+> tree), and the as-tried implementation shape -- so future
+> readers can see the ground that was already covered before
+> arriving at the §12 conclusion. **§10 (Implementation summary)
+> and §11 (Dev-branch backup) describe code that has been
+> reverted; treat them as historical.**
+
 > Companion to [`uobject_restore.md`](uobject_restore.md). Documents the
-> empirical evidence, architectural reasoning, and **landed** kernel-side
-> mitigation for an RC datapath failure observed end-to-end with
-> `mlx5_sriov_vfmig` + CRIU process-swap, where post-restore RC traffic
-> hangs and eventually surfaces `IBV_WC_RETRY_EXC_ERR` (status 12) on
-> the first post-restore `post_send`.
+> empirical evidence, architectural reasoning, and (originally
+> proposed) kernel-side mitigation for an RC datapath failure
+> observed end-to-end with `mlx5_sriov_vfmig` + CRIU process-swap,
+> where post-restore RC traffic hangs and eventually surfaces
+> `IBV_WC_RETRY_EXC_ERR` (status 12) on the first post-restore
+> `post_send`.
 >
 > Filed by the CRIU agent after end-to-end testing with the
 > `rdma_test_agent_vfmig_criu_swap_after_qp.yaml` harness.
 >
-> **Status (2026-06-04 evening):** diagnosis **LOCKED** -- the §6.0
-> `check_qp_av_dmac.sh` diagnostic returned `VERDICT=DMAC_IS_LOCAL` on
-> both physical hosts post-restore, with the QPC's `av_dmac` byte-equal
-> to the local NIC's MAC and `qpc_next_send_psn` exactly one ahead of
-> `qpc_last_acked_psn` (a WR is in flight, stuck in retry). Kernel-side
-> fix per §5.1 + §5.2-erratum **landed** as
-> `mlx5_ib_restore_qp_refresh_av_dmac()` in
-> `drivers/infiniband/hw/mlx5/qp.c`, called from `mlx5_ib_restore_qp`
-> in `main.c`. See [§10. Implementation summary](#10-implementation-summary)
-> for the as-built shape, including the deliberate divergence from
-> §5.1's `rdma_addr_find_l2_eth_by_grh` (which is private to ib_core
-> and not declared in any public header) to a direct `neigh_lookup`
-> against the destination netdev's ARP / NDISC table.
+> **Diagnosis is LOCKED**, but the *mitigation* described in §5 /
+> §10 / §11 is **REVERTED** -- see the STATUS banner above and
+> §12 for the post-mortem. The §6.0 `check_qp_av_dmac.sh`
+> diagnostic returned `VERDICT=DMAC_IS_LOCAL` on both physical
+> hosts post-restore, with the QPC's `av_dmac` byte-equal to the
+> local NIC's MAC and `qpc_next_send_psn` exactly one ahead of
+> `qpc_last_acked_psn` (a WR is in flight, stuck in retry). That
+> *symptom* analysis stands. The proposed kernel fix --
+> re-resolving av.dmac post-RESTORE_QP via
+> `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)` -- is what the
+> firmware refused.
 
 ## TL;DR
 
@@ -862,7 +905,23 @@ test setup doesn't VLAN-trunk VFs, so this is not a blocker. A v1
 that needs VLAN should walk `sgid_attr->ndev` (which the ib_core
 resolver does internally) instead of the port's base netdev.
 
-### 10.2 No call into `mlx5_set_path` for the synthesized qpc blob
+### 10.2 No call into `mlx5_set_path` for the synthesized qpc blob -- *RETRACTED*
+
+> **RETRACTED** (2026-06-06): the *premise* of this entire section --
+> "the optpar mask `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` tells FW which
+> path subfields to consume" -- is correct as a description of the
+> optpar bit's *intent*, but presupposes that FW will accept this
+> opcode + optpar combination at all. As §12 establishes, it does
+> not, on either side of the gate (mlx5_ib's own `opt_mask` table
+> excludes `PRIMARY_ADDR_PATH` from every state-pair cell, and CX-7
+> 28.x firmware independently rejects with syndrome `0x00498c8b`).
+> The follow-up Patch B (`66edef3f790f` / `fe188a601af9`) that tried
+> the *opposite* approach -- mirroring the entire pre-queried
+> `primary_address_path` into the modify blob and overriding only
+> `rmac_*` -- ALSO got the same syndrome, ruling out "blob internal
+> consistency" as the rejection cause. So this design choice
+> was moot in both directions. Preserved verbatim below for the
+> record; the helper itself is gone.
 
 §5.2's erratum suggested still calling `mlx5_set_path` into the
 synthesized qpc blob to preserve consistency checks. **As built we
@@ -930,7 +989,33 @@ principle be reused by any future code path that needs the same
 operation against a `mlx5_core_qp` -- e.g. a probe ioctl for
 KS6b.2-style validation.
 
-## 11. Dev-branch backup: userspace-triggered refresh ioctl (KS6b.6)
+## 11. Dev-branch backup: userspace-triggered refresh ioctl (KS6b.6) -- *REVERTED*
+
+> **REVERTED** (2026-06-06): the ioctl described in this section
+> drove the same `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)`
+> sequence as the always-on `mlx5_ib_restore_qp_refresh_av_dmac`
+> helper, just from a userspace trigger point AFTER the harness's
+> `pin_static_neighbor_*` step. End-to-end run with the ioctl in
+> place AND neighbor entries pinned hit the FW reject documented
+> in §12: `op_status=0xffffffea` (`-EINVAL`), `op_syndrome=0x00498c8b`,
+> `dmac_changed=1` but `post_dmac == pre_dmac` (the modify did not
+> land). Patch B (`fe188a601af9`) that mirrored a fully-formed
+> primary path into the modify blob did not change the verdict.
+>
+> Surfaces removed in the §S6b revert series:
+> * `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` (cmd `0x12`) and
+>   `struct mlx5_vfmig_refresh_av_dmac` from `include/uapi/linux/mlx5_vfmig.h`
+> * `vfmig_ioc_refresh_av_dmac()` handler + dispatch in `vfmig.c`
+> * `vfmig_lookup_l2_dmac()` / `vfmig_path_extract_dmac()` static helpers
+> * `mlx5_vfmig refresh_av_dmac <vf_id> <qpn>` CLI verb in
+>   `tools/testing/mlx5_vfmig/tools/mlx5_vfmig.c`
+> * `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/refresh_av_dmac.sh`
+>   wrapper script
+>
+> The §11.5 `lookup_l2_dmac` deduplication TODO is moot now that
+> both call sites are gone. Preserved verbatim below for the
+> record; KS7.1 takes over the av.dmac problem.
+
 
 The first end-to-end run with KS6b.1 in place surfaced a harness
 ordering issue rather than a kernel bug: the always-on
@@ -1059,6 +1144,155 @@ new exported helper in
 ~15-LOC wrapper that does its idiomatic netdev acquisition and
 delegates. Defer until the v0 runtime fix is verified end-to-end.
 
+## 12. Post-mortem: post-RTR primary-AV refresh is not supported on mlx5 + CX-7 28.x
+
+The §5 / §10 / §11 mitigation strategy rested on a single
+load-bearing premise (carried verbatim from §5.2 erratum and §10.2):
+
+> FW *does* support primary-AV update at RTS via the `RTS2RTS_QP`
+> opcode + `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` bit (see the optpar
+> mapping in `set_qp_state_optpar`'s `IB_QP_AV` case). This helper
+> bypasses the verbs gate by calling `mlx5_core_qp_modify`
+> directly...
+
+That premise was **never verified end-to-end**, and the end-to-end
+runs that finally exercised it have **falsified it**, in three
+mutually corroborating ways.
+
+### 12.1 Empirical: firmware rejects the opcode + optpar combination
+
+With the always-on path (KS6b.1) AND the userspace ioctl (KS6b.6)
+in tree, AND the harness ordered to pin static neighbors before
+firing the ioctl (so `neigh_lookup` actually returned the right
+peer MAC), the `MODIFY_QP(RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)`
+sent through `mlx5_core_qp_modify` reproducibly returned:
+
+```
+op_status=0xffffffea (-EINVAL)
+op_syndrome=0x00498c8b
+```
+
+against an otherwise-healthy restored RTS RC QPC:
+
+```
+pre_qpc_state=3                          (RTS, as required by RTS2RTS)
+pre_vhca_port_num=1                      (Ethernet, RoCE v2)
+pre_sgid_index=3                         (valid GID slot, RoCE v2 IPv4 mapped)
+pre_dmac=02:00:ef:04:00:01               (stale == local NIC MAC)
+pre_dgid=...c0a8:6404                    (peer IP, valid IPv4-mapped IPv6)
+lookup_status=0
+resolved_dmac=02:00:f0:04:00:01          (peer NIC MAC, neigh_lookup OK)
+dmac_changed=1
+post_dmac=02:00:ef:04:00:01              (modify did not land)
+```
+
+A subsequent Patch B (`66edef3f790f` / `fe188a601af9`) that built
+the modify blob's `primary_address_path` by mirroring the *entire*
+pre-op `QUERY_QP` path and overriding only `rmac_*` produced
+identical results -- same syndrome, same `post_dmac == pre_dmac`.
+This rules out "modify-blob internal consistency" as the rejection
+cause: FW rejects the opcode + optpar bit combination itself, not
+the payload shape.
+
+(For completeness: the diagnostic
+[`check_qp_av_dmac.sh`](#60-cheapest-diagnostic-cdev-query_qp--check_qp_av_dmacsh)
+captured the *symptom* correctly -- `VERDICT=DMAC_IS_LOCAL`. The
+bug it identified is real. What §5 / §10 / §11 got wrong was the
+*remediation path*.)
+
+### 12.2 Structural: mlx5_ib's own opt_mask allowlist excludes PRIMARY_ADDR_PATH everywhere
+
+`drivers/infiniband/hw/mlx5/qp.c` carries the kernel's
+authoritative FW-accept allowlist as a 3-D table:
+
+```c
+static enum mlx5_qp_optpar opt_mask
+        [MLX5_QP_NUM_STATE]   /* current state */
+        [MLX5_QP_NUM_STATE]   /* target  state */
+        [MLX5_QP_ST_MAX];     /* qp type */
+```
+
+`__mlx5_ib_modify_qp` AND-masks the user-requested optpar with
+`opt_mask[mlx5_cur][mlx5_new][mlx5_st]` before issuing the FW
+command (`optpar &= opt_mask[...]`). Auditing the table:
+
+| state pair      | RC opt_mask bits                                                      | `PRIMARY_ADDR_PATH` allowed? |
+|-----------------|------------------------------------------------------------------------|------------------------------|
+| INIT -> INIT    | `RRE \| RAE \| RWE \| PKEY_INDEX \| PRI_PORT \| LAG_TX_AFF`                | no                           |
+| INIT -> RTR     | `ALT_ADDR_PATH \| RRE \| RAE \| RWE \| PKEY_INDEX \| LAG_TX_AFF`           | no                           |
+| RTR  -> RTS     | `ALT_ADDR_PATH \| RRE \| RAE \| RWE \| PM_STATE \| RNR_TIMEOUT`            | no                           |
+| RTS  -> RTS     | `RRE \| RAE \| RWE \| RNR_TIMEOUT \| PM_STATE \| ALT_ADDR_PATH`            | **no**                        |
+| SQER -> RTS     | `RNR_TIMEOUT \| RWE \| RAE \| RRE`                                     | no                           |
+
+`MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` (bit `1 << 7`) is **never** in
+any cell of `opt_mask` for any `(cur, new, qp_type)` triple. The
+verbs path's `ib_mask_to_mlx5_opt(IB_QP_AV)` does map to
+`PRIMARY_ADDR_PATH | PRI_PORT`, but both bits get AND-masked to
+zero before reaching the FW. mlx5_ib relies on the primary AV being
+set as a *mandatory* QPC field on the INIT -> RTR transition (where
+the path is required, not optional, so it bypasses the optpar gate
+entirely) and offers **no path through the optpar-gated route to
+update the primary AV at any state**.
+
+Our reverted helpers bypassed `__mlx5_ib_modify_qp` and called
+`mlx5_core_qp_modify` directly, which skips the AND-mask. That's
+why the helper *built and ran* but FW rejected: we were sending an
+optpar bit the kernel itself never expects to see in any
+`MODIFY_QP` FW command, against a state-pair whose accept list
+doesn't include it.
+
+### 12.3 Structural: the verbs layer agrees
+
+`ib_modify_qp_is_ok(IB_QPS_RTS, IB_QPS_RTS, IB_QPT_RC, IB_QP_AV)`
+returns `false` -- the IB verbs layer's per-state-pair allowed
+attribute mask (`qp_state_table[][]` in `drivers/infiniband/core/verbs.c`)
+disallows `IB_QP_AV` for RTS -> RTS on RC. So an application
+calling `ibv_modify_qp(qp, &attr, IBV_QP_AV)` against an RTS QP
+fails before any kernel command is built. The §5 / §10 sketches
+acknowledged this gate ("`__mlx5_ib_modify_qp` rejects with
+`-EINVAL`") and chose to bypass it. We now know the bypass was
+trying to drive the FW into a corner the FW also doesn't support.
+
+### 12.4 Conclusion and forward path
+
+Post-RTR primary-AV refresh isn't a thing on mlx5 + CX-7 28.x.
+There is no opcode + optpar pairing that lands a corrected DMAC
+into a live RTS QPC. Every mechanism we have for installing
+primary AV runs at INIT -> RTR (mandatory, fixed), or via
+`LOAD_VHCA_STATE` (the entire QPC verbatim). Once the QP is in
+RTR or beyond, the path is immutable from the host side.
+
+Two corollaries:
+
+1. **The architecturally clean fix is to land the corrected DMAC
+   *before* `LOAD_VHCA_STATE`**, by rewriting `path.rmac_*` in
+   the saved QPC blob. This is exactly what
+   [`vf_prerestore_split.md`](vf_prerestore_split.md) **KS7.1**
+   describes (pre-RESTORE_QP DMAC fixup): the orchestrator
+   resolves the destination's peer MAC via `neigh_lookup` /
+   pinned static neighbor, edits the QPC payload in flight, and
+   `LOAD_VHCA_STATE` then installs a QPC that's already correct
+   at t=0. No state transitions, no FW commands beyond the
+   normal restore path, no `MODIFY_QP` syndromes.
+
+2. **A destructive rebuild path** -- driving the QP through
+   `2RST_QP` and back through `INIT2INIT_QP` / `INIT2RTR_QP`
+   with a fresh primary AV containing the corrected DMAC -- is
+   theoretically possible (the primary AV bit at INIT -> RTR is
+   mandatory, so it lives outside the optpar gate) but resets
+   PSN and breaks the connection's invariants. It defeats the
+   point of CRIU restore (which exists to preserve those
+   invariants verbatim) and is therefore not viable for the
+   workload.
+
+KS7.1 is the canonical owner of §S6b's stale-dmac problem going
+forward. KS6b.1 / KS6b.6 in this document are reverted as
+unrealizable on the targeted FW; the diagnostic tooling
+(`check_qp_av_dmac.sh`, `tools/mlx5_vfmig query_qp`) stays in
+tree as the canonical way to *confirm* a DMAC is correct on a
+freshly restored QP, which is the verification surface KS7.1
+will key off of.
+
 ## Changelog
 
 - 2026-06-04: initial draft, filed by the CRIU agent after the
@@ -1106,3 +1340,23 @@ delegates. Defer until the v0 runtime fix is verified end-to-end.
   refresh_av_dmac.sh` wrapper. Module-parameter gate considered
   and rejected (see §11.3). KS6b.6 marked DONE; KS6b.2 / KS6b.4
   pending end-to-end harness rerun.
+- 2026-06-06: end-to-end run with the ioctl in tree AND neighbor
+  entries pinned reproduced the FW reject documented in **§12**:
+  `op_status=0xffffffea` (`-EINVAL`),
+  `op_syndrome=0x00498c8b`, `dmac_changed=1` /
+  `post_dmac == pre_dmac`. Patch B (commits `66edef3f790f` /
+  `fe188a601af9`) that mirrored a fully-formed
+  `primary_address_path` from a pre-op `QUERY_QP` into the
+  modify blob did not change the verdict, ruling out modify-blob
+  internal consistency as the rejection cause. Audit of
+  mlx5_ib's `opt_mask[cur][new][qp_type]` allowlist established
+  that `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` is absent from every
+  cell, mirroring the FW gate -- post-RTR primary-AV refresh is
+  not a supported operation on this driver / FW combination.
+  KS6b.1 + KS6b.6 + Patch B + design-doc updates around them
+  **REVERTED** as architecturally infeasible; ownership of §S6b
+  moved to `vf_prerestore_split.md` KS7.1 (pre-RESTORE_QP DMAC
+  fixup). Top-of-file STATUS banner, §10.2 RETRACTED note, §11
+  REVERTED note, and new §12 post-mortem all added in this
+  pass. Diagnostic tooling (`check_qp_av_dmac.sh`,
+  `tools/mlx5_vfmig query_qp`) stays in tree.
