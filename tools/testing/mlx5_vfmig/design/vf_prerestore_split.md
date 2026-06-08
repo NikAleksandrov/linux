@@ -10,22 +10,16 @@
 >
 > * KS7.1 -- the existing `MLX5_VFMIG_IOC_QUERY_VF.restored`
 >   indicator. **LANDED**, no new kernel work.
-> * KS7.2 -- the `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl
->   (§S6b "Alternative C" backstop). **REVERTED** as
->   architecturally infeasible -- post-RTR primary-AV
->   refresh is not supported on mlx5 + CX-7 28.x. See
->   [`qp_av_dmac_swap.md`](qp_av_dmac_swap.md) **§12** for
->   the post-mortem (FW reject syndrome `0x00498c8b` against
->   `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)`, mlx5_ib's
->   `opt_mask` allowlist excludes `PRIMARY_ADDR_PATH` from
->   every state-pair cell). Whatever §S6b dmac-correction
->   work was previously planned for **after** restore is now
->   ownership of **KS7.4** (newly promoted from "future
->   work") -- pre-RESTORE_QP DMAC fixup in the saved QPC
->   blob, performed by the prerestore binary itself, before
->   `LOAD_VHCA_STATE` installs the QPC. That landing site is
->   the only place a corrected DMAC can be installed without
->   a state transition the FW won't perform.
+> * KS7.2 -- the `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl.
+>   **REVERTED** as architecturally infeasible AND
+>   no longer needed; the §S6b stale-dmac problem it was
+>   trying to address turned out to be a missing
+>   orchestrator-side step, not a kernel gap. See
+>   [`qp_av_dmac_swap.md` STATUS banner](qp_av_dmac_swap.md)
+>   for the resolution and Appendix A §12 of that doc for
+>   the FW post-mortem we generated along the way (preserved
+>   so the next person who's tempted by post-LOAD primary-AV
+>   refresh sees why it doesn't work on mlx5 + CX-7 28.x).
 > * KS7.3 -- an **orchestrator-owned** per-VF UUID
 >   (`SET_VF_UUID` write ioctl, called by the orchestrator
 >   when provisioning a VF; `vf_uuid` extension on
@@ -37,23 +31,26 @@
 >   stable across SAVE/LOAD (see §3.5); without it the
 >   prerestore model has no safe way to bind a CRIU dump
 >   to a specific prerestored VF.
-> * KS7.4 -- **pre-RESTORE_QP DMAC fixup in the saved QPC
->   blob** (§S6b dmac-stale fix, post-§12-retraction). The
->   prerestore binary, after pinning ARP for the workload's
->   peer IPs and BEFORE issuing `LOAD_VHCA_STATE`, walks
->   the SAVE_QP blobs and rewrites
->   `qpc.primary_address_path.rmac_*` for each RC/UC QP
->   from a `neigh_lookup` against the destination netdev's
->   ARP / NDISC table. `LOAD_VHCA_STATE` then installs a
->   QPC that's already correct at t=0 -- no `MODIFY_QP`
->   syndromes, no state transitions, no firmware gates.
->   **NEW**, modest size (mostly userspace plumbing in the
->   prerestore binary; kernel side is a small write helper
->   on top of the existing SAVE/LOAD blob path).
+> * KS7.4 -- **orchestrator-side per-VF identity migration
+>   on the destination, pre-LOAD_VHCA_STATE** (§S6b
+>   resolution). The orchestrator (or whatever provisioning
+>   tool drives the VF on the destination) sets the
+>   destination VF's MAC, IP, and pinned ARP to mirror the
+>   source-time peer-VF's identity, the same way SR-IOV VM
+>   live-migration sets the destination VF's admin MAC to
+>   the migrating VM's vNIC MAC. With those steps in place
+>   the source-baked `path.rmac_*` in the saved QPC is
+>   correct at t=0; LOAD_VHCA_STATE installs the QPC
+>   verbatim and RESTORE_QP works on it without
+>   modification. **No new kernel surface required** -- this
+>   ask is documentation + harness wiring, not a kernel
+>   patch. Spec lives in §4.6. Empirically confirmed
+>   2026-06-08; see `qp_av_dmac_swap.md` STATUS banner +
+>   §1 (Resolution) + §2 (Validation).
 >
-> **Kernel agent: KS7.1 is landed; KS7.2 is reverted (see
-> §4 banner); KS7.3 and KS7.4 are the outstanding kernel
-> asks.** Start at [§2](#2-kernel-agent-asks-at-a-glance);
+> **Kernel agent: KS7.1 is landed; KS7.2 is reverted; KS7.4
+> needs no kernel work; KS7.3 is the only outstanding
+> kernel ask.** Start at [§2](#2-kernel-agent-asks-at-a-glance);
 > the KS7.3 specification lives in §3.5. The CRIU-side
 > sections (§6-§10) are FYI.
 >
@@ -67,80 +64,88 @@
 
 ## TL;DR
 
-> **Updated 2026-06-06.** The earlier TL;DR framed §S6b as a
-> *timing* problem -- the dmac-refresh helper was sound but ran
-> too early. End-to-end testing **with** the timing solved (via
-> the KS7.2 ioctl backstop fired AFTER `pin_static_neighbor_*`)
-> proved the timing wasn't the only issue: the
-> `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)` opcode + optpar
-> combination the helper drove is not supported by mlx5 + CX-7
-> 28.x at all. KS7.2 is reverted, the §S6b post-restore helper
-> is reverted, and the dmac-correction work has moved to a
-> *pre*-RESTORE_QP fixup performed by the prerestore binary
-> itself (KS7.4). The split-restore architecture below is still
-> the right shape -- it just acquires KS7.4 as a built-in step,
-> rather than relying on a post-LOAD kernel helper to clean up
-> after the fact. See [`qp_av_dmac_swap.md`](qp_av_dmac_swap.md)
-> §12 for the FW-rejection post-mortem.
+> **Updated 2026-06-08.** The §S6b dmac-stale problem that
+> originally motivated this doc has been **resolved
+> orchestrator-side, with no kernel work**. The fix is the
+> same per-VF identity migration SR-IOV VM live-migration
+> already does for free: set the destination VF's MAC, IP,
+> and pinned ARP to mirror the source-time peer-VF identity
+> via `ip link set vf mac` + `ip addr add` + `ip neigh
+> replace`, all before `LOAD_VHCA_STATE`. With those steps
+> the source-baked QPC is correct at t=0 and `LOAD_VHCA_STATE
+> → RESTORE_QP` works on the unmodified blob. See
+> [`qp_av_dmac_swap.md`](qp_av_dmac_swap.md) STATUS banner +
+> §0 / §1 / §2 for the field-by-field analysis and
+> validation; [Appendix A §12](qp_av_dmac_swap.md#12-post-mortem-post-rtr-primary-av-refresh-is-not-supported-on-mlx5--cx-7-28x)
+> of that doc preserves the FW-rejection post-mortem we
+> generated while still chasing a kernel-side fix. KS7.4 in
+> this document collapses from "pre-RESTORE_QP blob fixup
+> with a kernel patch surface" to "**orchestrator-side VF
+> identity migration; no new kernel surface**" -- spec at
+> §4.6.
 
 The §S6b dmac-refresh problem is that `LOAD_VHCA_STATE`
 faithfully preserves the source's QPC verbatim, including the
-source-resolved `av.dmac` -- which on the destination physical
-host (where peer IPs were reassigned to simulate VM mobility) is
-the *local* NIC's MAC, not the peer's. Outgoing RoCEv2 frames are
-self-addressed at L2 and silently dropped, surfacing as
-`IBV_WC_RETRY_EXC_ERR` (status 12, `vendor_err 0x81`) on first
-post-restore `post_send`.
+source-resolved `av.dmac` baked into `path.rmac_*` at
+`MODIFY_QP_TO_RTR` time. On the destination physical host, the
+*peer* of the restored process is now whichever process was
+swapped onto the *other* physical host -- and that peer process
+is using a different VF MAC than its source-time predecessor.
+Outgoing RoCEv2 frames carry the source-baked `path.rmac` as L2
+destination; if that MAC doesn't match the actual peer's
+current VF MAC, frames are silently dropped by the fabric and
+surface as `IBV_WC_RETRY_EXC_ERR` (status 12,
+`vendor_err 0x81`) on first post-restore `post_send`.
 
-The original §S6b plan (`qp_av_dmac_swap.md` §5) was to fix this
-*after* restore: re-resolve `av.dmac` via `neigh_lookup` and
-install it via `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)`. That
-plan was implemented as `mlx5_ib_restore_qp_refresh_av_dmac()`
-(`5166e228c223`) and the `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl
-(`b70b6624084a`). Both are now **reverted**: the
-`RTS2RTS_QP + PRIMARY_ADDR_PATH` combination is rejected by FW
-with syndrome `0x00498c8b`, and mlx5_ib's own `opt_mask`
-allowlist independently confirms `PRIMARY_ADDR_PATH` is never
-valid as an optpar bit on any state transition. Once the QPC is
-in RTS (or even RTR), the primary address path is immutable from
-the host side.
+The fix is to make the destination-side VF *take on* the
+source-time peer-VF MAC -- the same way SR-IOV VM-LM sets the
+destination VF's admin MAC to the migrating VM's vNIC MAC.
+Combined with the existing IP-swap step (which already
+auto-populates the GID table at the same `src_addr_index`
+slot), that's enough: `path.rmac_*` matches the actual peer
+post-swap, and `path.src_addr_index` resolves correctly.
+Concretely, on each destination host before `LOAD_VHCA_STATE`:
 
-The viable forward path -- newly promoted to **KS7.4** in this
-document -- is to fix the DMAC **before** `LOAD_VHCA_STATE`
-installs the QPC: the prerestore binary, after pinning ARP for
-the workload's peer IPs, walks the SAVE_QP blobs and rewrites
-`qpc.primary_address_path.rmac_*` on each RC/UC QP from a
-`neigh_lookup` against the destination netdev. `LOAD_VHCA_STATE`
-then installs a QPC that's already correct at t=0; no
-`MODIFY_QP` is needed at any point in the restore. This is
-strictly cleaner than the post-restore helper anyway -- it
-operates on a static blob in userspace memory, with no FW
-state-transition gates to worry about.
+```bash
+ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>
+ip addr add <source-time-peer-vf-ip>/<prefix> dev <vf_netdev>
+ip neigh replace <source-time-local-ip> \
+                 lladdr <source-time-local-vf-mac> \
+                 dev <vf_netdev> nud permanent
+```
 
-The architectural fix is to split the existing monolithic
-restore into two operator-orderable phases:
+(MAC first, then IP -- GID-table entries bind `(IP, MAC)` at
+`ip addr add` time, and changing MAC after leaves the GID
+entries with stale bindings.)
+
+This split-restore architecture -- two operator-orderable
+phases instead of CRIU's monolithic flow -- is still the right
+shape for *making the orchestrator's reconfiguration step
+explicit and operator-controllable*. It just acquires KS7.4's
+identity-migration as one of its prerestore steps rather than
+relying on a post-LOAD kernel helper that doesn't actually
+exist (per the FW post-mortem in `qp_av_dmac_swap.md`
+Appendix A §12).
+
+The two phases:
 
 1. **VF prerestore** -- a standalone CRIU-side binary
    (`mlx5_vfmig_restore_vf`, dlopens `rdma_mlx5_vfmig_plugin.so`)
-   that consumes the dump's plugin blob, lets the operator
-   pin static ARP for the workload's peer IPs, then (KS7.4)
-   walks the saved RC/UC QP blobs and rewrites
-   `qpc.primary_address_path.rmac_*` from `neigh_lookup`
-   against the destination netdev BEFORE driving the kernel
-   to apply `LOAD_VHCA_STATE`. The destination QPC therefore
-   loads with the correct DMAC at t=0; no post-restore FW
-   commands are needed.
+   that consumes the dump's plugin blob, hands operator-visible
+   control to the orchestrator long enough to perform the
+   per-VF identity migration above (KS7.4), then drives the
+   kernel to apply `LOAD_VHCA_STATE`. The destination QPC
+   therefore loads with the correct DMAC at t=0; no
+   post-restore FW commands are needed.
 
 2. **Process restore** -- a subsequent `criu restore` invocation.
    The plugin's `init()` checks a kernel-exposed VF state flag;
    if the VF was already loaded by step 1 the plugin **skips**
    `LOAD_VHCA_STATE` and proceeds straight to PD/CQ/MR/QP
-   restore. Because step 1 already corrected the saved DMAC
-   in-blob and `LOAD_VHCA_STATE` installed the QPC verbatim,
-   the restored QP is datapath-ready as soon as RESTORE_QP
-   completes. No post-restore dmac-refresh helper is required
-   (and per `qp_av_dmac_swap.md` §12, no such helper is
-   *possible* on this FW).
+   restore. Because step 1 already mirrored the source's per-VF
+   identity onto the destination and `LOAD_VHCA_STATE` installed
+   the QPC verbatim, the restored QP is datapath-ready as soon
+   as `RESTORE_QP` completes.
 
 This split is entirely a CRIU-side change. The kernel-side
 surfaces it depends on:
@@ -154,63 +159,55 @@ surfaces it depends on:
    per VF in the dump blob to decide between the prerestore
    path (skip LOAD) and the monolithic path (run LOAD). See §3.
 
-2. **A pre-RESTORE_QP DMAC fixup hook in the prerestore
-   binary's saved-blob path** (KS7.4): walks each saved RC/UC
-   QP blob, computes the corrected `path.rmac_*` from
-   `neigh_lookup` against the destination netdev's ARP /
-   NDISC table (post-pin), and rewrites the blob in place
-   before `LOAD_VHCA_STATE` consumes it. Replaces the
-   originally-planned post-restore
-   `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl, which was reverted
-   after FW (CX-7 28.x) rejected
-   `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)` with syndrome
-   `0x00498c8b`. See §4 for the post-mortem on the reverted
-   ioctl path; KS7.4 specification proper lives in §4.5.
-
-3. **An orchestrator-owned per-VF UUID.** New
+2. **An orchestrator-owned per-VF UUID.** New
    `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl (called by the
    orchestrator when provisioning a VF; CRIU never calls it)
    plus a 16-byte `vf_uuid` field added to the existing
    `MLX5_VFMIG_IOC_QUERY_VF` return struct. CRIU's dump path
    reads the source VF's UUID and stores it in the plugin
    image; CRIU's restore path iterates eligible PFs/VFs to
-   find the destination VF carrying the matching UUID
-   (which the orchestrator stamped before kicking off
-   restore). Required because `vhca_id` is not stable across
-   SAVE/LOAD -- the source's `vhca_id` is not in the SAVE
-   blob, the destination's `vhca_id` is allocated by the
-   dest PF at LOAD time, and the orchestrator's only
-   collision detection today is a 60-second IOMMU-cmd-ring
-   timeout. See §3.5.
+   find the destination VF carrying the matching UUID (which
+   the orchestrator stamped before kicking off restore).
+   Required because `vhca_id` is not stable across SAVE/LOAD
+   -- the source's `vhca_id` is not in the SAVE blob, the
+   destination's `vhca_id` is allocated by the dest PF at
+   LOAD time, and the orchestrator's only collision detection
+   today is a 60-second IOMMU-cmd-ring timeout. See §3.5.
 
-Surface (1) is LANDED. Surface (2) -- KS7.4 (pre-RESTORE_QP DMAC
-fixup) -- is NEW, replacing the reverted KS7.2 ioctl. Surface (3)
--- KS7.3 -- is also outstanding. None of these required (or will
-require) invasive changes to existing fast paths; all are
-additive.
+Surface (1) is LANDED. Surface (2) -- KS7.3 -- is the only
+outstanding kernel ask. KS7.4 (per-VF identity migration) is
+not a kernel ask at all; the existing `ip link set vf mac` /
+`ip addr add` / `ip neigh replace` UAPIs are sufficient. None
+of these require invasive changes to existing fast paths; all
+are additive.
 
 ## Status
 
-Pre-implementation on the CRIU side. KS7.1 is landed; **KS7.2 was
-reverted 2026-06-06** (see §4 banner / `qp_av_dmac_swap.md` §12).
-KS7.3 (orchestrator UUID) and KS7.4 (pre-RESTORE_QP DMAC fixup,
-replacing KS7.2) are the outstanding kernel-side asks (§2 /
-§3.5 / §4.6). This doc is the contract for the CRIU-side work
-and the KS7.3 + KS7.4 kernel work that follow.
+Pre-implementation on the CRIU side. KS7.1 is landed; **KS7.2
+was reverted 2026-06-06** (see Appendix A §4 banner /
+`qp_av_dmac_swap.md` Appendix A §12 for the FW post-mortem);
+**KS7.4 needs no kernel surface** (resolved orchestrator-side;
+empirically validated 2026-06-08 -- see `qp_av_dmac_swap.md`
+STATUS banner). KS7.3 (orchestrator UUID) is the only
+outstanding kernel-side ask (§2 / §3.5). This doc is the
+contract for the CRIU-side prerestore-binary work and the
+KS7.3 kernel work that follows.
 
-Soft-fallback default: if the prerestore binary was not run, the
-plugin falls back to today's monolithic flow (LOAD_VHCA_STATE
-inside `criu restore`'s `init()`). Behavior on that path is
-**broken on the v0 swap workload** (the QP comes up with the
-wrong DMAC and first `post_send` fails with
-`IBV_WC_RETRY_EXC_ERR` -- exactly the §S6b symptom). Pre-revert
-this fallback was salvageable via the KS7.2 ioctl as a manual
-recovery; post-revert there is no recovery and the v0 swap
-workload requires the prerestore binary to be present. The
-plugin still logs whether the VF was prerestored or restored
-in-line so post-hoc analysis can tell the two paths apart (see
-§6.4); the in-line path will simply surface as "QP not
-operational" rather than silently degrading.
+Soft-fallback default: if the prerestore binary was not run,
+the plugin falls back to today's monolithic flow
+(`LOAD_VHCA_STATE` inside `criu restore`'s `init()`). Behavior
+on that path is **broken on the v0 swap workload** -- the QP
+comes up with the wrong DMAC and first `post_send` fails with
+`IBV_WC_RETRY_EXC_ERR`, exactly the §S6b symptom. There is no
+post-restore recovery: per the post-mortem above, FW does not
+support post-LOAD primary-AV refresh. The v0 swap workload
+therefore requires the prerestore binary (or equivalent
+orchestrator-driven path that performs the KS7.4 identity
+migration before `LOAD_VHCA_STATE`); a soft-fallback that
+runs `LOAD_VHCA_STATE` without it surfaces as "QP not
+operational" with no clean recovery path. The plugin still
+logs whether the VF was prerestored or restored in-line so
+post-hoc analysis can tell the two paths apart (see §6.4).
 
 ## 1. Architecture: the two phases, end-to-end
 
@@ -319,17 +316,17 @@ Detailed CRIU-side shape: §6.3, §6.4.
 ## 2. Kernel-agent asks at a glance
 
 One kernel-side surface is already in place (KS7.1); KS7.2 was
-landed and then reverted (see row below + §4 banner). Two new
-asks are open: identity matching of prerestored VFs back to their
-CRIU dump images (KS7.3) and pre-RESTORE_QP DMAC fixup (KS7.4,
-replacing the reverted KS7.2).
+landed and then reverted (see row below + §4 banner); KS7.4
+needs no kernel surface at all (resolved orchestrator-side
+2026-06-08). KS7.3 (orchestrator-owned per-VF UUID) is the
+only outstanding kernel ask.
 
 | # | ask | where | status | size |
 |---|---|---|---|---|
 | KS7.1 | **VF loaded/unloaded indicator surfaced via `MLX5_VFMIG_IOC_QUERY_VF`** (ioctl 0x03 on the PF cdev). The existing `restored` field is set by `MLX5_VFMIG_IOC_MARK_RESTORED` during the destination LOAD lifecycle. The CRIU plugin's `init()` and the prerestore binary read `restored` from QUERY_VF to decide whether to drive `LOAD_VHCA_STATE` themselves. PF cdev is the right surface: it exists whenever the PF is up, doesn't depend on VF probe state, and iterates VFs via `0..num_vfs-1`. The same QUERY_VF call also returns the per-VF UUID added by KS7.3, so identity matching and load-state checking happen in a single roundtrip. | §3.1-§3.4 | LANDED (existing field; no new kernel work) | -- |
-| KS7.2 | ~~**`MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl** (§S6b "Alternative C" backstop). Landed in `b70b6624084a` with CLI wrapper in `1bbe576bc7c5`.~~ **REVERTED 2026-06-06**: post-RTR primary-AV refresh is not supported on mlx5 + CX-7 28.x. FW rejected `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)` with syndrome `0x00498c8b` and `mlx5_ib`'s own `opt_mask` allowlist excludes `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` from every state-pair cell. See `qp_av_dmac_swap.md` §12 post-mortem. KS7.4 below replaces this ask. | §4 (historical) | REVERTED (commit forthcoming) | -- |
+| KS7.2 | ~~**`MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl** (§S6b "Alternative C" backstop). Landed in `b70b6624084a` with CLI wrapper in `1bbe576bc7c5`.~~ **REVERTED 2026-06-06** in `0a05d29edb2f` / `6055711aae44` / `5786cb303142`: post-RTR primary-AV refresh is not supported on mlx5 + CX-7 28.x. The §S6b problem this ioctl was meant to address turned out to be addressable orchestrator-side (KS7.4); see `qp_av_dmac_swap.md` STATUS banner for the resolution and Appendix A §12 of that doc for the FW post-mortem. | §4 (historical) | REVERTED | -- |
 | KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl (called by the **orchestrator** when provisioning the VF; CRIU never calls it), and a 16-byte `vf_uuid` field added to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps; existing ABI pattern). CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. | §3.5 | NEW; small (one ioctl + extend QUERY_VF) | tiny |
-| KS7.4 | **Pre-RESTORE_QP DMAC fixup in the saved QPC blob** (§S6b dmac-stale fix, post-§12-retraction). Replaces KS7.2. The prerestore binary, after the operator pins static ARP, walks the saved RC/UC QP blobs and rewrites `qpc.primary_address_path.rmac_*` from a `neigh_lookup` against the destination netdev's ARP / NDISC table BEFORE driving `LOAD_VHCA_STATE`. The destination QPC loads with the correct DMAC at t=0; no post-restore FW commands are needed. Mostly userspace work in the prerestore binary; kernel side is a small write helper (or a thin extension to the existing SAVE/LOAD blob path) that lets userspace mutate `path.rmac_*` in a saved-blob slot without rebuilding the whole blob from scratch. Spec lives in §4.6. | §4.6 | NEW; modest | -- |
+| KS7.4 | **Per-VF identity migration on the destination, pre-LOAD_VHCA_STATE** (§S6b resolution). Orchestrator (or whatever provisioning tool drives the VF on the destination) sets `ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>`, `ip addr add <source-time-peer-vf-ip>`, and `ip neigh replace <source-time-local-ip> lladdr <source-time-local-vf-mac>` to mirror the source's per-VF identity. With those steps in place, the source-baked `path.rmac_*` in the saved QPC matches the actual peer's VF MAC at t=0 and `LOAD_VHCA_STATE` installs a QPC that's already correct. Empirically confirmed 2026-06-08 on `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`. **No kernel surface required** -- existing `ip link set vf mac` / `ip addr` / `ip neigh` UAPIs are sufficient. Spec lives in §4.6. | §4.6 | RESOLVED orchestrator-side; no kernel work | -- |
 
 The earlier draft of this doc proposed a new sysfs node at
 `/sys/bus/pci/devices/<pf>/vfmig/vf%u/state` for KS7.1. That
@@ -824,10 +821,13 @@ win of in-kernel storage is worth it.
 > operation on this driver / FW combination.
 >
 > The §S6b dmac-correction work has moved to **KS7.4** below
-> (pre-RESTORE_QP DMAC fixup, performed by the prerestore
-> binary itself). The remainder of this §4 is preserved as a
-> historical record of the as-tried ioctl shape; the surfaces
-> it documents (ioctl `0x12`, `struct mlx5_vfmig_refresh_av_dmac`,
+> (per-VF identity migration via `ip link set vf mac` + `ip
+> addr` + `ip neigh`, run by the orchestrator before
+> `LOAD_VHCA_STATE`; empirically validated 2026-06-08 -- see
+> `qp_av_dmac_swap.md` STATUS banner / §0 / §1 / §2). The
+> remainder of this §4 is preserved as a historical record of
+> the as-tried ioctl shape; the surfaces it documents (ioctl
+> `0x12`, `struct mlx5_vfmig_refresh_av_dmac`,
 > `mlx5_vfmig refresh_av_dmac` CLI verb, `refresh_av_dmac.sh`
 > wrapper) **are no longer in the tree**.
 
@@ -839,8 +839,9 @@ win of in-kernel storage is worth it.
 
 This section captures the as-built shape **as it was before
 revert**, for the historical record. The current tree has none
-of these surfaces; KS7.4 (§5 below) is the canonical owner of
-the §S6b dmac-correction problem going forward.
+of these surfaces; KS7.4 (§4.6 below) is the canonical owner
+of the §S6b dmac-correction problem going forward, and is now
+purely orchestrator-side (no kernel surface).
 
 ### 4.1 Use cases
 
@@ -972,165 +973,205 @@ A future `--refresh-dmac` subcommand on the prerestore binary
 itself would also be reasonable for operator convenience, but
 is plugin-side work and not gated on the kernel side.
 
-### 4.6 KS7.4 -- forward replacement: pre-RESTORE_QP DMAC fixup
+### 4.6 KS7.4 -- per-VF identity migration on the destination, pre-LOAD_VHCA_STATE
 
-This subsection is the canonical specification for the
-replacement work that takes over §S6b dmac-correction from the
-reverted KS7.2 ioctl. It lives in §4.6 (rather than as its own
-top-level §5) so the surrounding section numbering and inbound
-cross-references in §6-§10 remain stable.
+This subsection is the canonical specification for the §S6b
+dmac-correction work, replacing the reverted KS7.2 ioctl. It
+lives in §4.6 (rather than as its own top-level §5) so the
+surrounding section numbering and inbound cross-references in
+§6-§10 remain stable.
 
-#### 4.6.1 Why this works where KS7.2 didn't
+KS7.4 is **not a kernel ask**. It is documentation + harness
+wiring around the existing per-VF identity-migration UAPIs (`ip
+link set vf mac`, `ip addr`, `ip neigh`) so that CRIU
+process-swap mirrors the source-time per-VF identity onto the
+destination the same way SR-IOV VM live-migration does for the
+migrating VM's vNIC. With those steps in place, the
+source-baked QPC is correct at t=0 and `LOAD_VHCA_STATE` /
+`RESTORE_QP` work on the unmodified blob.
 
-The §12 post-mortem in `qp_av_dmac_swap.md` establishes that
-**no post-RTR primary-AV refresh path exists** on mlx5 + CX-7
-28.x. Once a QPC has crossed INIT -> RTR, its
-`primary_address_path` is immutable from the host side: every
-state-pair cell of `opt_mask[cur][new][qp_type]` excludes
-`MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH`, the verbs layer's
-`ib_modify_qp_is_ok` rejects `IB_QP_AV` at RTS for RC, and the
-firmware independently rejects `MODIFY_QP(RTS2RTS_QP,
-PRIMARY_ADDR_PATH)` with syndrome `0x00498c8b`.
+#### 4.6.1 Why per-VF identity migration suffices
 
-The corollary: the only place a corrected DMAC can be installed
-without an unsupported state transition is **before
-`LOAD_VHCA_STATE` consumes the QPC blob**. At that point the
-QPC is just bytes in a userspace buffer; rewriting
-`primary_address_path.rmac_*` is a memcpy, not a FW command.
-`LOAD_VHCA_STATE` then installs a QPC that's already correct
-at t=0 and the post-restore datapath works without any
-further refresh.
+The companion document
+[`qp_av_dmac_swap.md`](qp_av_dmac_swap.md) §0 walks the
+restored QPC's `primary_address_path` field by field; the
+short version is:
 
-This is the architecturally clean path the original §S6b §5
-sketch *thought* it was avoiding by deferring to a kernel-side
-post-restore helper. With the kernel-side post-restore helper
-proven impossible, the pre-restore fixup becomes the only
-option and -- it turns out -- the simpler one in absolute
-terms. There is no FW state machine to navigate, no
-opcode + optpar combination to gamble on, no syndrome to
-decode.
+* **`path.rmac_*`** is the only field that goes stale on a
+  symmetric process-swap. It's baked verbatim into the QPC
+  at source-time `MODIFY_QP_TO_RTR` and points at the *peer's
+  source-time VF MAC*. Mirror the source's per-VF MAC on the
+  destination via `ip link set vf mac` and the actual peer
+  on the *other* destination host now matches what
+  `path.rmac_*` already says.
+* **`path.rgid_rip`** (peer GID) is correct because the
+  existing IP-swap step puts the peer's source-time IP on
+  the destination's VF.
+* **`path.src_addr_index`** is an *index* into the local
+  GID table; the entry at that index matches because the
+  kernel auto-populates GID entries from netdev IPs at
+  `ip addr add` time, and the IPs we add mirror the
+  source's.
+* **`smac` is not in the QPC**; the FW resolves it on every
+  send via `src_addr_index → GID → netdev → netdev MAC`. So
+  the local NIC's *current* MAC always wins, automatically.
+* All other identity-bearing fields (PSNs, dest_qpn,
+  timeouts, RoCE knobs) are host-agnostic and travel
+  cleanly through `LOAD_VHCA_STATE`.
+
+The companion doc's [Appendix A §12](qp_av_dmac_swap.md#12-post-mortem-post-rtr-primary-av-refresh-is-not-supported-on-mlx5--cx-7-28x)
+captures the post-LOAD-refresh investigation in detail (FW
+reject syndrome `0x00498c8b`, mlx5_ib `opt_mask` excludes
+`PRIMARY_ADDR_PATH` from every state-pair cell). It is
+preserved so the next person tempted by a kernel-side fix
+sees the road that has been ruled out.
 
 #### 4.6.2 Phase ordering
 
-Inside the prerestore binary's main path, ordered:
+On each destination host, ordered:
 
-1. Plugin reads the dump's saved QP blobs into userspace
-   memory (already happens today as part of LOAD_VHCA_STATE
-   blob assembly).
-2. Operator pins static ARP / NDISC for the workload's peer
-   IPs against the destination netdev (existing
-   `pin_static_neighbor_*` step in
-   `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`; in a
-   production deployment this is whatever orchestration
-   layer pins the destination's L2 routing for the VM-style
-   peer set).
-3. **(KS7.4)** Prerestore binary walks the saved QP blobs.
-   For each RC/UC QP whose `qpc.primary_address_path` exists
-   in the blob (i.e. the QPC was at least at INIT2RTR on the
-   source, so primary AV was set), it:
-   * Decodes `path.rgid_rip` to its IPv4 (RoCE v2) or IPv6
-     (RoCE v2) form.
-   * Issues a `neigh_lookup` against the destination netdev
-     (which the prerestore binary already has bound at this
-     point).
-   * If the lookup yields a `NUD_VALID` entry whose lladdr
-     differs from `path.rmac_*`, rewrites `path.rmac_*` in
-     the blob in place. Counts the rewrite for telemetry.
-   * If the lookup misses or yields `NUD_INCOMPLETE`,
-     records a *warning* in the prerestore binary's output
-     (visible to the orchestrator) but **proceeds** with
-     the original DMAC. The orchestration layer can use
-     the warning count to decide whether to abort the
-     restore or accept "best effort"; the kernel does not
-     enforce.
-4. Prerestore binary issues `LOAD_VHCA_STATE` with the
-   (now-corrected) blob. The QPC installs verbatim with
-   the right DMAC.
-5. CRIU plugin's later `init()` sees `restored=1` from
-   QUERY_VF (KS7.1), skips its own LOAD_VHCA_STATE call,
-   and proceeds straight to RESTORE_QP. RESTORE_QP attaches
-   uobjects to the already-correct QPC; first post-restore
-   `post_send` succeeds.
+1. **(Orchestrator)** Stamp `vf_uuid` via `MLX5_VFMIG_IOC_SET_VF_UUID`
+   (KS7.3) so the prerestore binary can match the dump to a
+   destination VF.
+2. **(Orchestrator, pre-LOAD_VHCA_STATE)** Mirror the source's
+   per-VF identity onto the destination VF. **MAC first,
+   then IP, then ARP** -- GID-table entries bind `(IP, MAC)`
+   at IP-add time, so changing MAC after `ip addr add`
+   leaves the GID with a stale binding.
+
+   ```bash
+   ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>
+   ip addr add <source-time-peer-vf-ip>/<prefix> dev <vf_netdev>
+   ip neigh replace <source-time-local-ip> \
+                    lladdr <source-time-local-vf-mac> \
+                    dev <vf_netdev> nud permanent
+   ```
+
+3. **(Prerestore binary)** Read the dump's saved QP blobs
+   and issue `LOAD_VHCA_STATE`. The blob is consumed
+   verbatim; no patching, no FW commands, no neighbor
+   lookups inside the binary's path.
+4. **(CRIU plugin's `init()`, later)** Sees `restored=1`
+   from QUERY_VF (KS7.1), skips its own LOAD_VHCA_STATE
+   call, and proceeds straight to RESTORE_QP. RESTORE_QP
+   attaches uobjects to the already-correct QPC; first
+   post-restore `post_send` succeeds.
+
+The orchestrator owns step (2) because it's a privileged
+host-side operation (`ip link set vf mac` requires
+CAP_NET_ADMIN on the PF host) that orchestration tools
+already drive routinely as part of SR-IOV provisioning.
+Folding it into the prerestore binary would push that
+privilege requirement onto the binary; the orchestrator-side
+split keeps the prerestore binary unprivileged-by-default.
+
+The prerestore binary *can* sanity-check the per-VF identity
+before issuing LOAD_VHCA_STATE (e.g. confirm `ip link show vf
+<VF_ID>` reports the expected MAC) and refuse to load if the
+orchestrator hasn't done its job. That's an operational
+guardrail, not a correctness requirement; recommended but
+optional for v0.
 
 #### 4.6.3 Kernel-side surface
 
-KS7.4 is *mostly* userspace work. The kernel-side surface is
-deliberately small:
+**None.** Every UAPI needed already exists:
 
-* **Either** the existing `MLX5_VFMIG_IOC_LOAD_VF` path is
-  extended to accept a "fixup hook" callback before it hands
-  the blob to FW (callback runs in userspace; the kernel
-  just exposes a reasonable interception point), **or** a
-  new ioctl `MLX5_VFMIG_IOC_PATCH_SAVE_BLOB` lets userspace
-  rewrite specific QPC subfields in a still-staged blob
-  before `LOAD_VHCA_STATE`. The latter is the cleaner
-  contract (the kernel doesn't run user callbacks; it just
-  exposes `(blob_slot, qpc_offset, field, value)` writes
-  bounded by a whitelist of safe fields -- `path.rmac_*` is
-  the v0 entry).
-* The whitelist of patchable subfields stays tight: v0 is
-  `primary_address_path.rmac_47_32` /
-  `primary_address_path.rmac_31_0` only. Future expansions
-  (e.g. `path.vlan_id` if we hit a VLAN-trunk case) would
-  go through the same list with FW-validation as the gate.
-* No state-transition gates. The blob is pre-FW-consumption,
-  so there's no "is this a legal modify in current state"
-  question to answer; the QPC isn't installed yet.
+* `ip link set <PF> vf <VF_ID> mac <MAC>` -- existing SR-IOV
+  admin-MAC primitive; FW-enforced; no mlx5-specific hook
+  needed.
+* `ip addr add` / `ip addr del` -- existing netlink IFADDR;
+  drives the kernel's auto-population of the RoCE GID table.
+* `ip neigh replace ... nud permanent` -- existing netlink
+  neigh; pins the L3->L2 mapping in the destination's ARP
+  cache.
 
-This kernel surface is small enough that it could be folded
-into the existing `MLX5_VFMIG_IOC_LOAD_VF` request struct as
-an optional patch list, rather than a separate ioctl. The
-right shape is for the kernel agent to decide once they
-look at the existing LOAD path.
+All three are routine, well-supported on mlx5, and
+documented. There is **no new mlx5 ioctl, no new sysfs node,
+no `MLX5_VFMIG_IOC_PATCH_SAVE_BLOB` ask**, and no extension
+of `MLX5_VFMIG_IOC_LOAD_VF`. Earlier drafts of this section
+sketched a "saved-blob patch list" surface; that surface is
+no longer needed because the underlying problem turned out
+to be host-side identity drift (which existing UAPIs
+already address) rather than blob-content drift.
 
 #### 4.6.4 Userspace consumer
 
-The prerestore binary itself drives KS7.4. The CRIU plugin
-proper does not need to touch it -- by the time `init()` runs
-on the destination, the QPC is already loaded with the
-corrected DMAC, and RESTORE_QP just attaches uobjects.
+* **Orchestrator / harness**: drives the three `ip` commands
+  in step (2) above. In `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`,
+  this slots into the existing per-host prerestore phase,
+  reusing the same step shape as the IP-add and ARP-pin
+  steps that are already there.
+* **Prerestore binary**: unchanged path -- read dump,
+  verify `vf_uuid` match, optionally sanity-check that
+  per-VF MAC has been set, then `LOAD_VHCA_STATE`.
+* **CRIU plugin proper**: unchanged. By the time `init()`
+  runs, the QPC is already loaded with the right DMAC.
 
-Diagnostic tooling stays the same:
+Diagnostic tooling stays as-is:
 [`check_qp_av_dmac.sh`](../uobject_restore/qp_av_dmac/check_qp_av_dmac.sh)
-remains the canonical post-restore confirmation that the QP's
-DMAC matches the destination's resolved peer MAC; the harness
-runs it after RESTORE_QP completes and expects
-`VERDICT=DMAC_IS_PEER`.
+remains the canonical post-restore confirmation that
+`path.rmac_*` matches the destination's resolved peer MAC;
+the harness runs it after RESTORE_QP completes and expects
+`VERDICT=DMAC_IS_PEER`. (See `qp_av_dmac_swap.md` §2 for
+empirical confirmation that this is exactly what the
+post-fix harness reports.)
 
 #### 4.6.5 Failure modes
 
-* **Neighbor entry missing at fixup time.** Same recovery as
-  KS7.2's `lookup_status=-ENOENT` path: warn, proceed with
-  the original DMAC, let the orchestrator decide. The QP
-  will fail with `IBV_WC_RETRY_EXC_ERR` on first
-  `post_send`, surfaced via the harness's traffic step.
-* **Patch field rejected by kernel whitelist.** Returns
-  `-EINVAL` with a syndrome the prerestore binary can log;
-  this is a programmer-error path, not an operational one.
-* **`LOAD_VHCA_STATE` fails after fixup.** Same recovery as
-  any other LOAD failure today; the patched blob is no
-  more or less likely to fail than an unpatched one,
-  because the patched fields are FW-validated by the same
-  consistency check that runs on a non-patched QPC.
+* **Orchestrator forgot step (2).** The QP comes up with
+  the wrong DMAC and first post_send fails with
+  `IBV_WC_RETRY_EXC_ERR` (status 12). `check_qp_av_dmac.sh`
+  reports `VERDICT=DMAC_IS_LOCAL`. Recovery: tear down,
+  re-run with the orchestrator step in place. There is no
+  post-LOAD recovery (per `qp_av_dmac_swap.md` Appendix A
+  §12).
+* **Orchestrator applied step (2) in the wrong order.** If
+  `ip addr add` runs before `ip link set vf mac`, the GID
+  table populates with the old VF MAC, and outgoing sends
+  carry `src_mac = old_vf_mac` even though the netdev's
+  current MAC is correct. Symptoms identical to "forgot
+  step (2)". Recovery: redo step (2) in MAC-then-IP order
+  (the kernel's GID-table refresh on netdev MAC change is
+  not always immediate; the safe path is to delete and
+  re-add the IP after the MAC change).
+* **Orchestrator stamped the wrong MAC.** Symmetric flip
+  is the most common bug -- e.g. on host A you set the VF
+  MAC to host A's *own* original VF MAC instead of host B's
+  source-time peer-VF MAC. `check_qp_av_dmac.sh` will
+  report `VERDICT=DMAC_AMBIGUOUS` if the captured MAC
+  doesn't match the expected pattern; recovery is to
+  consult the source-time topology dump and rerun.
+* **`LOAD_VHCA_STATE` fails for an unrelated reason.** Same
+  recovery as today; identity migration doesn't change LOAD
+  failure semantics.
 
 #### 4.6.6 Out of scope (forward look)
 
 * **Source-side dmac fixup before SAVE_VHCA_STATE.** Would
   require the source kernel to know about destination
   topology, which violates the "save is host-state-blind"
-  contract. Pre-RESTORE fixup on the destination is the
-  right side of the wire to put this work.
-* **Auto-resolution from a userspace-supplied "destination
-  ARP table" blob.** The prerestore binary already has
-  access to the destination's actual ARP table via
-  `neigh_lookup`; an additional table indirection would
-  add zero correctness and one more way to be wrong.
-* **Patching anything beyond `path.rmac_*` for §S6b.** Other
-  drift between source and destination (vlan, IP, MTU,
-  QoS) is independent work; the §S6b dmac-stale problem is
-  fully addressable by `path.rmac_*` alone, and we don't
+  contract. Pre-LOAD identity migration on the destination
+  is the right side of the wire to put this work.
+* **A `MLX5_VFMIG_IOC_PATCH_SAVE_BLOB` ioctl that lets
+  userspace rewrite QPC subfields.** Earlier drafts of this
+  section proposed it as a fallback if identity migration
+  proved insufficient. Empirically (see `qp_av_dmac_swap.md`
+  §2 validation) it isn't needed for §S6b, and we don't
   want to ship a "rewrite arbitrary QPC fields" UAPI
-  speculatively.
+  speculatively. Any future drift category that the existing
+  `ip link` / `ip addr` / `ip neigh` triple can't address
+  should re-open this design space rather than reaching
+  for a blob-patch ioctl on day one.
+* **Source-side identity capture in the dump blob.** The
+  v0 harness uses a deterministic MAC scheme so the
+  orchestrator can reconstruct source-time MACs without
+  reading the dump. Production deployments may want the
+  CRIU plugin to record the source-time per-VF MAC in a
+  dump-side sidecar so the orchestrator on the destination
+  can read it back at restore time without out-of-band
+  state. This is plugin-side work (a few bytes per VF in
+  the plugin image) and not a kernel ask; tracked
+  separately in §6 if needed.
 
 ## 5. What the kernel agent does NOT need to do
 
@@ -1625,14 +1666,16 @@ completes.
 recovery + verification path while the primary in-restore
 helper remains the canonical mechanism.~~
 
-**(Updated 2026-06-06)** -- Both options on this branch are
-dead. KS7.2 was reverted (see §4 banner /
-`qp_av_dmac_swap.md` §12); the in-restore helper it backstopped
-was reverted alongside. Post-RTR primary-AV refresh isn't a
-thing on mlx5 + CX-7 28.x. The rejection of this approach as
-"primary path" stands -- the right primary path is KS7.4
-(pre-RESTORE_QP DMAC fixup, §4.6), which avoids the
-"setup-after-restore" workflow weirdness *and* the FW gate.
+**(Updated 2026-06-08)** -- Both branches of this approach
+are obsolete. KS7.2 was reverted (FW post-mortem in
+`qp_av_dmac_swap.md` Appendix A §12) AND the §S6b problem
+itself turned out to be addressable orchestrator-side (KS7.4
+per-VF identity migration, §4.6) without needing any
+post-LOAD recovery surface. The rejection of "refresh ioctl
+as primary path" stands -- the right primary path doesn't
+need a refresh ioctl at all; it sets the destination VF's
+identity to mirror the source-time peer's identity *before*
+LOAD_VHCA_STATE, the same way SR-IOV VM-LM has always done.
 
 ### 8.4 Capture-and-replay ARP from dump-side
 
@@ -1674,100 +1717,116 @@ layering violation, and the captured-vs-supplied conflict in
 
 ### 9.1 KS7.2-only path (~~immediate verification, no CRIU-side change~~) -- **REMOVED**
 
-> **Removed 2026-06-06.** This test path drove the now-reverted
-> `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl (KS7.2). It was
-> executed end-to-end on the live harness with neighbor
-> entries pinned BEFORE the ioctl was fired, and the FW
-> rejected `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)` with
-> `op_status=0xffffffea` / `op_syndrome=0x00498c8b`
-> reproducibly -- the very evidence that motivated the §12
-> post-mortem in `qp_av_dmac_swap.md` and the revert of KS7.2.
-> There is no §S6b dmac-correction path that doesn't require
-> the prerestore binary (or KS7.4-equivalent host-side
-> tooling); the immediate-verification escape hatch this
-> section described does not exist anymore.
+> **Removed 2026-06-06; obsolete 2026-06-08.** This test
+> path drove the reverted `MLX5_VFMIG_IOC_REFRESH_AV_DMAC`
+> ioctl (KS7.2), which the firmware rejected
+> reproducibly -- see `qp_av_dmac_swap.md` Appendix A §12
+> for the FW post-mortem. Both the ioctl and the test
+> path are gone.
 >
-> The forward equivalent is **§9.2** (full prerestore-binary
-> path with KS7.4 in place), which is the only end-to-end
-> verification path that exercises a working dmac-correction
-> sequence. Until KS7.4 lands, the v0 process-swap workload
-> has no working datapath verification. The kernel agent
-> should focus testing on the LANDED parts (KS7.1 cdev
-> behavior, prerestore -> LOAD round-trip without DMAC
-> changes, soft-fallback for VM-LM-style migrations where
-> the source-resolved DMAC is *already* valid on the
-> destination) and treat the §S6b workload as blocked on
-> KS7.4 implementation.
+> The §S6b problem the path was trying to validate is now
+> **resolved orchestrator-side** (KS7.4: per-VF identity
+> migration via `ip link set vf mac` + `ip addr` + `ip
+> neigh`, executed before LOAD_VHCA_STATE). The forward
+> equivalent of "immediate verification, no CRIU-side
+> change" is to add KS7.4's three `ip` commands directly
+> to the existing harness's per-host prerestore phase --
+> validated 2026-06-08; see `qp_av_dmac_swap.md` STATUS
+> banner. No additional test path is needed; §9.2 / §9.3
+> already cover the full and soft-fallback flows.
 
 ### 9.2 Full prerestore-binary path (CRIU-side work landed)
 
-Updated 2026-06-06 to reflect the KS7.4 ordering: ARP pin
-happens BEFORE `LOAD_VHCA_STATE` (not between LOAD and
-RESTORE_QP), and the prerestore binary itself rewrites
-`path.rmac_*` in the saved blob as part of its work.
+Updated 2026-06-08 to reflect the resolved KS7.4: per-VF
+identity migration is an *orchestrator-side step* using
+existing `ip` UAPIs, not a kernel-side blob rewrite. The
+prerestore binary's job is just `LOAD_VHCA_STATE` on the
+unmodified blob; the orchestrator's job is to make sure the
+VF identity matches the source-time peer's identity before
+that LOAD happens.
 
 ```
 provision_vf_host1:      orchestrator stamps SET_VF_UUID on
-                         destination VF (must run BEFORE workload
-                         bind on source AND BEFORE prerestore on dest;
-                         in this harness the VF is provisioned on
-                         each host pre-test)
+                         destination VF (KS7.3) -- must run BEFORE
+                         workload bind on source AND BEFORE prerestore
+                         on dest
 provision_vf_host2:      same on host2
-pin_static_neighbor_*:   pin ARP on each destination netdev
-                         (moved BEFORE prerestore -- the prerestore
-                          binary's KS7.4 fixup needs the entries
-                          present at lookup time)
+identity_migrate_host1:  KS7.4. Orchestrator runs, in order:
+                           ip link set <PF> vf <ID> mac <SRC_PEER_VF_MAC>
+                           ip addr  add  <SRC_PEER_VF_IP>/<prefix> dev <vf_netdev>
+                           ip neigh replace <SRC_LOCAL_IP> \
+                                            lladdr <SRC_LOCAL_VF_MAC> \
+                                            dev <vf_netdev> nud permanent
+                         The destination VF now presents the source-time
+                         peer-VF identity at L2/L3.
+identity_migrate_host2:  same on host2 with the symmetric flip
+                         (host2 mirrors what host1 had source-time;
+                         host1 mirrors what host2 had source-time)
 restore_vf_host1:        runs mlx5_vfmig_restore_vf on host1
                          (binary scans /dev/mlx5_vfmig/* for matching
-                          vf_uuid, walks saved RC/UC QP blobs,
-                          rewrites path.rmac_* via KS7.4 fixup,
-                          THEN issues LOAD_VHCA_STATE;
-                          QUERY_VF.restored goes 0 -> 1)
+                          vf_uuid, then issues LOAD_VHCA_STATE on the
+                          unmodified saved blob; QUERY_VF.restored
+                          goes 0 -> 1)
 restore_vf_host2:        same on host2
 criu_restore_host1:      runs criu restore on host1
 criu_restore_host2:      runs criu restore on host2
                          (init() looks up VF by vf_uuid, sees
-                          restored=1, skips LOAD; QPs were already
-                          loaded with corrected DMAC by KS7.4, so
-                          RESTORE_QP just attaches uobjects and
-                          there's no post-restore refresh step)
-ping_pong_after_restore: traffic should succeed without any
-                         post-restore dmac-correction step
+                          restored=1, skips LOAD; QPs were loaded with
+                          a QPC whose path.rmac_* already matches the
+                          actual peer's VF MAC because the orchestrator
+                          symmetrically reconfigured both hosts; so
+                          RESTORE_QP just attaches uobjects)
+ping_pong_after_restore: traffic should succeed
 ```
 
-Pass criterion: `ping_pong_after_restore` returns OK MATCH on
-both directions; `local_ack_timeout_err` does not tick;
+Pass criterion (empirically validated 2026-06-08):
+`ping_pong_after_restore` returns OK MATCH on both
+directions; `local_ack_timeout_err` does not tick;
 `check_qp_av_dmac.sh` returns `VERDICT=DMAC_IS_PEER` on both
 hosts; CRIU restore log on each host emits the "prerestore
-detected; skipping LOAD_VHCA_STATE" line from §6.4; prerestore
-binary log emits a "KS7.4 fixup: rewrote path.rmac_* on N QPs"
-line per host.
+detected; skipping LOAD_VHCA_STATE" line from §6.4. The
+prerestore binary log notes successful LOAD_VHCA_STATE on
+the unmodified blob; no "blob rewrote N QPs" line because
+no rewriting happens.
 
 ### 9.3 Soft-fallback path (no prerestore binary)
 
-Validates that the monolithic flow still works for the cases
-that didn't need prerestore in the first place (VM-LM
-workloads where av.dmac is genuinely valid post-restore). The
-orchestrator-side UUID stamp is still required -- monolithic
-fallback uses the matched VF, it just does LOAD inline.
+Validates that the monolithic flow still works for VM-LM
+style workloads where the source-baked `av.dmac` is genuinely
+valid on the destination -- typically because the migrating
+VM brought its vNIC MAC with it and the peer didn't move.
+The orchestrator-side UUID stamp is still required;
+monolithic fallback uses the matched VF, it just does LOAD
+inline.
+
+The KS7.4 identity-migration step is **also** required for
+the process-swap workload here -- monolithic vs prerestored
+is orthogonal to whether the orchestrator did the per-VF
+identity mirror. If the orchestrator did the migration,
+monolithic LOAD_VHCA_STATE inside criu init() works the same
+way prerestore would. If the orchestrator didn't, neither
+flow saves you (per `qp_av_dmac_swap.md` Appendix A §12, no
+post-LOAD recovery exists).
 
 ```
-provision_vf_host1 / host2: orchestrator stamps SET_VF_UUID
-                            on destination VFs
-criu_restore_host1 / host2: runs criu restore (monolithic flow:
-                            init() finds VF by vf_uuid, restored=0,
-                            runs LOAD inline, sets restored=1)
-ping_pong_after_restore:    expected to succeed for VM-LM workloads,
-                            expected to surface dmac-stale for
-                            process-swap (no backstop available
-                            post-KS7.2 revert; process-swap workload
-                            requires §9.2 path with KS7.4 fixup)
+provision_vf_host1 / host2:    orchestrator stamps SET_VF_UUID
+                               on destination VFs (KS7.3)
+identity_migrate_host1 / host2: orchestrator runs the three-step
+                               KS7.4 mirror, same as §9.2
+criu_restore_host1 / host2:    runs criu restore (monolithic flow:
+                               init() finds VF by vf_uuid, restored=0,
+                               runs LOAD inline, sets restored=1)
+ping_pong_after_restore:       succeeds when the orchestrator's KS7.4
+                               step matches the workload
 ```
 
 Pass criterion: log line "prerestore was NOT run" appears;
-all PD/CQ/MR/QP restore steps succeed; for VM-LM workloads
-ping/pong succeeds; for process-swap workloads the operator
-recognizes the soft-fallback and follows up with §9.1.
+all PD/CQ/MR/QP restore steps succeed; ping/pong succeeds.
+Difference from §9.2 is purely operational: when there's no
+mid-restore window the operator wants for other host
+config, the prerestore binary is a no-op savings and the
+monolithic flow is simpler. The KS7.4 identity-migration
+step is identical and required in both shapes.
 
 ### 9.4 Idempotency
 
@@ -1835,11 +1894,27 @@ destination.
   added to `tools/testing/mlx5_vfmig/tools/mlx5_vfmig.c` in
   `1bbe576bc7c5`.~~ **Removed 2026-06-06**: the ioctl, CLI
   verb, and wrapper script were reverted along with KS7.2.
-  See §4 banner / `qp_av_dmac_swap.md` §12. The §9.2 path
-  no longer needs a post-restore refresh step (KS7.4
-  installs the corrected DMAC pre-LOAD instead).
-* **`pin_static_neighbor_*` (reordered)**: existing step, just
-  moved earlier in the YAML for the §9.2 path.
+  See §4 banner / `qp_av_dmac_swap.md` Appendix A §12. The
+  §9.2 path no longer needs a post-restore refresh step:
+  KS7.4 (orchestrator-side per-VF identity migration via
+  `ip link set vf mac` / `ip addr` / `ip neigh`) makes the
+  source-loaded QPC correct at t=0.
+* **`identity_migrate_host*` (new, KS7.4)**: orchestrator
+  step that runs the three `ip` commands to mirror the
+  source-time peer-VF identity onto the destination VF.
+  Slots in *between* `restore_vf_host*` provisioning (or
+  the `sriov_numvfs` cycle, whichever is later) and the
+  `criu_restore_host*` step. **MAC must be set before the
+  IP** -- GID-table entries bind `(IP, MAC)` at IP-add
+  time. Inputs are deterministic from the harness's
+  source-time MAC scheme (the symmetric flip described in
+  §4.6.2).
+* **`pin_static_neighbor_*` (still in YAML)**: now folds
+  into `identity_migrate_host*` as the third `ip neigh
+  replace` command. With the corrected lladdr (source-time
+  peer-VF MAC, *not* destination NIC MAC), this step
+  becomes a routine ARP pin rather than the workaround it
+  was when the kernel-side fix was assumed.
 
 YAML diff sketch (full prerestore-binary path, §9.2):
 
@@ -1874,7 +1949,29 @@ YAML diff sketch (full prerestore-binary path, §9.2):
   vf_id: 0
   vf_uuid: ${TEST_VF_UUID}
 
-# Prerestore + ARP pin + criu restore:
+# Identity migration (KS7.4) + prerestore + criu restore:
+- name: identity_migrate_host1
+  type: identity_migrate          # new step type
+  host: host1
+  pf_bdf: 0000:08:00.0
+  vf_id: 0
+  # MAC is the source-time peer-VF MAC -- on host1 post-swap,
+  # the local VF takes on what was host2's source-time VF MAC.
+  vf_mac: ${SOURCE_TIME_HOST2_VF_MAC}
+  vf_ip: ${SOURCE_TIME_HOST2_VF_IP}/24
+  peer_ip: ${SOURCE_TIME_HOST1_VF_IP}
+  peer_lladdr: ${SOURCE_TIME_HOST1_VF_MAC}
+- name: identity_migrate_host2
+  type: identity_migrate
+  host: host2
+  pf_bdf: 0000:08:00.0
+  vf_id: 0
+  # Symmetric flip: host2's local VF takes on host1's
+  # source-time VF MAC, etc.
+  vf_mac: ${SOURCE_TIME_HOST1_VF_MAC}
+  vf_ip: ${SOURCE_TIME_HOST1_VF_IP}/24
+  peer_ip: ${SOURCE_TIME_HOST2_VF_IP}
+  peer_lladdr: ${SOURCE_TIME_HOST2_VF_MAC}
 - name: restore_vf_host1
   type: restore_vf
   host: host1
@@ -1883,10 +1980,6 @@ YAML diff sketch (full prerestore-binary path, §9.2):
   type: restore_vf
   host: host2
   image_dir: /var/lib/criu/img/host2/
-- name: pin_static_neighbor_host1
-  # ... existing definition ...
-- name: pin_static_neighbor_host2
-  # ... existing definition ...
 - name: criu_restore_host1
   # ... existing definition (no change) ...
 - name: criu_restore_host2
@@ -1895,13 +1988,19 @@ YAML diff sketch (full prerestore-binary path, §9.2):
   # ... existing definition (no change) ...
 ```
 
-~~YAML diff sketch (KS7.2-only backstop path, §9.1):~~
+The `identity_migrate` step type encapsulates the three
+`ip` commands from §4.6.2 (MAC -> IP -> ARP, in order) and
+returns success only if all three settle cleanly. On
+failure, the step type emits the offending command and
+its stderr so the operator can debug without having to
+re-derive what went wrong.
 
-> **Removed 2026-06-06.** This sketch drove the KS7.2 ioctl
-> backstop, which has been reverted. See §9.1 / §4 banners
-> and `qp_av_dmac_swap.md` §12. Process-swap workloads
-> require the §9.2 path with KS7.4 fixup; there is no
-> post-restore backstop available.
+The `pin_static_neighbor_*` steps from earlier drafts are
+absorbed into `identity_migrate_host*` as the third `ip
+neigh replace` command -- the lladdr it carries is the
+source-time peer-VF MAC, *not* the destination host's
+local NIC MAC, which was the bug the v0 harness shipped
+with.
 
 ## 11. Open questions
 
@@ -1924,17 +2023,17 @@ review items.
    iteration is the right shape). No new kernel work.
 
 3. ~~**`refresh_qp_av` location.**~~ **Resolved, then
-   REVERTED.** Originally landed as
+   REVERTED, then obsoleted.** Originally landed as
    `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` (ioctl `0x12`) on the
    `/dev/mlx5_vfmig/<pf_bdf>` cdev in `b70b6624084a` with
    CLI wrapper `1bbe576bc7c5`; reverted 2026-06-06 because
    FW rejected `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)`
    with syndrome `0x00498c8b`. See §4 banner /
-   `qp_av_dmac_swap.md` §12. The replacement KS7.4 (§4.6)
-   does not need a runtime ioctl -- it operates on the
-   saved blob in userspace before LOAD_VHCA_STATE -- so the
-   "where does the runtime refresh ioctl live" question is
-   moot.
+   `qp_av_dmac_swap.md` Appendix A §12. The replacement
+   KS7.4 (§4.6) is now per-VF identity migration via
+   existing `ip` UAPIs, with no runtime refresh ioctl
+   needed -- the question is moot in both shapes (no
+   post-LOAD ioctl; no pre-LOAD blob-patch ioctl either).
 
 4. ~~**State on a cold boot with no SR-IOV.**~~ **Resolved.**
    With the sysfs proposal dropped, this becomes "what does
