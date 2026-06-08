@@ -15,6 +15,7 @@
  *   mlx5_vfmig <pf-bdf> load_vhca_state  <vf_id> <blob_path>
  *   mlx5_vfmig <pf-bdf> save_vhca_state  <vf_id> <blob_path> [keep_suspended]
  *   mlx5_vfmig <pf-bdf> enable_migratable <vf_id>
+ *   mlx5_vfmig <pf-bdf> set_vf_uuid       <vf_id> <uuid-string>
  *   mlx5_vfmig <pf-bdf> query_qp          <vf_id> <qpn>
  *
  * Verbs accept either '_' or '-' between words.
@@ -717,6 +718,115 @@ static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
 	return 0;
 }
 
+/*
+ * Parse a canonical RFC 4122 UUID string ("8-4-4-4-12" hex) into 16
+ * bytes in network byte order, matching what the kernel stores and
+ * what util-linux's libuuid produces. Accepts uppercase or lowercase
+ * hex, must contain four dashes in the canonical positions, and must
+ * be exactly 36 chars long. Returns 0 on success, -EINVAL on parse
+ * failure.
+ */
+static int parse_uuid(const char *s, unsigned char out[16])
+{
+	static const int dash_at[] = { 8, 13, 18, 23 };
+	unsigned int i, j, b;
+
+	if (!s || strlen(s) != 36)
+		return -EINVAL;
+	for (i = 0; i < sizeof(dash_at) / sizeof(dash_at[0]); i++)
+		if (s[dash_at[i]] != '-')
+			return -EINVAL;
+
+	b = 0;
+	for (i = 0; i < 36; i++) {
+		unsigned int hi, lo;
+
+		if (s[i] == '-')
+			continue;
+		if (i + 1 >= 36 || s[i + 1] == '-')
+			return -EINVAL;
+		for (j = 0; j < 2; j++) {
+			char c = s[i + j];
+			unsigned int v;
+
+			if (c >= '0' && c <= '9')
+				v = c - '0';
+			else if (c >= 'a' && c <= 'f')
+				v = c - 'a' + 10;
+			else if (c >= 'A' && c <= 'F')
+				v = c - 'A' + 10;
+			else
+				return -EINVAL;
+			if (j == 0)
+				hi = v;
+			else
+				lo = v;
+		}
+		if (b >= 16)
+			return -EINVAL;
+		out[b++] = (unsigned char)((hi << 4) | lo);
+		i++;
+	}
+	return b == 16 ? 0 : -EINVAL;
+}
+
+/*
+ * Inverse of parse_uuid; writes 36 bytes + NUL. @buf must be >= 37.
+ */
+static void format_uuid(const unsigned char in[16], char *buf)
+{
+	snprintf(buf, 37,
+		 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		 in[0], in[1], in[2], in[3],
+		 in[4], in[5],
+		 in[6], in[7],
+		 in[8], in[9],
+		 in[10], in[11], in[12], in[13], in[14], in[15]);
+}
+
+static int uuid_is_zero(const unsigned char in[16])
+{
+	static const unsigned char zero[16] = {};
+
+	return memcmp(in, zero, 16) == 0;
+}
+
+static int do_set_vf_uuid(int fd, unsigned int vf_id, const char *uuid_str)
+{
+	struct mlx5_vfmig_set_vf_uuid arg = { .vf_id = vf_id };
+	int err;
+
+	err = parse_uuid(uuid_str, arg.vf_uuid);
+	if (err) {
+		fprintf(stderr,
+			"SET_VF_UUID: bad UUID %s (expected 8-4-4-4-12 hex, e.g. 5edc7d3e-7e44-4d8a-b8a8-50f7c8a0c3b1)\n",
+			uuid_str);
+		return 1;
+	}
+	if (uuid_is_zero(arg.vf_uuid)) {
+		fprintf(stderr,
+			"SET_VF_UUID: refusing to send all-zeros UUID (kernel will reject anyway)\n");
+		return 1;
+	}
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_SET_VF_UUID, &arg) < 0) {
+		if (errno == EBUSY)
+			fprintf(stderr,
+				"vf %u: a different UUID is already stamped on this slot; "
+				"sriov_numvfs=0 + sriov_numvfs=N to clear, or use the same UUID\n",
+				vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"vf %u: SET_VF_UUID rejected (vf_id out of range or zero UUID)\n",
+				vf_id);
+		else
+			perror("SET_VF_UUID");
+		return 1;
+	}
+	printf("vf %u: vf_uuid stamped\n", vf_id);
+	return 0;
+}
+
 static int do_mark(int fd, unsigned int vf_id)
 {
 	struct mlx5_vfmig_mark_restored arg = { .vf_id = vf_id };
@@ -775,9 +885,17 @@ static int do_query(int fd, unsigned int vf_id)
 		perror("QUERY_VF");
 		return 1;
 	}
-	printf("vf %u vhca_id 0x%04x restored=%u tracked=%u (num_vfs=%u)\n",
+	printf("vf %u vhca_id 0x%04x restored=%u tracked=%u (num_vfs=%u)",
 	       vf_id, info.vhca_id, info.restored, info.tracked,
 	       info.num_vfs);
+	if (uuid_is_zero(info.vf_uuid)) {
+		printf(" vf_uuid=<unset>\n");
+	} else {
+		char ub[37];
+
+		format_uuid(info.vf_uuid, ub);
+		printf(" vf_uuid=%s\n", ub);
+	}
 	return 0;
 }
 
@@ -799,9 +917,11 @@ static int do_list(int fd)
 		return 0;
 	}
 
-	printf("%-6s %-9s %-9s %s\n",
-	       "vf_id", "vhca_id", "restored", "tracked");
+	printf("%-6s %-9s %-9s %-9s %s\n",
+	       "vf_id", "vhca_id", "restored", "tracked", "vf_uuid");
 	for (i = 0; i < n; i++) {
+		char ub[37];
+
 		err = query_one(fd, i, &info);
 		if (err) {
 			errno = -err;
@@ -809,8 +929,12 @@ static int do_list(int fd)
 				i, strerror(errno));
 			continue;
 		}
-		printf("%-6u 0x%04x    %-9u %u\n",
-		       i, info.vhca_id, info.restored, info.tracked);
+		if (uuid_is_zero(info.vf_uuid))
+			snprintf(ub, sizeof(ub), "<unset>");
+		else
+			format_uuid(info.vf_uuid, ub);
+		printf("%-6u 0x%04x    %-9u %-9u %s\n",
+		       i, info.vhca_id, info.restored, info.tracked, ub);
 	}
 	return 0;
 }
@@ -1027,6 +1151,9 @@ static void usage(const char *argv0)
 		"  save_vhca_state  <vf_id> <blob_path> [keep_suspended]\n"
 		"  enable_migratable <vf_id>\n"
 		"  set_tracked       <vf_id> <0|1>\n"
+		"  set_vf_uuid       <vf_id> <uuid-string>\n"
+		"                    uuid-string: canonical 8-4-4-4-12 hex\n"
+		"                    (e.g. 5edc7d3e-7e44-4d8a-b8a8-50f7c8a0c3b1)\n"
 		"  probe_uid         <vf_id>     (experimental)\n"
 		"  query_qp          <vf_id> <qpn>  (experimental)\n"
 		"  probe_pd          <vf_id> <pdn> [<uid_hint=0>]  (experimental)\n"
@@ -1114,6 +1241,10 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_set_tracked(fd, strtoul(argv[3], NULL, 0),
 				     strtoul(argv[4], NULL, 0));
+	} else if (verb_eq(verb, "set_vf_uuid")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_set_vf_uuid(fd, strtoul(argv[3], NULL, 0), argv[4]);
 	} else if (verb_eq(verb, "probe_uid")) {
 		if (argc != 4)
 			goto badargs;
