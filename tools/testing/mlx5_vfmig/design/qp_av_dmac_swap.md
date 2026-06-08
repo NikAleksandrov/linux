@@ -1,73 +1,230 @@
-# DESIGN: §S6b -- stale `av.dmac` in migrated QPC after CRIU process-swap with IP reassignment
+# DESIGN: §S6b -- stale `av.dmac` in migrated QPC after CRIU process-swap (RESOLVED)
 
-> ## STATUS (2026-06-06): KS6b kernel mitigation **REVERTED** as architecturally infeasible
+> ## STATUS (2026-06-08): RESOLVED via orchestrator-side VF identity migration
 >
-> The kernel-side fix described as "landed" in earlier revisions of
-> this document has been **reverted**. Both surfaces --
-> `mlx5_ib_restore_qp_refresh_av_dmac()` (always-on, KS6b.1, commit
-> `5166e228c223`) and `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` (userspace
-> ioctl backstop, KS6b.6, commit `b70b6624084a`) -- drove the same
-> `MODIFY_QP(RTS2RTS_QP, opt_param_mask=PRIMARY_ADDR_PATH)` sequence
-> from inside the kernel after `LOAD_VHCA_STATE` had restored the
-> QPC. CX-7 28.x firmware **rejects** that opcode + optpar
-> combination unconditionally (-EINVAL syndrome `0x00498c8b`),
-> regardless of how the modify blob's primary_address_path is
-> shaped. The follow-up Patch B (commits `66edef3f790f` /
-> `fe188a601af9`) that mirrored a fully-formed primary path from a
-> pre-op QUERY_QP into the modify blob did **not** change the
-> verdict, confirming that the rejection is about the
-> opcode + optpar pairing itself, not about path internal
-> consistency.
+> The §S6b stale-dmac problem -- post-restore RC traffic hangs
+> and the first `post_send` surfaces `IBV_WC_RETRY_EXC_ERR`
+> (status 12) -- was a **missing orchestrator-side
+> reconfiguration step on the destination, not a kernel bug**.
+> A complete CRIU process-swap requires the same per-VF
+> identity migration that SR-IOV VM live-migration performs
+> for free: each destination VF needs to take on the
+> *source-time peer-VF MAC and IP*, and pinned ARP needs to
+> map the source-time peer IP to the source-time peer-VF MAC
+> (which the *other* destination host has been similarly
+> reconfigured to expose). With those steps in place, the
+> source-baked `path.rmac_*` in each restored QPC is correct
+> at t=0 and `LOAD_VHCA_STATE → RESTORE_QP` works on the
+> unmodified blob. **No kernel patches required.**
 >
-> The structural reason is captured below in **§12. Post-mortem**:
-> mlx5_ib's own `opt_mask[cur][new][qp_type]` allowlist -- the
-> table `__mlx5_ib_modify_qp` AND-masks the user-requested optpar
-> with -- never contains `MLX5_QP_OPTPAR_PRIMARY_ADDR_PATH` for
-> *any* state-pair / qp-type triple. The verbs layer's
-> `ib_modify_qp_is_ok` independently rejects `IB_QP_AV` at RTS for
-> RC. Both gates agree with the firmware: post-RTR primary-AV
-> refresh is not a supported operation on this driver / FW
-> combination.
+> Empirically confirmed 2026-06-08 on
+> `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`: adding
+> `ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>`
+> to the destination-side prerestore steps, and updating the
+> existing `pin_static_neighbor_*` step to use source-time
+> peer-VF MAC values (instead of the destination host's local
+> NIC MAC), makes the end-to-end test pass on the unmodified
+> source-loaded QPC. `check_qp_av_dmac.sh` returns
+> `VERDICT=DMAC_IS_PEER` on both hosts; `ping_pong_after_restore`
+> returns OK MATCH.
 >
-> §S6b's stale-dmac problem is **not solved**. Ownership has moved
-> to [`vf_prerestore_split.md`](vf_prerestore_split.md) **KS7.1**
-> (pre-RESTORE_QP DMAC fixup in the saved QPC blob) -- the only
-> mechanism that doesn't require an unsupported state transition
-> to land a corrected DMAC.
+> ### What stays in tree
+> * `tools/mlx5_vfmig query_qp` ioctl + CLI verb (commits
+>   `c659ab66483d`, `e4b0b417a97d`, `a7a17b9bb670`) -- the
+>   diagnostic surface that backs `check_qp_av_dmac.sh`. Useful
+>   as forward post-restore verification ("did the orchestrator
+>   actually mirror the VF identity correctly?").
+> * `check_qp_av_dmac.sh` -- harness wrapper that drives the
+>   diagnostic ioctl and emits `DMAC_IS_LOCAL` /
+>   `DMAC_IS_PEER` / `DMAC_AMBIGUOUS`. Pass criterion for the
+>   v0 swap workload is `DMAC_IS_PEER` on both hosts.
 >
-> The remainder of this document is preserved as a record of the
-> investigation, the diagnostic tooling that *did* land
-> (`check_qp_av_dmac.sh`, `tools/mlx5_vfmig query_qp`, kept in
-> tree), and the as-tried implementation shape -- so future
-> readers can see the ground that was already covered before
-> arriving at the §12 conclusion. **§10 (Implementation summary)
-> and §11 (Dev-branch backup) describe code that has been
-> reverted; treat them as historical.**
+> ### What was reverted
+> * `mlx5_ib_restore_qp_refresh_av_dmac()` always-on helper
+>   (`5166e228c223`, Patch B `66edef3f790f`) -- reverted in
+>   `0a05d29edb2f`.
+> * `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl + `vfmig_*` helpers
+>   (`b70b6624084a`, Patch B `fe188a601af9`) -- reverted in
+>   `6055711aae44`.
+> * `mlx5_vfmig refresh_av_dmac` CLI verb +
+>   `refresh_av_dmac.sh` harness wrapper (`1bbe576bc7c5`) --
+>   reverted in `5786cb303142`.
+>
+> All three drove the same `MODIFY_QP(RTS2RTS_QP,
+> opt_param_mask=PRIMARY_ADDR_PATH)` sequence, which CX-7 28.x
+> firmware rejects with syndrome `0x00498c8b`. The investigation
+> chain that established this -- including the audit of mlx5_ib's
+> own `opt_mask` allowlist, which excludes `PRIMARY_ADDR_PATH`
+> from every state-pair cell -- is preserved in
+> [Appendix A](#appendix-a-investigation-history-preserved).
+> With the orchestrator-side fix in place, none of that matters
+> at runtime: the QPC is correct from t=0 and no post-LOAD
+> modification is ever attempted.
 
-> Companion to [`uobject_restore.md`](uobject_restore.md). Documents the
-> empirical evidence, architectural reasoning, and (originally
-> proposed) kernel-side mitigation for an RC datapath failure
-> observed end-to-end with `mlx5_sriov_vfmig` + CRIU process-swap,
-> where post-restore RC traffic hangs and eventually surfaces
-> `IBV_WC_RETRY_EXC_ERR` (status 12) on the first post-restore
-> `post_send`.
->
-> Filed by the CRIU agent after end-to-end testing with the
-> `rdma_test_agent_vfmig_criu_swap_after_qp.yaml` harness.
->
-> **Diagnosis is LOCKED**, but the *mitigation* described in §5 /
-> §10 / §11 is **REVERTED** -- see the STATUS banner above and
-> §12 for the post-mortem. The §6.0 `check_qp_av_dmac.sh`
-> diagnostic returned `VERDICT=DMAC_IS_LOCAL` on both physical
-> hosts post-restore, with the QPC's `av_dmac` byte-equal to the
-> local NIC's MAC and `qpc_next_send_psn` exactly one ahead of
-> `qpc_last_acked_psn` (a WR is in flight, stuck in retry). That
-> *symptom* analysis stands. The proposed kernel fix --
-> re-resolving av.dmac post-RESTORE_QP via
-> `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)` -- is what the
-> firmware refused.
+## 0. What was actually wrong
 
-## TL;DR
+The harness was reassigning per-VF *IPs* between hosts on each
+swap but leaving per-VF *MACs* untouched. Walking the restored
+QPC's `primary_address_path` field by field on the v0 swap
+workload (single-port RoCE v2 IPv4 RC):
+
+| Field | Stored in QPC verbatim? | What it represents | Stale post-swap on v0 harness? | Mitigated by |
+|---|---|---|---|---|
+| `rmac_47_32` / `rmac_31_0` | **Yes** | Peer's MAC at MODIFY_QP_TO_RTR time | **Yes** -- peer moved to other host; its source-time MAC is now the *destination host's local NIC MAC* | VF-MAC swap (the missing step) |
+| `rgid_rip` | Yes | Peer's GID (IPv4-mapped IPv6 for RoCEv2 IPv4) | No -- harness IP swap puts peer's source-time IP on the destination's VF | Existing IP-swap step |
+| `src_addr_index` | Yes (an *index*) | Index into local GID table | No -- the index is stable; the GID-table contents at that index match because the destination's VF has the source-time IP | Existing IP-swap step (kernel auto-populates GIDs from netdev IPs) |
+| `vhca_port_num` | Yes | Local physical port | No -- single-port NIC; same on both hosts | n/a |
+| `tclass`, `flow_label`, `udp_sport`, `dscp`, `eth_prio`, `sl`, `hop_limit`, `mtu` | Yes | RoCE/IP knobs | No -- host-agnostic | n/a |
+| **`smac` (local source MAC)** | **No** -- not in QPC | Local VF's MAC | n/a -- FW resolves on every send via `src_addr_index → GID → netdev → netdev MAC` | n/a (the local NIC's *current* MAC always wins, automatically) |
+| `dest_qpn`, `rq_psn`, `sq_psn`, timeouts | Yes | Connection state | No -- both peers' QPCs are symmetrically restored, so all numbering matches | n/a |
+
+So **`path.rmac_*` was the only field whose value disagreed
+between the source's saved QPC and the destination's post-swap
+network reality**. Every other identity-bearing field either
+moves with the IP-swap step the harness already did, or is a
+purely host-agnostic value, or is resolved at runtime from
+state we control.
+
+Why VM-LM doesn't hit this: in SR-IOV VM live-migration, the
+hypervisor sets the destination VF's admin MAC to the VM's
+vNIC MAC as part of the migration setup -- vNIC MAC is portable
+identity that travels with the VM. The peer is unchanged (the
+peer didn't move), so `path.rmac` is correct on the destination
+as soon as `LOAD_VHCA_STATE` installs the QPC. Zero patching,
+zero kernel commands, zero MODIFY_QP attempts.
+
+For symmetric CRIU process-swap (where *both* peers move to
+opposite hosts simultaneously), both VFs need to take on their
+respective source-time peer-VF MACs. That's what was missing.
+
+## 1. The resolution: orchestrator-side VF identity migration
+
+On each destination host, between the SR-IOV VF cycle and
+`LOAD_VHCA_STATE`, the orchestrator mirrors the source's
+per-VF identity:
+
+```bash
+# (1) Local VF takes on the source-time peer-VF MAC, since the
+# peer is now running on this host post-swap.  This was the
+# missing step.
+ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>
+
+# (2) IPs are reassigned to mirror source-time peer-VF IPs.
+# (Existing harness step; unchanged.)
+ip addr add <source-time-peer-vf-ip>/<prefix> dev <vf_netdev>
+
+# (3) Static ARP for the actual peer (now on the OTHER host,
+# which has been similarly reconfigured) maps to that host's
+# source-time-peer-VF MAC -- not to the local NIC MAC, which
+# was the v0 harness's bug.
+ip neigh replace <source-time-local-ip> \
+                 lladdr <source-time-local-vf-mac> \
+                 dev <vf_netdev> nud permanent
+```
+
+The four MAC values are deterministic from the harness's own
+MAC scheme; the symmetric flip is exactly the mirror image of
+the source-time configuration. (See
+[Appendix A §3.1](#31-pre-checkpoint-macip-topology-from-the-test-log)
+for the source-time topology.)
+
+This works because:
+
+* `path.rmac_*` (peer MAC, baked into the QPC at source-time
+  RTR) matches the actual peer's VF MAC -- which the *other*
+  destination host has been told to take on via the same
+  `ip link set vf mac` step. Both hosts run step (1) with
+  source-time *peer*-VF MACs as inputs, which is the
+  symmetric flip that the source-time topology already had.
+* `path.src_addr_index` resolves to a GID-table slot whose
+  contents (source-time local IP) match what the source
+  put there. This was already working pre-fix because the
+  harness's `ip addr add` already drove the auto-population.
+  (See `Appendix A §10.1 / §10.2` for why we sweat over
+  this; for the v0 single-IP single-port case there's no
+  slot-allocation drift.)
+* `smac` is *not* in the QPC; the FW resolves it on every
+  send via `src_addr_index → GID → netdev → netdev MAC`. So
+  the local NIC's *current* (post-`ip link set vf mac`) MAC
+  always wins, automatically.
+
+Step (1) must run *before* step (2). GID-table entries bind
+`(IP, MAC)` at IP-add time, and changing the netdev's MAC
+afterwards leaves entries with stale `(IP, old-MAC)` bindings.
+"MAC first, then IP" is the safe ordering.
+
+## 2. Validation
+
+Post-restore confirmation lives in
+`tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/check_qp_av_dmac.sh`,
+which uses the diagnostic `MLX5_VFMIG_IOC_QUERY_QP` ioctl to
+dump `path.rmac_*` from the FW QPC and compare it to the
+destination's `ip neigh` view of the actual peer MAC:
+
+* **Pre-fix** harness: `VERDICT=DMAC_IS_LOCAL` on both hosts
+  -- the QPC's stored peer MAC matched the *destination
+  host's local NIC MAC*, confirming the swap left the
+  source-baked dmac stale.
+* **Post-fix** harness (with `ip link set vf mac` added):
+  `VERDICT=DMAC_IS_PEER` on both hosts; first
+  `ping_pong_after_restore` returns OK MATCH on both
+  directions; `local_ack_timeout_err` does not tick.
+
+The diagnostic surface stays in tree as the canonical
+post-restore confirmation that the orchestrator did its job:
+
+* `tools/mlx5_vfmig query_qp` ioctl + CLI verb (`c659ab66483d`,
+  `e4b0b417a97d`, `a7a17b9bb670`).
+* `check_qp_av_dmac.sh` wrapper (in `a7a17b9bb670`).
+
+Future workloads adding new restore-time identity drift
+(VLAN, MTU, etc.) should follow the same pattern: extend the
+orchestrator's per-VF mirror step, *not* the kernel's
+post-LOAD reconciliation surface (there isn't one;
+[Appendix A §12](#12-post-mortem-post-rtr-primary-av-refresh-is-not-supported-on-mlx5--cx-7-28x)
+explains why).
+
+## Appendix A: investigation history (preserved)
+
+The remainder of this document is the original investigation
+chain that led to the resolution above. It is **preserved
+verbatim** for the record -- so future readers can see the
+full diagnosis lock, the alternatives considered, the reverted
+as-tried kernel mitigations, and the FW post-mortem that
+established why post-LOAD primary-AV refresh isn't a viable
+mechanism on this driver/FW combination (syndrome
+`0x00498c8b`; mlx5_ib's `opt_mask` excludes `PRIMARY_ADDR_PATH`
+from every state-pair cell).
+
+None of the kernel asks named in this appendix are still open;
+all of them have been reverted or superseded by the
+orchestrator-side fix above. Section numbers and intra-doc
+references are kept as-is for git-blame and inbound-link
+friendliness.
+
+The appendix entry points worth pulling forward:
+
+* **§3.1** -- the pre-checkpoint MAC/IP topology that the
+  resolution at §1 mirrors. Useful when working out which
+  source-time MAC each destination host should take on.
+* **§3.4** -- the architectural reason this is unique to
+  CRIU-on-host swap: VFs *don't* move with the process the
+  way vNICs move with a VM, so per-VF identity has to be
+  reassigned post-hoc by the orchestrator.
+* **§6.0** -- the cheap diagnostic (`check_qp_av_dmac.sh`)
+  that landed and stays in tree.
+* **§12** -- the FW-rejection post-mortem; documents the
+  `opt_mask` audit and the verbs `qp_state_table` agreement.
+  Worth preserving so future work doesn't try to revive
+  the post-LOAD `MODIFY_QP(RTS2RTS_QP, PRIMARY_ADDR_PATH)`
+  approach without first reading why it's not viable.
+
+The TL;DR section that follows was the original framing
+("the architectural fix this doc proposes" -- a kernel-side
+helper). That framing was wrong; read it as a record of how
+the team got from initial diagnosis to the shipped resolution.
+
+## A.TL;DR (original; superseded by §1)
 
 `LOAD_VHCA_STATE` faithfully preserves the FW QPC, including the
 **resolved `av.dmac`** that was written into the QPC at source-side
@@ -84,7 +241,8 @@ what is now the local NIC's MAC. Outgoing RoCEv2 frames are
 self-addressed at L2 (`src_mac == dst_mac`) and are silently dropped
 by the fabric.
 
-The architectural fix this doc proposes:
+The architectural fix originally proposed (superseded by the
+orchestrator-side fix at §1):
 
 ```c
 /* mlx5_ib_restore_qp -- after LOAD_VHCA_STATE has installed the FW
@@ -103,12 +261,8 @@ The architectural fix this doc proposes:
  */
 ```
 
-This puts the dmac-refresh policy in the same place where every other
-restore-time FW reconciliation lives, makes process-swap migration
-**transparent to userspace** (no
-`ibv_modify_qp(qp, &attr, IBV_QP_AV)` cooperation required from
-applications), and matches the semantic the rest of the existing
-RoCEv2 modify path already implements at `MODIFY_QP_TO_RTR` time.
+This was rejected in §12 (post-LOAD primary-AV refresh isn't a
+supported operation on mlx5 + CX-7 28.x).
 
 The leak budget is **zero** -- this is a state-refresh, not a
 resource allocation.
@@ -1355,8 +1509,33 @@ will key off of.
   not a supported operation on this driver / FW combination.
   KS6b.1 + KS6b.6 + Patch B + design-doc updates around them
   **REVERTED** as architecturally infeasible; ownership of §S6b
-  moved to `vf_prerestore_split.md` KS7.1 (pre-RESTORE_QP DMAC
-  fixup). Top-of-file STATUS banner, §10.2 RETRACTED note, §11
-  REVERTED note, and new §12 post-mortem all added in this
-  pass. Diagnostic tooling (`check_qp_av_dmac.sh`,
-  `tools/mlx5_vfmig query_qp`) stays in tree.
+  moved (transiently) to `vf_prerestore_split.md` KS7.4
+  (pre-RESTORE_QP blob fixup). Top-of-file STATUS banner, §10.2
+  RETRACTED note, §11 REVERTED note, and a then-new §12
+  post-mortem all added in this pass. Diagnostic tooling
+  (`check_qp_av_dmac.sh`, `tools/mlx5_vfmig query_qp`) stays in
+  tree.
+- 2026-06-08: **RESOLVED.** Empirical orchestrator-side test on
+  `rdma_test_agent_vfmig_criu_swap_after_qp.yaml` confirmed
+  that the §S6b stale-dmac problem is fully addressable by
+  adding `ip link set <PF> vf <VF_ID> mac
+  <source-time-peer-vf-mac>` to the destination-side
+  prerestore steps and pointing the existing
+  `pin_static_neighbor_*` step at source-time peer-VF MACs
+  instead of the destination host's local NIC MACs.
+  `check_qp_av_dmac.sh` returns `VERDICT=DMAC_IS_PEER` on
+  both hosts and `ping_pong_after_restore` returns OK MATCH
+  on the unmodified, source-loaded QPC. **No kernel work
+  needed**: the missing piece was the same per-VF identity
+  migration that SR-IOV VM live-migration performs for free
+  (vNIC MAC moves with the VM); CRIU process-swap requires
+  the same step explicitly because VFs don't move with the
+  process. Doc reframed: top of file rewritten as
+  §0 (what was actually wrong) / §1 (resolution) / §2
+  (validation), with the original investigation chain
+  (§§1-12 plus the `Outstanding evidence` and original
+  `TL;DR` sections) preserved verbatim under
+  **Appendix A: investigation history**. KS7.4 in
+  `vf_prerestore_split.md` collapses from "pre-RESTORE_QP
+  blob fixup" to "orchestrator-side VF identity migration;
+  no kernel surface required".
