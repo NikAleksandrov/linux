@@ -48,11 +48,18 @@
 >   2026-06-08; see `qp_av_dmac_swap.md` STATUS banner +
 >   §1 (Resolution) + §2 (Validation).
 >
-> **Kernel agent: KS7.1 is landed; KS7.2 is reverted; KS7.4
-> needs no kernel work; KS7.3 is the only outstanding
-> kernel ask.** Start at [§2](#2-kernel-agent-asks-at-a-glance);
-> the KS7.3 specification lives in §3.5. The CRIU-side
-> sections (§6-§10) are FYI.
+> **Kernel agent: ALL v0 kernel work is now landed.** KS7.1
+> already in place (existing `MLX5_VFMIG_IOC_QUERY_VF`); KS7.3
+> landed 2026-06-08 (new ioctl 0x12 `MLX5_VFMIG_IOC_SET_VF_UUID`
+> + 16-byte `vf_uuid` field on the QUERY_VF return struct);
+> KS7.2 reverted; KS7.4 resolved orchestrator-side with no
+> kernel surface required. Next handoff is the CRIU agent
+> picking up KS7.3's UAPI in the dump/restore plugin (see
+> §3.5.3 for the contract). Start at
+> [§2](#2-kernel-agent-asks-at-a-glance) for the at-a-glance
+> table; the KS7.3 specification + lifecycle lives in §3.5.
+> The CRIU-side sections (§6-§10) are the next agent's
+> focus.
 >
 > Filed by the CRIU agent. Companion to
 > [`uobject_restore.md`](uobject_restore.md) and
@@ -315,17 +322,18 @@ Detailed CRIU-side shape: §6.3, §6.4.
 
 ## 2. Kernel-agent asks at a glance
 
-One kernel-side surface is already in place (KS7.1); KS7.2 was
-landed and then reverted (see row below + §4 banner); KS7.4
+All kernel-side surfaces are now in place (KS7.1, KS7.3); KS7.2
+was landed and then reverted (see row below + §4 banner); KS7.4
 needs no kernel surface at all (resolved orchestrator-side
-2026-06-08). KS7.3 (orchestrator-owned per-VF UUID) is the
-only outstanding kernel ask.
+2026-06-08). **No outstanding kernel asks remain for v0.** Next
+work item is the CRIU agent picking KS7.3's `vf_uuid` UAPI up
+in the dump/restore plugin (see §3.5.3).
 
 | # | ask | where | status | size |
 |---|---|---|---|---|
 | KS7.1 | **VF loaded/unloaded indicator surfaced via `MLX5_VFMIG_IOC_QUERY_VF`** (ioctl 0x03 on the PF cdev). The existing `restored` field is set by `MLX5_VFMIG_IOC_MARK_RESTORED` during the destination LOAD lifecycle. The CRIU plugin's `init()` and the prerestore binary read `restored` from QUERY_VF to decide whether to drive `LOAD_VHCA_STATE` themselves. PF cdev is the right surface: it exists whenever the PF is up, doesn't depend on VF probe state, and iterates VFs via `0..num_vfs-1`. The same QUERY_VF call also returns the per-VF UUID added by KS7.3, so identity matching and load-state checking happen in a single roundtrip. | §3.1-§3.4 | LANDED (existing field; no new kernel work) | -- |
 | KS7.2 | ~~**`MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl** (§S6b "Alternative C" backstop). Landed in `b70b6624084a` with CLI wrapper in `1bbe576bc7c5`.~~ **REVERTED 2026-06-06** in `0a05d29edb2f` / `6055711aae44` / `5786cb303142`: post-RTR primary-AV refresh is not supported on mlx5 + CX-7 28.x. The §S6b problem this ioctl was meant to address turned out to be addressable orchestrator-side (KS7.4); see `qp_av_dmac_swap.md` STATUS banner for the resolution and Appendix A §12 of that doc for the FW post-mortem. | §4 (historical) | REVERTED | -- |
-| KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl (called by the **orchestrator** when provisioning the VF; CRIU never calls it), and a 16-byte `vf_uuid` field added to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps; existing ABI pattern). CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. | §3.5 | NEW; small (one ioctl + extend QUERY_VF) | tiny |
+| KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl 0x12 on the PF cdev (called by the **orchestrator** when provisioning the VF; CRIU never calls it), plus a 16-byte `vf_uuid` field appended to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps via the `_IOWR` `sizeof` encoding; same ABI pattern as the earlier QUERY_QP grow). Storage is `u8 vf_uuid[16]` on the per-VF context (`mlx5_vf_context.vf_uuid`); the value is cleared on SR-IOV teardown so a recycled slot starts fresh. CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. **LANDED 2026-06-08** with kernel-matrix C probe (`uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig`) and lifecycle / multi-VF shell harness (`uobject_restore/vf_uuid/test_vf_uuid_lifecycle.sh`). | §3.5 | LANDED | tiny |
 | KS7.4 | **Per-VF identity migration on the destination, pre-LOAD_VHCA_STATE** (§S6b resolution). Orchestrator (or whatever provisioning tool drives the VF on the destination) sets `ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>`, `ip addr add <source-time-peer-vf-ip>`, and `ip neigh replace <source-time-local-ip> lladdr <source-time-local-vf-mac>` to mirror the source's per-VF identity. With those steps in place, the source-baked `path.rmac_*` in the saved QPC matches the actual peer's VF MAC at t=0 and `LOAD_VHCA_STATE` installs a QPC that's already correct. Empirically confirmed 2026-06-08 on `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`. **No kernel surface required** -- existing `ip link set vf mac` / `ip addr` / `ip neigh` UAPIs are sufficient. Spec lives in §4.6. | §4.6 | RESOLVED orchestrator-side; no kernel work | -- |
 
 The earlier draft of this doc proposed a new sysfs node at
@@ -351,8 +359,10 @@ match at restore. The orchestrator is the only component
 that has all the workload ↔ VF binding information needed
 to assign UUIDs consistently across save/restore.
 
-KS7.3 is the only outstanding kernel work for v0; the
-remainder is CRIU-side (§6) plus harness changes (§10).
+All v0 kernel work is now landed (KS7.1 already in place,
+KS7.3 added 2026-06-08, KS7.2 reverted, KS7.4 no kernel
+surface required). The remainder is CRIU-side (§6) plus
+harness changes (§10).
 
 ## 3. KS7.1 -- VF loaded/unloaded indicator (already in place)
 
@@ -537,7 +547,26 @@ So nothing about the v0 contract closes the door on
 later-added per-uobject restore-completeness tracking. The
 v0 contract just doesn't need it.
 
-### 3.5 KS7.3 -- orchestrator-owned per-VF UUID (NEW)
+### 3.5 KS7.3 -- orchestrator-owned per-VF UUID (LANDED)
+
+> **Status (2026-06-08): LANDED.** Kernel-side surface frozen
+> as described in §3.5.4. Storage is `u8 vf_uuid[16]` on
+> `struct mlx5_vf_context`; write site is the new
+> `MLX5_VFMIG_IOC_SET_VF_UUID` ioctl 0x12 on the PF cdev;
+> read site is the existing `MLX5_VFMIG_IOC_QUERY_VF`
+> (now extended with a 16-byte `vf_uuid` + 8-byte
+> `reserved_out` tail; size grows so the encoded ioctl
+> number bumps and old userspace gets `-ENOTTY` instead
+> of a misaligned read, same ABI pattern as the earlier
+> QUERY_QP grow). Cleared on SR-IOV teardown
+> (sriov_numvfs=0) so a recycled slot starts fresh. The
+> kernel-matrix C probe lives at
+> `tools/testing/mlx5_vfmig/uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig`
+> and the lifecycle / multi-VF shell harness at
+> `tools/testing/mlx5_vfmig/uobject_restore/vf_uuid/test_vf_uuid_lifecycle.sh`.
+> Both build via the standard
+> `make -C tools/testing/mlx5_vfmig`. CRIU plugin work
+> picks up at §3.5.3 (the contract).
 
 #### 3.5.1 Why `vhca_id` is the wrong identifier
 
@@ -757,13 +786,37 @@ fast path.
 The "set once until teardown" semantics defend against the
 orchestrator accidentally re-tagging a VF that's still bound
 to a workload. A legitimate workflow that wants to repurpose
-a `vf_id` slot for a new workload must go through
-`sriov_numvfs=0 -> sriov_numvfs=N` first (which is the same
-teardown the kernel already requires before re-LOADing
-state into the slot anyway). Cross-host migration is
-unaffected: source host's slot keeps its UUID until source
-teardown; destination host's slot gets the UUID stamped
-fresh by the orchestrator before workload bind on the dest.
+a `vf_id` slot for a *different* workload identity must go
+through `sriov_numvfs=0 -> sriov_numvfs=N` first.
+
+The clear-on-`sriov_numvfs=0` step in the lifecycle table is
+implemented by `mlx5_vfmig_pf_drop_vf_uuids()` (called from
+`mlx5_device_disable_sriov`), because `sriov->vfs_ctx[]`
+itself survives the cycle -- the array is allocated at PF
+bind and freed at PF unbind, not on each `sriov_numvfs`
+write. Without the explicit memset hook, a stale UUID would
+survive into the next generation and the orchestrator's
+fresh `SET_VF_UUID` would `-EBUSY` with no in-kernel clear
+path short of PF unload/reload. This is **not** an
+empirical assertion that mlx5 firmware allows multiple
+`LOAD_VHCA_STATE` invocations on the same VHCA without an
+`sriov_numvfs` cycle in between -- that path is unproven
+and not exercised by anything in tree (the existing
+`vfmig_install_pending_load_locked` itself rejects a
+second stage with `-EBUSY` while one is already pending,
+and the vfio mlx5 LM variant driver assumes one LOAD per
+VM lifecycle). The clear-on-cycle hook is purely about
+unblocking identity-tag refresh on the cycle that the
+orchestrator already has to perform for *any* slot
+repurposing.
+
+Cross-host migration is unaffected: source host's slot
+keeps its UUID until source teardown; destination host's
+slot gets the UUID stamped fresh by the orchestrator
+before workload bind on the dest. The same orchestrator
+that performs the migration also issues the matching
+`SET_VF_UUID` on the dest, so identity-tag continuity is
+trivially preserved.
 
 #### 3.5.6 Authorization
 
