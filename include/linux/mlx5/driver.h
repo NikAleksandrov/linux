@@ -50,6 +50,7 @@
 #include <linux/refcount.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/mutex.h>
+#include <linux/uuid.h>
 
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/doorbell.h>
@@ -579,13 +580,14 @@ struct mlx5_vf_context {
 	 * state image to a destination VF without depending on
 	 * @vhca_id (per-PF allocator, unstable) or @vf_id (per-PF
 	 * slot, may differ source-vs-destination). Read via QUERY_VF
-	 * by CRIU dump/restore plus the prerestore binary. All-zeros
-	 * means "unset" (initial state, and post-teardown). Cleared
-	 * implicitly when the per-VF context is freed at SR-IOV
-	 * teardown (sriov_numvfs=0). See KS7.3 in
+	 * by CRIU dump/restore plus the prerestore binary. The all-
+	 * zero value (uuid_null) means "unset" (initial state, and
+	 * post-teardown); use uuid_is_null() to test. Cleared
+	 * explicitly via mlx5_vfmig_pf_drop_vf_uuids() at SR-IOV
+	 * teardown (sriov_numvfs=0) and PF unload. See KS7.3 in
 	 * tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5.
 	 */
-	u8	vf_uuid[16];
+	uuid_t	vf_uuid;
 	enum port_state_policy	policy;
 	struct blocking_notifier_head notifier;
 };

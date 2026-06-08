@@ -333,7 +333,7 @@ in the dump/restore plugin (see §3.5.3).
 |---|---|---|---|---|
 | KS7.1 | **VF loaded/unloaded indicator surfaced via `MLX5_VFMIG_IOC_QUERY_VF`** (ioctl 0x03 on the PF cdev). The existing `restored` field is set by `MLX5_VFMIG_IOC_MARK_RESTORED` during the destination LOAD lifecycle. The CRIU plugin's `init()` and the prerestore binary read `restored` from QUERY_VF to decide whether to drive `LOAD_VHCA_STATE` themselves. PF cdev is the right surface: it exists whenever the PF is up, doesn't depend on VF probe state, and iterates VFs via `0..num_vfs-1`. The same QUERY_VF call also returns the per-VF UUID added by KS7.3, so identity matching and load-state checking happen in a single roundtrip. | §3.1-§3.4 | LANDED (existing field; no new kernel work) | -- |
 | KS7.2 | ~~**`MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl** (§S6b "Alternative C" backstop). Landed in `b70b6624084a` with CLI wrapper in `1bbe576bc7c5`.~~ **REVERTED 2026-06-06** in `0a05d29edb2f` / `6055711aae44` / `5786cb303142`: post-RTR primary-AV refresh is not supported on mlx5 + CX-7 28.x. The §S6b problem this ioctl was meant to address turned out to be addressable orchestrator-side (KS7.4); see `qp_av_dmac_swap.md` STATUS banner for the resolution and Appendix A §12 of that doc for the FW post-mortem. | §4 (historical) | REVERTED | -- |
-| KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl 0x12 on the PF cdev (called by the **orchestrator** when provisioning the VF; CRIU never calls it), plus a 16-byte `vf_uuid` field appended to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps via the `_IOWR` `sizeof` encoding; same ABI pattern as the earlier QUERY_QP grow). Storage is `u8 vf_uuid[16]` on the per-VF context (`mlx5_vf_context.vf_uuid`); the value is cleared on SR-IOV teardown so a recycled slot starts fresh. CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. **LANDED 2026-06-08** with kernel-matrix C probe (`uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig`) and lifecycle / multi-VF shell harness (`uobject_restore/vf_uuid/test_vf_uuid_lifecycle.sh`). | §3.5 | LANDED | tiny |
+| KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl 0x12 on the PF cdev (called by the **orchestrator** when provisioning the VF; CRIU never calls it), plus a 16-byte `vf_uuid` field appended to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps via the `_IOWR` `sizeof` encoding; same ABI pattern as the earlier QUERY_QP grow). Storage is `uuid_t vf_uuid` on the per-VF context (`mlx5_vf_context.vf_uuid`), using the kernel's standard `<linux/uuid.h>` helpers (`uuid_is_null` / `uuid_equal` / `uuid_copy` / `import_uuid` / `export_uuid`); the value is cleared on SR-IOV teardown so a recycled slot starts fresh. CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. **LANDED 2026-06-08** with kernel-matrix C probe (`uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig`) and lifecycle / multi-VF shell harness (`uobject_restore/vf_uuid/test_vf_uuid_lifecycle.sh`). | §3.5 | LANDED | tiny |
 | KS7.4 | **Per-VF identity migration on the destination, pre-LOAD_VHCA_STATE** (§S6b resolution). Orchestrator (or whatever provisioning tool drives the VF on the destination) sets `ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>`, `ip addr add <source-time-peer-vf-ip>`, and `ip neigh replace <source-time-local-ip> lladdr <source-time-local-vf-mac>` to mirror the source's per-VF identity. With those steps in place, the source-baked `path.rmac_*` in the saved QPC matches the actual peer's VF MAC at t=0 and `LOAD_VHCA_STATE` installs a QPC that's already correct. Empirically confirmed 2026-06-08 on `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`. **No kernel surface required** -- existing `ip link set vf mac` / `ip addr` / `ip neigh` UAPIs are sufficient. Spec lives in §4.6. | §4.6 | RESOLVED orchestrator-side; no kernel work | -- |
 
 The earlier draft of this doc proposed a new sysfs node at
@@ -550,8 +550,10 @@ v0 contract just doesn't need it.
 ### 3.5 KS7.3 -- orchestrator-owned per-VF UUID (LANDED)
 
 > **Status (2026-06-08): LANDED.** Kernel-side surface frozen
-> as described in §3.5.4. Storage is `u8 vf_uuid[16]` on
-> `struct mlx5_vf_context`; write site is the new
+> as described in §3.5.4. Storage is `uuid_t vf_uuid` on
+> `struct mlx5_vf_context` (using the kernel's
+> `<linux/uuid.h>` helpers: `uuid_is_null`, `uuid_equal`,
+> `uuid_copy`, `import_uuid`, `export_uuid`); write site is the new
 > `MLX5_VFMIG_IOC_SET_VF_UUID` ioctl 0x12 on the PF cdev;
 > read site is the existing `MLX5_VFMIG_IOC_QUERY_VF`
 > (now extended with a 16-byte `vf_uuid` + 8-byte
@@ -766,9 +768,14 @@ struct mlx5_vfmig_set_vf_uuid {
     _IOW(MLX5_VFMIG_IOC_MAGIC, 0x13, struct mlx5_vfmig_set_vf_uuid)
 ```
 
-Storage is a single `u8 vf_uuid[16]` field on the existing
+Storage is a single `uuid_t vf_uuid` field on the existing
 per-VF context (`mlx5_core_sriov.vfs_ctx[vf_id]`, alongside
-`restored` / `restored_vhca_id`). One write site
+`restored` / `restored_vhca_id`). The driver reaches the field
+through the standard `<linux/uuid.h>` helpers
+(`uuid_is_null` / `uuid_equal` / `uuid_copy` / `import_uuid`
+/ `export_uuid`); the UAPI struct stays as `__u8 vf_uuid[16]`
+because `uuid_t` is a kernel-internal typedef that is not
+exposed via `<uapi/linux/uuid.h>`. One write site
 (`vfmig_ioc_set_vf_uuid`), one read site
 (`vfmig_ioc_query_vf`'s extended return), zero impact on any
 fast path.

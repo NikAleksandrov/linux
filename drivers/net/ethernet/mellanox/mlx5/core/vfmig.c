@@ -56,6 +56,7 @@
 #include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/uuid.h>
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/driver.h>
 #include <linux/mlx5/mlx5_ifc.h>
@@ -1007,23 +1008,24 @@ out_unlock:
 static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 				  void __user *uarg)
 {
-	static const u8 zero_uuid[sizeof(((struct mlx5_vfmig_set_vf_uuid *)0)->vf_uuid)] = {};
 	struct mlx5_vfmig_set_vf_uuid arg;
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
 	struct mlx5_core_sriov *sriov;
 	struct mlx5_vf_context *vfs_ctx;
+	uuid_t new_uuid;
 	int err = 0;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
 	if (arg.reserved)
 		return -EINVAL;
+	import_uuid(&new_uuid, arg.vf_uuid);
 	/*
-	 * All-zeros is the "unset" sentinel. Reject as a write so
+	 * uuid_null is the "unset" sentinel. Reject as a write so
 	 * userspace cannot accidentally clear a slot via SET_VF_UUID;
-	 * the only legitimate path to all-zeros is teardown.
+	 * the only legitimate path to uuid_null is teardown.
 	 */
-	if (memcmp(arg.vf_uuid, zero_uuid, sizeof(arg.vf_uuid)) == 0)
+	if (uuid_is_null(&new_uuid))
 		return -EINVAL;
 
 	sriov = &pf_mdev->priv.sriov;
@@ -1033,15 +1035,12 @@ static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 	vfs_ctx = &sriov->vfs_ctx[arg.vf_id];
 
 	mutex_lock(&vfmig->ctxs_lock);
-	if (memcmp(vfs_ctx->vf_uuid, zero_uuid,
-		   sizeof(vfs_ctx->vf_uuid)) == 0) {
-		memcpy(vfs_ctx->vf_uuid, arg.vf_uuid,
-		       sizeof(vfs_ctx->vf_uuid));
+	if (uuid_is_null(&vfs_ctx->vf_uuid)) {
+		uuid_copy(&vfs_ctx->vf_uuid, &new_uuid);
 		mlx5_core_info(pf_mdev,
 			       "vfmig: SET_VF_UUID vf %u stamped\n",
 			       arg.vf_id);
-	} else if (memcmp(vfs_ctx->vf_uuid, arg.vf_uuid,
-			  sizeof(vfs_ctx->vf_uuid)) == 0) {
+	} else if (uuid_equal(&vfs_ctx->vf_uuid, &new_uuid)) {
 		/* Idempotent same-UUID re-stamp; no log line. */
 	} else {
 		mlx5_core_warn(pf_mdev,
@@ -2513,7 +2512,7 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 		arg.vhca_id = 0;
 		arg.restored = 0;
 		arg.tracked = 0;
-		memset(arg.vf_uuid, 0, sizeof(arg.vf_uuid));
+		export_uuid(arg.vf_uuid, &uuid_null);
 		if (copy_to_user(uarg, &arg, sizeof(arg)))
 			return -EFAULT;
 		return -ERANGE;
@@ -2538,8 +2537,7 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	 */
 	arg.restored = sriov->vfs_ctx[arg.vf_id].restored;
 	arg.tracked = sriov->vfs_ctx[arg.vf_id].vfmig_tracked;
-	memcpy(arg.vf_uuid, sriov->vfs_ctx[arg.vf_id].vf_uuid,
-	       sizeof(arg.vf_uuid));
+	export_uuid(arg.vf_uuid, &sriov->vfs_ctx[arg.vf_id].vf_uuid);
 	if (copy_to_user(uarg, &arg, sizeof(arg)))
 		return -EFAULT;
 	return 0;
@@ -6348,8 +6346,9 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
  * Unlike vfmig_pf_drop_pending_loads_locked / drop_iova_domains_locked
  * (which only touch slots that *had* the relevant resource), this hook
  * iterates every slot in @sriov->num_vfs unconditionally: the cost is
- * a memset per slot and we want the simple invariant "after this runs,
- * QUERY_VF returns vf_uuid=0 for every slot in this generation".
+ * one uuid_copy(&uuid_null) per slot and we want the simple invariant
+ * "after this runs, QUERY_VF returns uuid_null for every slot in this
+ * generation".
  *
  * What this is NOT: this hook is not enabling multi-LOAD-on-the-
  * same-VHCA. Re-LOADing a different SAVE blob onto a still-bound
@@ -6373,7 +6372,7 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
  *
  * ctxs_lock serialises against concurrent SET_VF_UUID, matching the
  * write-side handler. Within the loop we don't drop ctxs_lock --
- * memset is non-blocking and the iteration count is bounded by
+ * uuid_copy() is non-blocking and the iteration count is bounded by
  * num_vfs (the FW caps total_vfs at low hundreds), so a tail-end
  * SET_VF_UUID is briefly delayed but never forever.
  */
@@ -6393,8 +6392,7 @@ static void vfmig_pf_drop_vf_uuids_locked(struct mlx5_vfmig_pf *vfmig)
 	total_vfs = sriov->num_vfs;
 	mutex_lock(&vfmig->ctxs_lock);
 	for (i = 0; i < total_vfs; i++)
-		memset(sriov->vfs_ctx[i].vf_uuid, 0,
-		       sizeof(sriov->vfs_ctx[i].vf_uuid));
+		uuid_copy(&sriov->vfs_ctx[i].vf_uuid, &uuid_null);
 	mutex_unlock(&vfmig->ctxs_lock);
 }
 
