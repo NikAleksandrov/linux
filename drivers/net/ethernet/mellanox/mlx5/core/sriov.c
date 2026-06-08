@@ -140,6 +140,17 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	 */
 	mlx5_vfmig_pf_drop_pending_loads(dev);
 
+	/*
+	 * Clear orchestrator-stamped per-VF UUIDs so the
+	 * MLX5_VFMIG_IOC_SET_VF_UUID lifecycle ("all-zeros after
+	 * sriov_numvfs=0") holds even though vfs_ctx[] itself
+	 * survives the cycle. The cycle is the only orchestrator-
+	 * visible reset point for an identity-tag refresh; this
+	 * hook makes the kernel cooperate with that. See
+	 * vfmig.c::vfmig_pf_drop_vf_uuids_locked for rationale.
+	 */
+	mlx5_vfmig_pf_drop_vf_uuids(dev);
+
 	for (vf = num_vfs - 1; vf >= 0; vf--) {
 		if (!sriov->vfs_ctx[vf].enabled)
 			continue;

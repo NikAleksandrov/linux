@@ -570,6 +570,22 @@ struct mlx5_vf_context {
 	 */
 	u8	vfmig_tracked:1;
 	struct vfmig_iova_domain *vfmig_iova_dom;
+	/*
+	 * Set by /dev/mlx5_vfmig SET_VF_UUID ioctl on the PF mdev.
+	 * Orchestrator-owned per-VF identity tag that survives across
+	 * SAVE/LOAD on the same PF and is stamped symmetrically on
+	 * source and destination by the orchestrator before workload
+	 * bind, so CRIU's dump and restore paths can bind a saved-
+	 * state image to a destination VF without depending on
+	 * @vhca_id (per-PF allocator, unstable) or @vf_id (per-PF
+	 * slot, may differ source-vs-destination). Read via QUERY_VF
+	 * by CRIU dump/restore plus the prerestore binary. All-zeros
+	 * means "unset" (initial state, and post-teardown). Cleared
+	 * implicitly when the per-VF context is freed at SR-IOV
+	 * teardown (sriov_numvfs=0). See KS7.3 in
+	 * tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5.
+	 */
+	u8	vf_uuid[16];
 	enum port_state_policy	policy;
 	struct blocking_notifier_head notifier;
 };

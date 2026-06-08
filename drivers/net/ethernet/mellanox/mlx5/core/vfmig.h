@@ -132,6 +132,36 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * Drop any orchestrator-stamped per-VF UUIDs on @pf_mdev's
+ * sriov->vfs_ctx[]. Called from mlx5_device_disable_sriov() so the
+ * lifecycle promised by the SET_VF_UUID UAPI doc-comment ("cleared on
+ * sriov_numvfs=0") holds even though the underlying vfs_ctx[] array
+ * itself survives the sriov_numvfs cycle.
+ *
+ * Motivation: a VF slot is an orchestration unit, not a workload
+ * unit. After tearing the SR-IOV generation down (sriov_numvfs=0),
+ * the orchestrator is free to provision the same vf_id slot for a
+ * *different* workload identity on the next sriov_numvfs=N -- e.g.
+ * when a host has been drained and re-targeted, or when a fresh
+ * workload (with no SAVE blob at all) takes over a slot whose
+ * previous occupant was a CRIU-restored workload. Without this
+ * hook the previous identity tag would survive the cycle, and the
+ * subsequent SET_VF_UUID with the new workload's UUID would get
+ * -EBUSY with no in-kernel path to clear the stale stamp short of
+ * PF unload/reload.
+ *
+ * This hook does NOT depend on (or imply support for) multiple
+ * LOAD_VHCA_STATE invocations on the same VF without an
+ * sriov_numvfs cycle in between -- that workflow is firmware-
+ * unproven and not exercised by anything in tree. The hook only
+ * unblocks identity-tag recycling across the cycle that already
+ * has to happen for *any* repurposing of the slot.
+ *
+ * Safe to call when there is no vfmig PF context yet (no-op).
+ */
+void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev);
+
+/*
  * VF-side helper: detach this VF's vfmig_iova_dom from its PCI device
  * (iommu_dom + dma_ops shim) without freeing the domain struct itself.
  * Idempotent; no-op on PFs, untracked VFs, and orphaned VFs whose PF
@@ -292,6 +322,7 @@ static inline int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev) { return 0;
 static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev) { }
+static inline void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_vf_detach_iova_domain(struct mlx5_core_dev *vf_mdev) { }
 static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *dev,

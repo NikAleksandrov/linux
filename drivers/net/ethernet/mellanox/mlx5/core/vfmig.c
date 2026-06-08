@@ -580,6 +580,7 @@ static void vfmig_load_release_resources(struct mlx5_vfmig_load_ctx *ctx);
 static bool vfmig_vf_id_busy_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id);
 static void vfmig_pf_drop_pending_loads_locked(struct mlx5_vfmig_pf *vfmig);
 static void vfmig_pf_drop_iova_domains_locked(struct mlx5_vfmig_pf *vfmig);
+static void vfmig_pf_drop_vf_uuids_locked(struct mlx5_vfmig_pf *vfmig);
 
 static void vfmig_pf_release(struct kref *kref)
 {
@@ -957,6 +958,98 @@ out_unlock:
 	 */
 	if (old_dom)
 		vfmig_iova_domain_destroy(old_dom);
+	return err;
+}
+
+/*
+ * MLX5_VFMIG_IOC_SET_VF_UUID handler.
+ *
+ * Stamp the orchestrator's 16-byte UUID into vfs_ctx[vf_id].vf_uuid.
+ * Read by CRIU dump/restore (and the prerestore binary) via QUERY_VF
+ * to bind a saved-state image to a specific destination VF -- the
+ * orchestrator is the only component that knows which destination
+ * VF carries which workload's identity, so this is the orchestrator's
+ * write surface.
+ *
+ * Locking
+ *   vfmig->ctxs_lock serialises the per-PF set-or-collide decision.
+ *   Concurrent SET_VF_UUID calls on the same vf_id must agree on the
+ *   "first writer wins, second-with-different-value gets -EBUSY"
+ *   semantics; without the mutex two simultaneous all-zeros-then-write
+ *   races could end with an unintended last-writer-wins outcome.
+ *   The matching read site (vfmig_ioc_query_vf) is intentionally
+ *   lock-free, matching the rest of QUERY_VF; a torn read just yields
+ *   a one-cycle stale snapshot for an observer racing a SET_VF_UUID.
+ *
+ * Lifecycle / -EBUSY semantics
+ *   See the doc-comment in include/uapi/linux/mlx5_vfmig.h. Briefly:
+ *     - vfs_ctx->vf_uuid all-zeros + non-zero @arg.vf_uuid:
+ *       stamp; return 0.
+ *     - vfs_ctx->vf_uuid == @arg.vf_uuid (both non-zero):
+ *       no-op; return 0 (idempotent).
+ *     - vfs_ctx->vf_uuid != @arg.vf_uuid, and vfs_ctx->vf_uuid
+ *       is non-zero:
+ *       refuse; return -EBUSY (defends against accidental
+ *       cross-workload reuse of a slot).
+ *
+ * The kernel does NOT validate UUID uniqueness across slots / PFs;
+ * that is the orchestrator's responsibility (it has the cross-PF
+ * view we'd need anyway). Per-slot serialization is enough to keep
+ * a single slot's value internally consistent.
+ *
+ * VF bind state is irrelevant: unlike SET_TRACKED, this ioctl does
+ * not touch the VF's pci_dev, IOMMU domain, or any cmdif state. The
+ * orchestrator is expected to call this before workload bind, but a
+ * post-bind call is not catastrophic -- it just wouldn't normally
+ * happen because the orchestrator's natural flow is to stamp at
+ * provisioning time.
+ */
+static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	static const u8 zero_uuid[sizeof(((struct mlx5_vfmig_set_vf_uuid *)0)->vf_uuid)] = {};
+	struct mlx5_vfmig_set_vf_uuid arg;
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	struct mlx5_vf_context *vfs_ctx;
+	int err = 0;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+	/*
+	 * All-zeros is the "unset" sentinel. Reject as a write so
+	 * userspace cannot accidentally clear a slot via SET_VF_UUID;
+	 * the only legitimate path to all-zeros is teardown.
+	 */
+	if (memcmp(arg.vf_uuid, zero_uuid, sizeof(arg.vf_uuid)) == 0)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	vfs_ctx = &sriov->vfs_ctx[arg.vf_id];
+
+	mutex_lock(&vfmig->ctxs_lock);
+	if (memcmp(vfs_ctx->vf_uuid, zero_uuid,
+		   sizeof(vfs_ctx->vf_uuid)) == 0) {
+		memcpy(vfs_ctx->vf_uuid, arg.vf_uuid,
+		       sizeof(vfs_ctx->vf_uuid));
+		mlx5_core_info(pf_mdev,
+			       "vfmig: SET_VF_UUID vf %u stamped\n",
+			       arg.vf_id);
+	} else if (memcmp(vfs_ctx->vf_uuid, arg.vf_uuid,
+			  sizeof(vfs_ctx->vf_uuid)) == 0) {
+		/* Idempotent same-UUID re-stamp; no log line. */
+	} else {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_VF_UUID vf %u rejected: a different UUID is already stamped (orchestrator bug?)\n",
+			       arg.vf_id);
+		err = -EBUSY;
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
 	return err;
 }
 
@@ -2408,16 +2501,19 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	 * No input check on it -- the kernel always overwrites the
 	 * field on success or on -ERANGE -- so old userspace that
 	 * happens to have a non-zero byte in there still gets a clean
-	 * answer instead of -EINVAL.
+	 * answer instead of -EINVAL. Same posture for @vf_uuid /
+	 * @reserved_out, which the kernel always overwrites.
 	 */
 
 	sriov = &vfmig->pf_mdev->priv.sriov;
 
 	arg.num_vfs = sriov->num_vfs;
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
 	if (arg.vf_id >= sriov->num_vfs) {
 		arg.vhca_id = 0;
 		arg.restored = 0;
 		arg.tracked = 0;
+		memset(arg.vf_uuid, 0, sizeof(arg.vf_uuid));
 		if (copy_to_user(uarg, &arg, sizeof(arg)))
 			return -EFAULT;
 		return -ERANGE;
@@ -2429,16 +2525,21 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 
 	arg.vhca_id = vhca_id;
 	/*
-	 * @restored and @tracked are read without explicit locking,
-	 * matching the rest of the QUERY_VF path. They are u8 flags
-	 * that toggle only via the SET_TRACKED / MARK_RESTORED
-	 * ioctls, and a torn read just produces a one-cycle stale
-	 * answer for a userspace observer that's racing those ioctls
-	 * against this query. Stable values during the typical
-	 * "userspace orchestrator polls QUERY_VF at init" use case.
+	 * @restored, @tracked, and @vf_uuid are read without explicit
+	 * locking, matching the rest of the QUERY_VF path. They are
+	 * mutated only via the SET_TRACKED / MARK_RESTORED /
+	 * SET_VF_UUID ioctls, so a torn read just produces a
+	 * one-cycle stale answer for a userspace observer that's
+	 * racing those ioctls against this query. Stable values
+	 * during the typical "orchestrator stamps once at
+	 * provisioning, CRIU polls QUERY_VF at init" use case --
+	 * which is the only access pattern these fields are designed
+	 * for.
 	 */
 	arg.restored = sriov->vfs_ctx[arg.vf_id].restored;
 	arg.tracked = sriov->vfs_ctx[arg.vf_id].vfmig_tracked;
+	memcpy(arg.vf_uuid, sriov->vfs_ctx[arg.vf_id].vf_uuid,
+	       sizeof(arg.vf_uuid));
 	if (copy_to_user(uarg, &arg, sizeof(arg)))
 		return -EFAULT;
 	return 0;
@@ -4978,6 +5079,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case MLX5_VFMIG_IOC_SET_TRACKED:
 		ret = vfmig_ioc_set_tracked(vfmig, uarg);
 		break;
+	case MLX5_VFMIG_IOC_SET_VF_UUID:
+		ret = vfmig_ioc_set_vf_uuid(vfmig, uarg);
+		break;
 	case MLX5_VFMIG_IOC_PROBE_UID:
 		ret = vfmig_ioc_probe_uid(vfmig, uarg);
 		break;
@@ -5128,6 +5232,14 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 	 * unloads after this returns (mlx5_unload), so VFs are still here.
 	 */
 	vfmig_pf_drop_iova_domains_locked(vfmig);
+	/*
+	 * Clear orchestrator-stamped per-VF UUIDs. Cheap (memset only,
+	 * no FW / IOMMU traffic), and keeps the SET_VF_UUID lifetime
+	 * promise ("cleared on PF unload") intact for callers that
+	 * tear the PF down via driver unbind without first dropping
+	 * sriov_numvfs to 0.
+	 */
+	vfmig_pf_drop_vf_uuids_locked(vfmig);
 	vfmig->dead = true;
 	vfmig->pf_mdev = NULL;
 	up_write(&vfmig->lock);
@@ -6226,6 +6338,80 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
 	down_read(&vfmig->lock);
 	if (!vfmig->dead)
 		vfmig_pf_drop_iova_domains_locked(vfmig);
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+}
+
+/*
+ * Zero every vfs_ctx[].vf_uuid on PF teardown / sriov_numvfs=0.
+ *
+ * Unlike vfmig_pf_drop_pending_loads_locked / drop_iova_domains_locked
+ * (which only touch slots that *had* the relevant resource), this hook
+ * iterates every slot in @sriov->num_vfs unconditionally: the cost is
+ * a memset per slot and we want the simple invariant "after this runs,
+ * QUERY_VF returns vf_uuid=0 for every slot in this generation".
+ *
+ * What this is NOT: this hook is not enabling multi-LOAD-on-the-
+ * same-VHCA. Re-LOADing a different SAVE blob onto a still-bound
+ * VHCA without an sriov_numvfs cycle is a firmware-unproven path
+ * that nothing in tree exercises -- the vfio mlx5 LM variant
+ * driver also assumes one LOAD per VM lifecycle, and our existing
+ * vfmig_install_pending_load_locked rejects a second stage with
+ * -EBUSY. We do not claim multi-LOAD works.
+ *
+ * What this IS: the orchestrator's natural slot-repurposing path
+ * already has to go through sriov_numvfs=0 + sriov_numvfs=N (any
+ * other shape requires firmware behaviour we haven't validated).
+ * Across that cycle, the orchestrator may want to assign a
+ * *different* identity tag to vf_id slot N -- because the new
+ * occupant is a different workload, not a re-instantiation of the
+ * old one. Without this hook the prior tag would survive the
+ * cycle and SET_VF_UUID with the new workload's UUID would get
+ * -EBUSY with no in-kernel clear path. The clear-on-teardown
+ * semantics published in the SET_VF_UUID UAPI doc-comment make
+ * the cycle the natural reset point.
+ *
+ * ctxs_lock serialises against concurrent SET_VF_UUID, matching the
+ * write-side handler. Within the loop we don't drop ctxs_lock --
+ * memset is non-blocking and the iteration count is bounded by
+ * num_vfs (the FW caps total_vfs at low hundreds), so a tail-end
+ * SET_VF_UUID is briefly delayed but never forever.
+ */
+static void vfmig_pf_drop_vf_uuids_locked(struct mlx5_vfmig_pf *vfmig)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	int total_vfs;
+	int i;
+
+	if (!pf_mdev)
+		return;
+	sriov = &pf_mdev->priv.sriov;
+	if (!sriov->vfs_ctx)
+		return;
+
+	total_vfs = sriov->num_vfs;
+	mutex_lock(&vfmig->ctxs_lock);
+	for (i = 0; i < total_vfs; i++)
+		memset(sriov->vfs_ctx[i].vf_uuid, 0,
+		       sizeof(sriov->vfs_ctx[i].vf_uuid));
+	mutex_unlock(&vfmig->ctxs_lock);
+}
+
+void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev)
+{
+	struct mlx5_vfmig_pf *vfmig;
+
+	if (!pf_mdev || !mlx5_core_is_pf(pf_mdev))
+		return;
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig)
+		return;
+
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_pf_drop_vf_uuids_locked(vfmig);
 	up_read(&vfmig->lock);
 	vfmig_pf_put(vfmig);
 }
