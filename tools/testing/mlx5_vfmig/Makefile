@@ -25,6 +25,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig	\
 	uobject_restore/qp_query/qp_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_query/qp_nlattr_probe		\
+	uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig	\
 	save_load/user_object_replay/user_object_replay_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
@@ -188,6 +189,18 @@ uobject_restore/qp_query/qp_nlattr_probe: \
 		uobject_restore/qp_query/qp_nlattr_probe.c \
 		../../../include/uapi/rdma/rdma_netlink.h
 	$(CC) $(CFLAGS) -isystem ../../../include/uapi -o $@ $<
+
+# KS7.3 SET_VF_UUID + extended QUERY_VF kernel-matrix probe
+# (design/vf_prerestore_split.md §3.5). Single-process matrix runner
+# that exercises every kernel cell of the orchestrator-owned per-VF
+# UUID surface that does NOT need an SR-IOV teardown / re-enable
+# cycle (the lifecycle teardown cells live in the accompanying shell
+# wrapper since they need sysfs writes). Pure cdev ioctls; no
+# libibverbs / libmlx5 deps.
+uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig: \
+		uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig.c \
+		../../../include/uapi/linux/mlx5_vfmig.h
+	$(CC) $(CFLAGS) -o $@ $<
 
 # user_mr_dma stage-2 success-criterion probe
 # (design/user_mr_dma.md section 6.4). Allocates a configurable set of
