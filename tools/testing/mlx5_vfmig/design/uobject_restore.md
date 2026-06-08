@@ -125,10 +125,51 @@ new-handle map maintained in CRIU userspace.
   in the SR-IOV case): covered by construction. Discovery is per-ufile,
   restore is per-ufile in dependency order, plugin dispatch picks the right
   ops by parent ucontext's `criu_driver`.
-* **Multi-process / cross-tree**: out of scope for v0 in the sense that
-  cross-tree exclusivity check (already in CRIU) refuses dump if the same
-  ibdev is shared across the dump tree boundary by an EXCLUSIVE plugin.
-  SHAREABLE (rxe) plugins permit it.
+* **Multi-process / cross-tree**: out of scope for v0. CRIU classifies
+  RDMA plugins (and therefore the ibdevs they own) as **EXCLUSIVE** or
+  **SHAREABLE** for cross-tree purposes:
+
+  * **EXCLUSIVE** -- the ibdev's FW/kernel state is captured as a
+    single VHCA-scoped blob at dump time and cannot be split per
+    process. mlx5_vfmig is EXCLUSIVE because `SAVE_VHCA_STATE` is a
+    per-VHCA atomic snapshot, and CRIU's freeze (SIGSTOP of dumpee
+    threads) only quiesces the dump tree's userspace -- a process
+    *outside* the tree holding open ufiles on the same VF would
+    continue posting WRs / mutating FW state, racing the SAVE.  CRIU
+    refuses to dump if any such cross-tree ufile holder exists on
+    the same ibdev.  The orchestrator's job is to ensure each VF
+    is bound 1:1 to a workload (typically via the KS7.3
+    per-VF UUID, see [`vf_prerestore_split.md`](vf_prerestore_split.md)
+    §3.5) so the cross-tree check is satisfied by construction.
+  * **SHAREABLE** -- the ibdev has no atomic per-device snapshot
+    operation; what dump captures is whatever uobjects the dump
+    tree holds, and other trees can hold their own uobjects on the
+    same ibdev independently.  rxe is SHAREABLE because it has no
+    SAVE_VHCA_STATE equivalent and its kernel state is naturally
+    per-process (queues live in vmalloc'd buffers per-ucontext;
+    there is no shared FW image to capture).
+
+  The check that enforces this is CRIU's existing per-ibdev
+  cross-tree dump admission; the EXCLUSIVE / SHAREABLE bit just
+  decides whether a sharing collision is a hard error (EXCLUSIVE)
+  or permitted (SHAREABLE).
+
+  > **Future work.** The EXCLUSIVE-on-mlx5_vfmig restriction comes
+  > from `SAVE_VHCA_STATE`'s VHCA-wide scope, not from any
+  > per-process state we couldn't otherwise capture.  Lifting it
+  > -- so that a CRIU dump can capture process A's uobjects on a
+  > shared VF without stalling process B's traffic on the same
+  > VF -- would require either (a) a per-process FW-state save
+  > (no current FW command), (b) a way for CRIU to skip
+  > `SAVE_VHCA_STATE` and rely on the orchestrator owning
+  > VF-level snapshots out-of-band, or (c) a quiesce primitive
+  > that holds traffic only briefly enough to read identity
+  > continuity and lets the VF resume immediately.  Out of scope
+  > for v0; tracked as a follow-on so the orchestrator-side
+  > workload-per-VF binding (KS7.3) doesn't become a permanent
+  > deployment constraint.  The dump-side
+  > "freeze the whole VF for the entire dump window" model is
+  > acceptable for the v0 single-workload-per-VF case.
 
 ## 2. Background: state model and where each piece lives
 
@@ -1674,10 +1715,35 @@ port state and destination port state. Any mismatch fails loudly with
 a clear diagnostic (which GID/PKey/ibdev didn't match, what hint would
 satisfy it).
 
-EXCLUSIVE plugins (mlx5_vfmig) take ownership of port-level state when
-the flag is supplied -- e.g. install GIDs at the requested indices via
-the netlink RDMA_NLDEV_CMD_SYS_SET command path. SHAREABLE plugins (rxe)
-trust the orchestrator and only validate.
+Port-state ownership is **not** keyed on the EXCLUSIVE / SHAREABLE
+plugin classification (which is a dump-side cross-tree property,
+see §1.4).  Under the KS7.4 / §S6b resolution model
+([`vf_prerestore_split.md`](vf_prerestore_split.md) §4.6), the
+**orchestrator** owns destination-side L2/L3 setup uniformly: it
+runs `ip link set <PF> vf <VF_ID> mac <…>`, `ip addr add <…>`, and
+`ip neigh replace <…>` to mirror the source's per-VF identity onto
+the destination *before* `LOAD_VHCA_STATE`.  The kernel
+auto-populates the RoCE GID table from netdev IPs as a side effect
+of `ip addr add`, so by the time the CRIU plugin's `init(RESTORE)`
+runs, the GID table already reflects the orchestrator's intent.
+
+The plugin's job, regardless of EXCLUSIVE / SHAREABLE
+classification, is therefore to **validate** that the populated
+GID/PKey state matches the dump image (or the hint file's
+overrides), and fail loud if it doesn't.  Both mlx5_vfmig and rxe
+use the same code path here; what differs is *who set up the port
+on the destination* (orchestrator's `ip` commands for mlx5_vfmig;
+orchestrator's `rdma link add rxe…` for rxe), not whether CRIU's
+plugin layer is doing the install.
+
+(An earlier draft of this section sketched the plugin calling
+`RDMA_NLDEV_CMD_SYS_SET` to install GIDs at requested indices.
+That sketch was based on a model where a kernel-side post-LOAD
+helper would also be needed to refresh `path.rmac_*` -- a model
+the §S6b post-mortem (`qp_av_dmac_swap.md` Appendix A §12) ruled
+out as architecturally infeasible, after which the entire port
+setup migrated orchestrator-side.  The plugin retains no
+GID-install path on either driver.)
 
 ## 7. Driver-side changes (kernel asks K2-K4 for v0 + K1 cleanup)
 
@@ -2234,20 +2300,39 @@ six fields back into `UVERBS_METHOD_RESTORE_MR`'s IN attrs.
 
 ### 8.1 GID / PKey port-level state
 
-mlx5_vfmig is EXCLUSIVE on its port; the destination VF's port GID/PKey
-table is whatever the FW + netdev configure at bind time. R3:
+mlx5_vfmig is EXCLUSIVE on its VF (dump-side cross-tree exclusivity,
+per §1.4 -- one workload per VF for v0).  Port GID/PKey state
+ownership is a separate axis: under the §S6b resolution
+([`vf_prerestore_split.md`](vf_prerestore_split.md) §4.6, KS7.4),
+**the orchestrator** owns destination-side port setup uniformly,
+running `ip link set <PF> vf <VF_ID> mac <…>` + `ip addr add <…>` +
+`ip neigh replace <…>` *before* `LOAD_VHCA_STATE`.  The kernel
+auto-populates the RoCE GID table from the IPs the orchestrator
+adds; by the time the CRIU plugin's `init(RESTORE)` runs, the GID
+table already reflects the orchestrator's intent.  R3:
 
-* **Symmetric setup** (test rigs, normal LM): destination netdev has the
-  same IPs as source -> RoCE GIDs at the same indices. No-op match.
-* **Asymmetric setup**: orchestrator hint file (?6.5) declares the
-  destination's GID-index -> GID-value mapping. mlx5_vfmig plugin reads
-  the hint at init(RESTORE) and installs GIDs via netlink before any
-  uobject restore touches the port. Mismatch with the dump image's
-  saved GIDs => fail loud with clear diagnostic.
+* **Symmetric setup** (test rigs, normal LM): orchestrator runs the
+  three `ip` commands to mirror source-time peer-VF identity onto
+  the destination, the destination netdev gets the source-time
+  IPs, and the kernel auto-populates RoCE GIDs at the same indices
+  the source had.  CRIU plugin validates -- no-op match.
+* **Asymmetric setup**: orchestrator hint file (§6.5) declares the
+  destination's GID-index -> GID-value mapping that the plugin
+  should expect (rather than the source's verbatim).  Plugin
+  validates the populated GID table against the hint at
+  `init(RESTORE)`.  Mismatch with the dump image's saved GIDs (or
+  the hint's overrides) => fail loud with clear diagnostic.
 
-rxe is SHAREABLE; orchestrator owns rxe link setup (`rdma link add rxe7
-type rxe netdev <X>`); CRIU just validates the resulting GID table
-matches the dump.
+rxe is SHAREABLE on its ibdev (multiple unrelated processes can
+hold ufiles on the same rxe link); the same validate-only port
+setup applies, just driven by the orchestrator's
+`rdma link add rxe7 type rxe netdev <X>` rather than `ip link set
+vf mac`.
+
+The earlier draft of this section had the mlx5_vfmig plugin
+*installing* GIDs via netlink at `init(RESTORE)`.  That path no
+longer exists; see §6.5 for the rationale (KS7.4 moved L2/L3 setup
+fully orchestrator-side).
 
 ### 8.2 FW identity continuity (K6)
 
