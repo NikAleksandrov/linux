@@ -862,11 +862,17 @@ static int do_get(int fd, unsigned int vf_id)
 static int query_one(int fd, unsigned int vf_id, struct mlx5_vfmig_query_vf *out)
 {
 	struct mlx5_vfmig_query_vf arg = { .vf_id = vf_id };
+	int err;
 
-	if (ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &arg) < 0)
-		return -errno;
+	/*
+	 * The kernel populates @arg unconditionally -- on success and
+	 * on -ERANGE -- so callers that bail on -ERANGE can still read
+	 * @num_vfs (and @vf_uuid, which is zero-filled) out of @out.
+	 * Copy out first, then return the verdict.
+	 */
+	err = ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &arg) ? -errno : 0;
 	*out = arg;
-	return 0;
+	return err;
 }
 
 static int do_query(int fd, unsigned int vf_id)
