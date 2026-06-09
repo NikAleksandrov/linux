@@ -26,6 +26,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/qp_query/qp_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_query/qp_nlattr_probe		\
 	uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig	\
+	save_load/multi_load_gates/multi_load_stage_gate_probe	\
 	save_load/user_object_replay/user_object_replay_probe
 
 # Optional VFIO STOP_COPY helper. Opt-in via `make vfio-helper`
@@ -199,6 +200,19 @@ uobject_restore/qp_query/qp_nlattr_probe: \
 # libibverbs / libmlx5 deps.
 uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig: \
 		uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig.c \
+		../../../include/uapi/linux/mlx5_vfmig.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+# Multi-LOAD staging-gate probe (design/vf_prerestore_split.md §3.5,
+# "Empirical multi-LOAD validation"). Single-process kernel-matrix
+# runner that exercises the per-vf_id LOAD-session busy gate
+# (vfmig_vf_id_busy_locked): concurrent fds, gate-clears-on-close,
+# and per-vf_id isolation. Pure cdev ioctls; no libibverbs / libmlx5
+# deps; never writes blob bytes so no FW interaction. The companion
+# wrapper test_multi_load_stage_gate.sh handles SR-IOV provisioning
+# and enable_migratable.
+save_load/multi_load_gates/multi_load_stage_gate_probe: \
+		save_load/multi_load_gates/multi_load_stage_gate_probe.c \
 		../../../include/uapi/linux/mlx5_vfmig.h
 	$(CC) $(CFLAGS) -o $@ $<
 

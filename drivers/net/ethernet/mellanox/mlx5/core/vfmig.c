@@ -6350,13 +6350,22 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
  * "after this runs, QUERY_VF returns uuid_null for every slot in this
  * generation".
  *
- * What this is NOT: this hook is not enabling multi-LOAD-on-the-
- * same-VHCA. Re-LOADing a different SAVE blob onto a still-bound
- * VHCA without an sriov_numvfs cycle is a firmware-unproven path
- * that nothing in tree exercises -- the vfio mlx5 LM variant
- * driver also assumes one LOAD per VM lifecycle, and our existing
- * vfmig_install_pending_load_locked rejects a second stage with
- * -EBUSY. We do not claim multi-LOAD works.
+ * What this is NOT: this hook is not an assertion that mlx5 FW
+ * accepts a second LOAD_VHCA_STATE on the same VHCA across a
+ * bind/unbind cycle. The kernel does not structurally block that
+ * path -- vfmig_install_pending_load_locked only fires while a
+ * prior stage is still un-applied, and apply (mlx5_vfmig_vf_apply_
+ * pending_load) clears vfs_ctx[vf_id].vfmig_pending_load BEFORE
+ * issuing LOAD_VHCA_STATE -- so a fresh stage after an apply could
+ * in principle install a second pending_load and the next bind
+ * would re-issue LOAD_VHCA_STATE. The unknown is firmware
+ * behaviour, not kernel structure: nothing in tree exercises that
+ * corner today (the vfio mlx5 LM variant driver also assumes one
+ * LOAD per VM lifecycle), and the single-host SAVE round-trip
+ * blocks at the destination bind on the cmd-ring DMA-address
+ * issue called out in the UAPI doc-comment "Note on round-trip
+ * behaviour". See vf_prerestore_split.md §3.5.5.1 for the
+ * empirical-status table.
  *
  * What this IS: the orchestrator's natural slot-repurposing path
  * already has to go through sriov_numvfs=0 + sriov_numvfs=N (any

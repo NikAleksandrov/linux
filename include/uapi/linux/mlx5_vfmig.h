@@ -1408,12 +1408,23 @@ struct mlx5_vfmig_probe_mr_destroy {
  *   The "set once until teardown" semantics mean a workflow that
  *   wants to repurpose a vf_id slot for a *different* workload
  *   identity must go through sriov_numvfs=0 -> sriov_numvfs=N
- *   first.  In practice the cycle is the only reset point the
- *   orchestrator has for a slot anyway -- mlx5 firmware has no
- *   in-place "wipe a bound VHCA's state and accept a fresh LOAD"
- *   primitive, so reuse with a different identity already
- *   implies the cycle. Idempotent re-stamps with the *same* UUID
- *   are explicitly fine and don't require any teardown.
+ *   first.  This matches the orchestrator's existing slot-
+ *   repurposing flow: the cycle is what already tears down per-
+ *   slot resources (cmd ring, EQ buffers, MR-backing pages,
+ *   tracked IOVA domain) so the new workload can come up clean.
+ *   Idempotent re-stamps with the *same* UUID are explicitly
+ *   fine and don't require any teardown.
+ *
+ *   What this UAPI does NOT promise: a "wipe a bound VHCA's
+ *   state and accept a fresh LOAD_VHCA_STATE" primitive. The
+ *   kernel does not structurally block such a multi-LOAD path,
+ *   but firmware behaviour across DISABLE_HCA + ENABLE_HCA on
+ *   the same VHCA without an sriov_numvfs cycle is unproven
+ *   and not exercised by any in-tree consumer (see
+ *   tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ *   §3.5.5.1 for the gate-by-gate empirical / structural
+ *   table). If a future consumer needs that path validated,
+ *   the open work item is firmware-side, not on this UAPI.
  *
  *   Authorization is the cdev FD, same as the rest of the
  *   /dev/mlx5_vfmig cdev family.

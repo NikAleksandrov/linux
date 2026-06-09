@@ -943,18 +943,50 @@ bind and freed at PF unbind, not on each `sriov_numvfs`
 write. Without the explicit memset hook, a stale UUID would
 survive into the next generation and the orchestrator's
 fresh `SET_VF_UUID` would `-EBUSY` with no in-kernel clear
-path short of PF unload/reload. This is **not** an
-empirical assertion that mlx5 firmware allows multiple
-`LOAD_VHCA_STATE` invocations on the same VHCA without an
-`sriov_numvfs` cycle in between -- that path is unproven
-and not exercised by anything in tree (the existing
-`vfmig_install_pending_load_locked` itself rejects a
-second stage with `-EBUSY` while one is already pending,
-and the vfio mlx5 LM variant driver assumes one LOAD per
-VM lifecycle). The clear-on-cycle hook is purely about
-unblocking identity-tag refresh on the cycle that the
-orchestrator already has to perform for *any* slot
-repurposing.
+path short of PF unload/reload.
+
+##### 3.5.5.1 Empirical multi-LOAD validation
+
+The hook is **not** an assertion that mlx5 firmware allows
+multiple `LOAD_VHCA_STATE` invocations on the same VHCA
+without an `sriov_numvfs` cycle in between. To make precise
+what is and is not validated, here are the kernel-side
+gates that touch the multi-LOAD question and their current
+empirical / structural standing:
+
+| layer                                                                                                              | what the kernel does                                                                                                                          | empirical status                                                                                                                                                                                                                                |
+|---|---|---|
+| **Stage gate (per-fd)** -- `vfmig_vf_id_busy_locked` (`drivers/.../vfmig.c` line 4199)                             | A second `MLX5_VFMIG_IOC_LOAD_VHCA_STATE` ioctl on the same `vf_id` while the first `load_fd` is still open returns `-EBUSY`.                 | **Tested 2026-06-09** by `save_load/multi_load_gates/multi_load_stage_gate_probe` (4 cells: open/close, concurrent-fd `-EBUSY`, gate-clears-on-close, per-vf_id isolation). Run via `test_multi_load_stage_gate.sh`. Pure ioctl path; no FW interaction. |
+| **Install gate (per-pending_load)** -- `vfmig_install_pending_load_locked` (`drivers/.../vfmig.c` line 3789)        | After a successful first stage installs `vfs_ctx[vf_id].vfmig_pending_load`, a second stage's release path emits `-EBUSY` to the dmesg warning channel and discards the second blob. The first ioctl that reaches release returns 0 to userspace; the *failure* surfaces only in dmesg. | **Code-verified, not empirically tested on this rig.** Reaching this gate requires writing a `STREAM_HEADER`-prefixed blob through the parser to set `image_staged=true`, which requires a working SAVE upstream. The single-host SAVE round-trip blocks at the destination bind (cmd-ring DMA-address issue called out in the UAPI doc-comment "Note on round-trip behaviour" in `include/uapi/linux/mlx5_vfmig.h`). |
+| **Apply path (FW)** -- `mlx5_vfmig_vf_apply_pending_load` (`drivers/.../vfmig.c` line 5822)                          | Pops `vfmig_pending_load`, walks SUSPEND_INITIATOR → SUSPEND_RESPONDER → `LOAD_VHCA_STATE` → RESUME_RESPONDER → RESUME_INITIATOR on the FW. The slot is cleared (`= NULL`) by `vfmig_take_pending_load_locked` BEFORE the FW command issues. | **Untested.** Whether mlx5 FW accepts `LOAD_VHCA_STATE` on a VHCA that has been `LOAD_VHCA_STATE`'d, then `DISABLE_HCA`'d (via VF unbind), then `ENABLE_HCA`'d again, is firmware-unproven. The kernel does *not* structurally block this path -- a fresh stage after the first apply would re-install `pending_load` and the next bind would re-issue `LOAD_VHCA_STATE`. The `vfio_mlx5_pci` LM variant driver also assumes one LOAD per VM lifecycle, so there is no in-tree consumer that exercises this corner. |
+
+The architectural takeaway:
+
+* **Slot repurposing across `sriov_numvfs` cycles is the
+  validated path.** That is exactly what the
+  `mlx5_vfmig_pf_drop_vf_uuids` hook supports, and it is
+  the orchestrator workflow KS7.3 was designed for.
+* **Multi-LOAD on the same VHCA without a cycle is the
+  un-validated path.** Nothing in the in-tree kernel
+  *prevents* it: the install gate would fire only if a
+  prior stage was un-applied, and an apply consumes the
+  slot before issuing the FW command. The unknown is FW
+  behaviour, not kernel structure. Empirical validation
+  belongs on the multi-host rdma-test-agent rig that
+  already exercises §S6b end-to-end (single-host native
+  bind times out behind the cmd-ring DMA-address issue).
+
+If a future consumer needs the un-validated path
+explicitly, the path forward is: (1) extend the
+multi-host rdma-test-agent rig to drive
+`save → bind → unbind → load → bind` against a single
+VHCA without an `sriov_numvfs` cycle, observing
+`LOAD_VHCA_STATE` syndrome in dmesg and post-second-LOAD
+data-plane integrity; (2) if FW accepts it cleanly, the
+existing kernel path already permits it -- no further
+kernel surface change required. If FW rejects it, that
+becomes a structural cap to surface to the orchestrator,
+not a gate to add kernel-side.
 
 Cross-host migration is unaffected: source host's slot
 keeps its UUID until source teardown; destination host's
