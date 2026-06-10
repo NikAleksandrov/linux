@@ -6352,20 +6352,20 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
  *
  * What this is NOT: this hook is not an assertion that mlx5 FW
  * accepts a second LOAD_VHCA_STATE on the same VHCA across a
- * bind/unbind cycle. The kernel does not structurally block that
- * path -- vfmig_install_pending_load_locked only fires while a
- * prior stage is still un-applied, and apply (mlx5_vfmig_vf_apply_
- * pending_load) clears vfs_ctx[vf_id].vfmig_pending_load BEFORE
- * issuing LOAD_VHCA_STATE -- so a fresh stage after an apply could
- * in principle install a second pending_load and the next bind
- * would re-issue LOAD_VHCA_STATE. The unknown is firmware
- * behaviour, not kernel structure: nothing in tree exercises that
- * corner today (the vfio mlx5 LM variant driver also assumes one
- * LOAD per VM lifecycle), and the single-host SAVE round-trip
- * blocks at the destination bind on the cmd-ring DMA-address
- * issue called out in the UAPI doc-comment "Note on round-trip
- * behaviour". See vf_prerestore_split.md §3.5.5.1 for the
- * empirical-status table.
+ * bind/unbind cycle without an sriov_numvfs cycle in between.
+ * That path is structurally blocked one layer down, in
+ * vfmig_iova_replay_page(): the first LOAD's parser arms
+ * dom->drift_armed=1 after every HOST_PAGE record has been
+ * parsed, and any later replay attempt (i.e. the HOST_PAGE
+ * prefix of a second LOAD on the same domain) trips
+ * WARN_ON_ONCE(dom->drift_armed) and returns -EBUSY, surfaced
+ * as -EINVAL on the second write(). LOAD_VHCA_STATE is never
+ * issued, so the firmware question is moot for in-tree
+ * consumers (the vfio mlx5 LM variant driver also assumes one
+ * LOAD per VM lifecycle). Empirically validated end-to-end on
+ * 2026-06-09 by tools/testing/mlx5_vfmig/save_load/
+ * multi_load_gates/test_multi_load_drift_gate.sh. See
+ * vf_prerestore_split.md §3.5.5.1 for the gate-by-gate table.
  *
  * What this IS: the orchestrator's natural slot-repurposing path
  * already has to go through sriov_numvfs=0 + sriov_numvfs=N (any

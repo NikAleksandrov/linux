@@ -19,15 +19,17 @@
  *
  * The probe does NOT exercise the second staging gate
  * (vfmig_install_pending_load_locked) -- that one fires inside the
- * LOAD fd's release path and surfaces only as a dmesg warning.
- * Reaching it requires writing a STREAM_HEADER-prefixed blob through
- * the parser to set image_staged=true, which in turn requires a
- * working SAVE flow upstream. On a single-host native rig the SAVE
- * round-trip relies on a destination bind path that times out behind
- * an unsolved cmd-ring DMA-address issue (see the UAPI doc-comment
- * around "Note on round-trip behaviour" in
- * include/uapi/linux/mlx5_vfmig.h), so we cover that gate via
- * code-level analysis in the design doc instead.
+ * LOAD fd's release path and surfaces only as a dmesg warning. In
+ * practice the IOVA replay drift_armed gate fires *first* on the
+ * second LOAD's HOST_PAGE prefix and aborts the second LOAD before
+ * the install gate's release path runs. The drift_armed gate is
+ * empirically validated end-to-end by test_multi_load_drift_gate.sh
+ * in this same directory. The install gate remains a code-level
+ * safety net for a small race window (apply takes the slot, the
+ * load_fd is closed, a fresh stage races in before sriov teardown),
+ * which is hard to manufacture cleanly without a second IOVA
+ * domain. See vf_prerestore_split.md §3.5.5.1 for the gate-by-gate
+ * table.
  *
  * Subtests (no SAVE / no FW interaction; idempotent across re-runs):
  *

@@ -20,19 +20,16 @@
 # What this does NOT validate
 # ---------------------------
 #   - vfmig_install_pending_load_locked (the second staging gate, in
-#     the LOAD fd's release path). Reaching it requires writing a
-#     STREAM_HEADER-prefixed blob through the parser, which in turn
-#     requires a working SAVE upstream. The single-host SAVE round-
-#     trip on this rig blocks at the destination bind step, behind
-#     the cmd-ring DMA-address issue called out in the UAPI doc-
-#     comment "Note on round-trip behaviour" in
-#     include/uapi/linux/mlx5_vfmig.h.
-#   - Firmware behaviour on a second LOAD_VHCA_STATE across a
-#     bind/unbind cycle on the same VHCA. Same blocker; needs the
-#     multi-host rdma-test-agent rig that already validated the §S6b
-#     end-to-end MAC/IP swap.
-#   The design doc (vf_prerestore_split.md §3.5) carries an "open
-#   FW question" pointer for both items.
+#     the LOAD fd's release path). In practice the IOVA replay
+#     drift_armed gate fires *first* on the second write of HOST_PAGE
+#     records and aborts the second LOAD before its release path
+#     runs; the install gate is a safety net for the small window
+#     between "apply path takes the slot" and "userspace closes the
+#     load_fd", which is hard to manufacture cleanly without a second
+#     IOVA domain. See test_multi_load_drift_gate.sh in this
+#     directory for the empirical drift_armed-gate probe, and
+#     design/vf_prerestore_split.md §3.5.5.1 for the gate-by-gate
+#     table.
 #
 # Usage:
 #   sudo PF=0000:08:00.0 ./test_multi_load_stage_gate.sh [N]

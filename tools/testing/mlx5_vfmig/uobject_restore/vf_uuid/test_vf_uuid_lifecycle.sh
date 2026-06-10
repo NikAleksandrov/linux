@@ -19,8 +19,8 @@
 #                        sriov_numvfs=0 hook, NOT a claim that
 #                        multiple LOAD_VHCA_STATE invocations are
 #                        supported on the same VHCA without a
-#                        cycle (that path is firmware-unproven on
-#                        the single-host rig; see
+#                        cycle (that path is structurally blocked
+#                        by the IOVA replay drift_armed gate; see
 #                        design/vf_prerestore_split.md §3.5.5.1).
 #                        The cell only proves that the cycle the
 #                        orchestrator already has to perform for

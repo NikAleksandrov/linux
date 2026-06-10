@@ -152,24 +152,22 @@ void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev);
  *
  * This hook does NOT depend on (or imply support for) multiple
  * LOAD_VHCA_STATE invocations on the same VHCA without an
- * sriov_numvfs cycle in between. That workflow is firmware-
- * unproven on this rig: the kernel does not structurally block
- * it (vfmig_install_pending_load_locked only fires while a
- * prior stage is still un-applied; apply clears the slot
- * before issuing the FW command), so a fresh stage after an
- * apply would in principle install another pending_load and
- * trigger a second LOAD_VHCA_STATE on the next bind. Whether
- * mlx5 FW accepts that command after a DISABLE_HCA + ENABLE_HCA
- * round trip on the same VHCA is not exercised by anything in
- * tree (the vfio mlx5 LM variant driver also assumes one LOAD
- * per VM lifecycle) and the single-host SAVE round-trip on
- * native rigs blocks at the destination bind behind the cmd-
- * ring DMA-address issue called out in the UAPI doc-comment
- * "Note on round-trip behaviour" in
- * include/uapi/linux/mlx5_vfmig.h. See
- * tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
- * §3.5.5.1 for the empirical-status table and the path to
- * resolving the open question on the multi-host rig.
+ * sriov_numvfs cycle in between. That workflow is structurally
+ * blocked one layer down, in vfmig_iova_replay_page(): the
+ * first LOAD's parser arms drift detection on the per-VF IOVA
+ * domain after every HOST_PAGE record has been parsed, and any
+ * later replay attempt (i.e. the HOST_PAGE prefix of a second
+ * LOAD on the same domain) trips WARN_ON_ONCE(dom->drift_armed)
+ * and returns -EBUSY, which the parser surfaces as -EINVAL.
+ * LOAD_VHCA_STATE is never issued, so the firmware question
+ * ("does FW accept LOAD on a VHCA that has already been LOADed
+ * and then DISABLE_HCA / ENABLE_HCA'd?") is moot for in-tree
+ * consumers. The cycle path, by contrast, drops the per-VF
+ * IOVA domain in mlx5_sriov_disable() (drift_armed goes with
+ * it) and is empirically validated end-to-end by
+ * tools/testing/mlx5_vfmig/save_load/test_iova_tracked_save_load.sh.
+ * See tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ * §3.5.5.1 for the gate-by-gate empirical table.
  *
  * The hook only unblocks identity-tag recycling across the
  * cycle that already has to happen for *any* repurposing of

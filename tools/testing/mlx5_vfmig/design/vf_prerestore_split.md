@@ -947,46 +947,57 @@ path short of PF unload/reload.
 
 ##### 3.5.5.1 Empirical multi-LOAD validation
 
-The hook is **not** an assertion that mlx5 firmware allows
-multiple `LOAD_VHCA_STATE` invocations on the same VHCA
-without an `sriov_numvfs` cycle in between. To make precise
-what is and is not validated, here are the kernel-side
-gates that touch the multi-LOAD question and their current
-empirical / structural standing:
+The hook coexists with three independent gates that
+together pin down what "multiple `LOAD_VHCA_STATE`
+invocations on the same VHCA" means in practice. All four
+layers were exercised on this rig (single-host, native
+mlx5_core, IOMMU + deterministic-IOVA tracking) on
+2026-06-09:
 
-| layer                                                                                                              | what the kernel does                                                                                                                          | empirical status                                                                                                                                                                                                                                |
+| layer                                                                                                              | what the kernel does                                                                                                                          | empirical status |
 |---|---|---|
-| **Stage gate (per-fd)** -- `vfmig_vf_id_busy_locked` (`drivers/.../vfmig.c` line 4199)                             | A second `MLX5_VFMIG_IOC_LOAD_VHCA_STATE` ioctl on the same `vf_id` while the first `load_fd` is still open returns `-EBUSY`.                 | **Tested 2026-06-09** by `save_load/multi_load_gates/multi_load_stage_gate_probe` (4 cells: open/close, concurrent-fd `-EBUSY`, gate-clears-on-close, per-vf_id isolation). Run via `test_multi_load_stage_gate.sh`. Pure ioctl path; no FW interaction. |
-| **Install gate (per-pending_load)** -- `vfmig_install_pending_load_locked` (`drivers/.../vfmig.c` line 3789)        | After a successful first stage installs `vfs_ctx[vf_id].vfmig_pending_load`, a second stage's release path emits `-EBUSY` to the dmesg warning channel and discards the second blob. The first ioctl that reaches release returns 0 to userspace; the *failure* surfaces only in dmesg. | **Code-verified, not empirically tested on this rig.** Reaching this gate requires writing a `STREAM_HEADER`-prefixed blob through the parser to set `image_staged=true`, which requires a working SAVE upstream. The single-host SAVE round-trip blocks at the destination bind (cmd-ring DMA-address issue called out in the UAPI doc-comment "Note on round-trip behaviour" in `include/uapi/linux/mlx5_vfmig.h`). |
-| **Apply path (FW)** -- `mlx5_vfmig_vf_apply_pending_load` (`drivers/.../vfmig.c` line 5822)                          | Pops `vfmig_pending_load`, walks SUSPEND_INITIATOR → SUSPEND_RESPONDER → `LOAD_VHCA_STATE` → RESUME_RESPONDER → RESUME_INITIATOR on the FW. The slot is cleared (`= NULL`) by `vfmig_take_pending_load_locked` BEFORE the FW command issues. | **Untested.** Whether mlx5 FW accepts `LOAD_VHCA_STATE` on a VHCA that has been `LOAD_VHCA_STATE`'d, then `DISABLE_HCA`'d (via VF unbind), then `ENABLE_HCA`'d again, is firmware-unproven. The kernel does *not* structurally block this path -- a fresh stage after the first apply would re-install `pending_load` and the next bind would re-issue `LOAD_VHCA_STATE`. The `vfio_mlx5_pci` LM variant driver also assumes one LOAD per VM lifecycle, so there is no in-tree consumer that exercises this corner. |
+| **Stage gate (per-fd)** -- `vfmig_vf_id_busy_locked` (`drivers/.../vfmig.c` line 4199)                             | A second `MLX5_VFMIG_IOC_LOAD_VHCA_STATE` ioctl on the same `vf_id` while the first `load_fd` is still open returns `-EBUSY`.                 | **Tested.** `save_load/multi_load_gates/multi_load_stage_gate_probe` (4 cells: open/close, concurrent-fd `-EBUSY`, gate-clears-on-close, per-vf_id isolation). Pure ioctl path; no FW interaction. |
+| **Install gate (per-pending_load)** -- `vfmig_install_pending_load_locked` (`drivers/.../vfmig.c` line 3789)        | After a successful first stage installs `vfs_ctx[vf_id].vfmig_pending_load`, a second stage's release path emits `-EBUSY` to the dmesg warning channel and discards the second blob. | **Code-verified.** Not separately probed because in practice the IOVA replay gate (next row) fires *first* on the second `write()` of HOST_PAGE records and aborts the second LOAD before its release path runs. The install gate is the safety net for the small window between "apply path takes the slot" and "userspace closes the load_fd"; that race is hard to manufacture cleanly without a second IOVA domain, which a single VHCA does not have. |
+| **IOVA replay gate (`drift_armed`)** -- `vfmig_iova_replay_page` (`drivers/.../vfmig_iova.c` line 1397)              | The first LOAD's parser arms `dom->drift_armed=1` after parsing all HOST_PAGE records. Any subsequent `replay_page` call (i.e. a second LOAD on the same domain) hits `WARN_ON_ONCE(dom->drift_armed)` and returns `-EBUSY`, which the parser surfaces as `-EINVAL`. | **Tested.** Reproduced on this rig: full SAVE → LOAD → bind → unbind → second LOAD on the same `vf_id` aborts at the first HOST_PAGE record with `replay_page(slot=1 ...) failed: -16` followed by `-22` in dmesg, plus the `WARN: dom->drift_armed` taint at `vfmig_iova_replay_page+0x1cc`. The first LOAD's IOVA installations stay live; the kernel refuses to grow `expected_count[slot]` after the source's footprint has been declared. |
+| **Apply path (FW)** -- `mlx5_vfmig_vf_apply_pending_load` (`drivers/.../vfmig.c` line 5822)                          | Pops `vfmig_pending_load`, walks SUSPEND_INITIATOR → SUSPEND_RESPONDER → `LOAD_VHCA_STATE` → RESUME_RESPONDER → RESUME_INITIATOR on the FW.    | **Tested for the cycle path.** A SAVE → LOAD → bind sequence, followed by `sriov_numvfs=0` / `sriov_numvfs=1` / SAVE → LOAD → bind on the same PF, completes end-to-end with `mlx5_core/mlx5e` reaching the same `vhca_id` and MAC both times. The test driver is `save_load/test_iova_tracked_save_load.sh`. Whether FW would accept a *non-cycle* second LOAD is moot: the IOVA replay gate above blocks it before any FW command issues. |
 
 The architectural takeaway:
 
 * **Slot repurposing across `sriov_numvfs` cycles is the
-  validated path.** That is exactly what the
-  `mlx5_vfmig_pf_drop_vf_uuids` hook supports, and it is
-  the orchestrator workflow KS7.3 was designed for.
-* **Multi-LOAD on the same VHCA without a cycle is the
-  un-validated path.** Nothing in the in-tree kernel
-  *prevents* it: the install gate would fire only if a
-  prior stage was un-applied, and an apply consumes the
-  slot before issuing the FW command. The unknown is FW
-  behaviour, not kernel structure. Empirical validation
-  belongs on the multi-host rdma-test-agent rig that
-  already exercises §S6b end-to-end (single-host native
-  bind times out behind the cmd-ring DMA-address issue).
+  validated path.** End-to-end on this rig, twice in a
+  row, vhca_id and MAC preserved both rounds.
+  `mlx5_sriov_disable()` drops the per-VF IOVA domain, so
+  the next `sriov_numvfs=1` allocates a fresh
+  `drift_armed=0` domain. This is exactly the workflow
+  the `mlx5_vfmig_pf_drop_vf_uuids` hook supports, and it
+  is what KS7.3 was designed for.
+* **Multi-LOAD on the same VHCA without a cycle is
+  blocked by the kernel's IOVA replay gate, not by FW.**
+  The first LOAD arms `dom->drift_armed`; any later
+  HOST_PAGE replay on that domain trips the WARN and
+  returns `-EBUSY`. `LOAD_VHCA_STATE` is never issued, so
+  the firmware's behaviour on a "DISABLE_HCA →
+  ENABLE_HCA → second LOAD" sequence remains unknown
+  *and irrelevant* to the in-tree contract: the kernel's
+  position is that re-loading without a cycle would
+  break the deterministic-IOVA invariant (allocations
+  added between SAVE and second LOAD would map to slots
+  the source never declared, and those would alias the
+  replayed source ranges if the replay were allowed to
+  grow `expected_count`), so the gate is correct as
+  written.
 
-If a future consumer needs the un-validated path
-explicitly, the path forward is: (1) extend the
-multi-host rdma-test-agent rig to drive
-`save → bind → unbind → load → bind` against a single
-VHCA without an `sriov_numvfs` cycle, observing
-`LOAD_VHCA_STATE` syndrome in dmesg and post-second-LOAD
-data-plane integrity; (2) if FW accepts it cleanly, the
-existing kernel path already permits it -- no further
-kernel surface change required. If FW rejects it, that
-becomes a structural cap to surface to the orchestrator,
-not a gate to add kernel-side.
+If a future consumer needs to LOAD twice without a
+cycle, the kernel-side change required is *not* lifting
+the install gate or the stage gate -- it is a redesign of
+the IOVA registry to support a "discard-and-reseed"
+operation that retires the first LOAD's drift expectations
+before accepting the second. Today's invariant is
+intentional and the gate's WARN is the right shape: it
+fires once in dmesg per offending sequence, fails the
+ioctl cleanly, and leaves the first-LOAD'd VHCA
+intact (validated above by clean recovery via
+`sriov_numvfs=0` cycle).
 
 Cross-host migration is unaffected: source host's slot
 keeps its UUID until source teardown; destination host's

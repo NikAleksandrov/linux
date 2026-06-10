@@ -1416,15 +1416,19 @@ struct mlx5_vfmig_probe_mr_destroy {
  *   fine and don't require any teardown.
  *
  *   What this UAPI does NOT promise: a "wipe a bound VHCA's
- *   state and accept a fresh LOAD_VHCA_STATE" primitive. The
- *   kernel does not structurally block such a multi-LOAD path,
- *   but firmware behaviour across DISABLE_HCA + ENABLE_HCA on
- *   the same VHCA without an sriov_numvfs cycle is unproven
- *   and not exercised by any in-tree consumer (see
+ *   state and accept a fresh LOAD_VHCA_STATE" primitive. A
+ *   second LOAD_VHCA_STATE on the same VHCA without an
+ *   sriov_numvfs cycle is structurally blocked by the IOVA
+ *   replay layer -- the first LOAD's parser arms drift
+ *   detection on the per-VF IOVA domain, and any later
+ *   HOST_PAGE replay trips WARN_ON_ONCE(dom->drift_armed) and
+ *   returns -EBUSY, surfaced as -EINVAL on the second
+ *   MLX5_VFMIG_IOC_LOAD_VHCA_STATE write(). The cycle path
+ *   (sriov_numvfs=0 -> sriov_numvfs=N -> SET_VF_UUID -> LOAD)
+ *   is the validated route and is what the orchestrator
+ *   workflow KS7.3 was designed for; see
  *   tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
- *   §3.5.5.1 for the gate-by-gate empirical / structural
- *   table). If a future consumer needs that path validated,
- *   the open work item is firmware-side, not on this UAPI.
+ *   §3.5.5.1 for the gate-by-gate empirical table.
  *
  *   Authorization is the cdev FD, same as the rest of the
  *   /dev/mlx5_vfmig cdev family.
