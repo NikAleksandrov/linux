@@ -333,7 +333,7 @@ in the dump/restore plugin (see §3.5.3).
 |---|---|---|---|---|
 | KS7.1 | **VF loaded/unloaded indicator surfaced via `MLX5_VFMIG_IOC_QUERY_VF`** (ioctl 0x03 on the PF cdev). The existing `restored` field is set by `MLX5_VFMIG_IOC_MARK_RESTORED` during the destination LOAD lifecycle. The CRIU plugin's `init()` and the prerestore binary read `restored` from QUERY_VF to decide whether to drive `LOAD_VHCA_STATE` themselves. PF cdev is the right surface: it exists whenever the PF is up, doesn't depend on VF probe state, and iterates VFs via `0..num_vfs-1`. The same QUERY_VF call also returns the per-VF UUID added by KS7.3, so identity matching and load-state checking happen in a single roundtrip. | §3.1-§3.4 | LANDED (existing field; no new kernel work) | -- |
 | KS7.2 | ~~**`MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl** (§S6b "Alternative C" backstop). Landed in `b70b6624084a` with CLI wrapper in `1bbe576bc7c5`.~~ **REVERTED 2026-06-06** in `0a05d29edb2f` / `6055711aae44` / `5786cb303142`: post-RTR primary-AV refresh is not supported on mlx5 + CX-7 28.x. The §S6b problem this ioctl was meant to address turned out to be addressable orchestrator-side (KS7.4); see `qp_av_dmac_swap.md` STATUS banner for the resolution and Appendix A §12 of that doc for the FW post-mortem. | §4 (historical) | REVERTED | -- |
-| KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl 0x12 on the PF cdev (called by the **orchestrator** when provisioning the VF; CRIU never calls it), plus a 16-byte `vf_uuid` field appended to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps via the `_IOWR` `sizeof` encoding; same ABI pattern as the earlier QUERY_QP grow). Storage is `uuid_t vf_uuid` on the per-VF context (`mlx5_vf_context.vf_uuid`), using the kernel's standard `<linux/uuid.h>` helpers (`uuid_is_null` / `uuid_equal` / `uuid_copy` / `import_uuid` / `export_uuid`); the value is cleared on SR-IOV teardown so a recycled slot starts fresh. CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. **LANDED 2026-06-08** with kernel-matrix C probe (`uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig`) and lifecycle / multi-VF shell harness (`uobject_restore/vf_uuid/test_vf_uuid_lifecycle.sh`). | §3.5 | LANDED | tiny |
+| KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl 0x12 on the PF cdev (called by the **orchestrator** when provisioning the VF; CRIU never calls it), plus a 16-byte `vf_uuid` field appended to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps via the `_IOWR` `sizeof` encoding; same ABI pattern as the earlier QUERY_QP grow). Storage is `uuid_t vf_uuid` on the per-VF context (`mlx5_vf_context.vf_uuid`), using the kernel's standard `<linux/uuid.h>` helpers (`uuid_is_null` / `uuid_equal` / `uuid_copy` / `import_uuid` / `export_uuid`); the value is cleared on SR-IOV teardown so a recycled slot starts fresh. CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. The orchestrator-side contract on top of this surface (§3.5.3) requires that the destination VF be stamped on the **same `vf_id` slot** as the source -- this is hard-enforced by CRIU restore via a paired `(vf_uuid, vf_id)` match because the kernel's per-VF IOVA window is `vf_id`-keyed and the FW E-Switch `vport_num` is `vf_id+1`-keyed (§3.5.3.1). **LANDED 2026-06-08** with kernel-matrix C probe (`uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig`) and lifecycle / multi-VF shell harness (`uobject_restore/vf_uuid/test_vf_uuid_lifecycle.sh`). | §3.5 | LANDED | tiny |
 | KS7.4 | **Per-VF identity migration on the destination, pre-LOAD_VHCA_STATE** (§S6b resolution). Orchestrator (or whatever provisioning tool drives the VF on the destination) sets `ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>`, `ip addr add <source-time-peer-vf-ip>`, and `ip neigh replace <source-time-local-ip> lladdr <source-time-local-vf-mac>` to mirror the source's per-VF identity. With those steps in place, the source-baked `path.rmac_*` in the saved QPC matches the actual peer's VF MAC at t=0 and `LOAD_VHCA_STATE` installs a QPC that's already correct. Empirically confirmed 2026-06-08 on `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`. **No kernel surface required** -- existing `ip link set vf mac` / `ip addr` / `ip neigh` UAPIs are sufficient. Spec lives in §4.6. | §4.6 | RESOLVED orchestrator-side; no kernel work | -- |
 
 The earlier draft of this doc proposed a new sysfs node at
@@ -427,11 +427,17 @@ The prerestore binary's flow on the destination host
 
 ```
 1. open dump image, parse plugin blob, build list of
-   (vf_uuid, blob_path, blob_size) entries.
+   (vf_uuid, vf_id, blob_path, blob_size) entries.
 2. for each entry:
      scan /dev/mlx5_vfmig/* for a VF whose
      QUERY_VF.vf_uuid == entry.vf_uuid;
-     if no match -> refuse with clear error.
+     if no match           -> refuse with clear error
+                              ("no VF with uuid X found ...");
+     if match.vf_id != entry.vf_id
+                            -> refuse with distinct error
+                              ("found UUID X on vf_id=Z but
+                                image dumped from vf_id=Y;
+                                see §3.5.3.1");
 3. for each matched (PF, vf_id):
      run the destination LOAD lifecycle steps 5-7:
        ioctl(MLX5_VFMIG_IOC_LOAD_VHCA_STATE, vf_id)
@@ -448,9 +454,14 @@ The CRIU plugin's `init()` flow at restore time:
 1. for each entry in dump's vfmig list:
      scan /dev/mlx5_vfmig/* PFs for a VF whose
      QUERY_VF.vf_uuid == entry.vf_uuid;
-     if no match -> refuse with clear error
-       ("orchestrator must provision destination VF with
-        matching uuid before running restore");
+     if no match           -> refuse with clear error
+                              ("orchestrator must provision
+                               destination VF with matching
+                               uuid before running restore");
+     if match.vf_id != entry.vf_id
+                            -> refuse with distinct error
+                              ("orchestrator stamped UUID on
+                               wrong slot; see §3.5.3.1");
      (matched_pf, matched_vf_id) = match.
 
 2. for each matched (matched_pf, matched_vf_id):
@@ -470,7 +481,8 @@ The CRIU plugin's `init()` flow at restore time:
 
 Both flows do **only reads** of `vf_uuid`. Neither calls
 `SET_VF_UUID`. The orchestrator owns the UUID; CRIU finds the
-VF by it.
+VF by `(vf_uuid, vf_id)` and refuses if either half of the
+pair disagrees with the image.
 
 The `restored` bit and `vf_uuid` are returned in the same
 QUERY_VF roundtrip (KS7.1 + KS7.3 share the surface), so the
@@ -668,9 +680,14 @@ right division of labour: the orchestrator owns the workload
     that the orchestrator commits to as a stable identity
     works.
   - The same logical workload gets the same UUID stamped on
-    both the source VF and the destination VF, even if the
-    two have different `vf_id` slots / different PFs / live
-    on different hosts.
+    both the source VF and the destination VF.
+  - **The destination VF's `vf_id` MUST equal the source
+    VF's `vf_id`** (see §3.5.3.1 for the rationale). The
+    orchestrator may pick any PF on the destination host;
+    cross-PF migration is fine. But the per-PF `vf_id` slot
+    must match end-to-end. So the contract is "same
+    `vf_id`, any PF, any host", not the looser "same UUID,
+    any slot, any PF, any host".
 
 * **CRIU dump path** (passive read):
   - At dump time, `vfmig_capture_one_vf` calls
@@ -682,33 +699,103 @@ right division of labour: the orchestrator owns the workload
     restore.
   - The plugin image stores `vf_uuid` per-VF entry alongside
     the SAVE blob path, blob size, and (diagnostic) source
-    `vhca_id`.
+    `vhca_id`. The image also records `vf_id` (it always
+    has, as a diagnostic field); under this contract that
+    `vf_id` is also part of the identity check on restore.
 
-* **CRIU restore path** (passive read + match):
+* **CRIU restore path** (passive read + paired match):
   - Plugin `init()` (and the prerestore binary) iterate
     eligible PFs (anything under `/dev/mlx5_vfmig/`),
     iterate `0..num_vfs-1` on each, call QUERY_VF, look for
     `query.vf_uuid == image.vf_uuid`. First match wins.
+  - **After a UUID match, also verify
+    `query.vf_id == image.vf_id`.** If they disagree --
+    UUID hit but on a different slot than the image was
+    dumped from -- refuse with a *distinct* error pointing
+    at §3.5.3.1: "found UUID X on (pf=..., vf_id=Z) but
+    image was dumped from vf_id=Y; orchestrator must
+    provision matching slot on destination". This is a
+    different failure mode from "no UUID match at all":
+    the operator has stamped the right workload identity,
+    just on the wrong slot, and needs to fix the
+    destination `sriov_numvfs` / `SET_VF_UUID` call. CRIU
+    does NOT silently coerce the LOAD onto the slot the
+    orchestrator picked, because cross-slot LOAD is not
+    supported (see §3.5.3.1).
   - **No write surface from CRIU.** Neither `init()` nor
-    the prerestore binary calls `SET_VF_UUID`. If no match
-    is found, refuse with a clear error: "no VF with uuid X
-    found on any vfmig-eligible PF; ensure the orchestrator
-    has provisioned the destination VF with the matching
-    UUID before running restore".
-  - The restore-side identity check is *only* this UUID
-    match. There is no fallback to vf_id-based identity, no
-    monolithic "if no UUID match, run LOAD on dump's
-    recorded source vf_id" path. That fallback would
-    re-introduce the orchestrator-skipping-the-stamp bug
-    we're trying to prevent.
+    the prerestore binary calls `SET_VF_UUID`. If no UUID
+    match is found at all, refuse with a clear error: "no
+    VF with uuid X found on any vfmig-eligible PF; ensure
+    the orchestrator has provisioned the destination VF
+    with the matching UUID before running restore".
+  - The restore-side identity check is the
+    `(vf_uuid, vf_id)` pair-match described above. There
+    is no fallback to UUID-only matching, no "if image.
+    vf_id != dest.vf_id, coerce" path. That fallback would
+    re-introduce the cross-slot LOAD failure mode §3.5.3.1
+    explicitly avoids.
 
-The match is by exact 16-byte compare. With the orchestrator
-controlling allocation, exotic cases like "two VFs with the
-same UUID on the same host" are an orchestrator bug, not a
-CRIU concern. The kernel-side `SET_VF_UUID` does NOT enforce
+The match is by exact 16-byte UUID compare plus exact
+`vf_id` agreement. With the orchestrator controlling
+allocation, exotic cases like "two VFs with the same UUID
+on the same host" are an orchestrator bug, not a CRIU
+concern. The kernel-side `SET_VF_UUID` does NOT enforce
 host-wide uniqueness for the same reason -- enforcement
 would require cross-PF coordination the kernel doesn't have
 a good place for. Documented as the orchestrator's invariant.
+
+##### 3.5.3.1 Why same-`vf_id` is required
+
+The kernel computes each VF's per-VF IOVA window
+deterministically from `vf_id` (see
+`drivers/.../mlx5/core/vfmig_iova.c:vfmig_iova_domain_create`):
+
+```c
+base = VFMIG_IOVA_BASE + (u64)vf_id * VFMIG_IOVA_PER_VF;
+```
+
+`VFMIG_IOVA_BASE` and `VFMIG_IOVA_PER_VF` are kernel
+compile-time constants; `vf_id` is the only variable. The
+slot grid (8 deterministic slots, plus the kcoherent and
+transient sub-arenas) is byte-identical across hosts for a
+given `vf_id`, which is what makes the saved IOVA replay
+log portable: the destination computes the same `iova_slot`
+from the same IOVA, and the cross-check at
+`vfmig_iova_install_replay` (`vfmig_iova.c:1378` ish, the
+"wire claims slot N for IOVA X but destination partitioning
+maps it to slot M" warn) just passes. If the destination's
+`vf_id` differs, every replayed record's claimed slot
+disagrees with the destination's slot grid and `LOAD` aborts
+with the slot-mismatch warn. We confirmed this empirically
+on 2026-06-10: a deliberate cross-slot smoke (source
+`vf_id=0`, destination `vf_id=1`, same UUID) fails at
+`write(load_fd) -> -EINVAL` with the expected dmesg.
+
+The IOVA layer is not the only `vf_id`-keyed dependency.
+The FW E-Switch maps each VF to a `vport_num` (typically
+`vf_id + 1`), and the FW's saved QPC / FDB / etc. references
+that `vport_num` internally. Same-`vf_id` ⇒ same-`vport_num`
+⇒ FW state references stay valid post-LOAD without rewrites.
+A general cross-slot LOAD would also need vport rewriting,
+which is materially harder and deeper than just relaxing
+the IOVA cross-check; we deliberately don't pursue it.
+
+The same-`vf_id` constraint is therefore not a workaround
+for a kernel bug; it's the natural shape of the kernel/FW
+model. The orchestrator already owns where each workload's
+VF lives, so "pick a destination slot that matches the
+source slot" is within its existing responsibility scope.
+
+Forward-look: if a future kernel + FW pair ever grows
+cross-slot LOAD support (relaxed IOVA-replay slot grid +
+vport rewriting + post-LOAD audit), this constraint can
+be relaxed CRIU-side by dropping the `vf_id` equality
+check. As of v0 it's a hard contract, hard-refuse. We
+considered an explicit kernel ask for cross-slot LOAD
+(provisional name "KS7.5") and decided against it: the
+orchestrator-side same-slot constraint is cheap and
+clean, the kernel work is large, and we have no
+production motivation to spend that complexity yet.
 
 #### 3.5.4 Kernel-side surface (the actual ask)
 
@@ -1400,10 +1487,13 @@ for each vf_image in dump.vfs:
     /* Phase A: locate the destination VF by matching vf_uuid.
      * The orchestrator stamped vf_image.uuid on exactly one
      * destination VF as part of provisioning (KS7.3 §3.5.3).
-     * We don't know which PF / vf_id the orchestrator picked
-     * -- could be different from the source -- so we scan all
-     * eligible PFs. The dump's recorded source PF BDF is just
-     * a hint we try first to keep the common case fast. */
+     * The orchestrator may have picked a different PF on the
+     * destination, so we scan all eligible PFs; the dump's
+     * recorded source PF BDF is just a hint we try first to
+     * keep the common case fast. The destination's vf_id
+     * MUST equal vf_image.vf_id (§3.5.3.1); we check that
+     * after the UUID hit and refuse with a distinct error
+     * if it doesn't agree. */
     matched_pf = NULL; matched_vf_id = -1; matched_q = {};
     for pf_bdf in [vf_image.source_pf_bdf] + other_eligible_pfs:
         int fd = open("/dev/mlx5_vfmig/" + pf_bdf, O_RDWR);
@@ -1430,6 +1520,21 @@ for each vf_image in dump.vfs:
                      "SET_VF_UUID on destination VF before restore",
                      uuid_str(vf_image.uuid));
 
+    if matched_vf_id != vf_image.vf_id:
+        /* Hard refuse, distinct error: orchestrator stamped the
+         * right UUID but on the wrong slot. Cross-slot LOAD is
+         * not supported (§3.5.3.1: vfmig_iova partitions per
+         * vf_id; vport_num is vf_id+1; LOAD's IOVA replay
+         * cross-check fails on slot mismatch). The operator
+         * needs to fix sriov_numvfs / SET_VF_UUID on the
+         * destination so the matching slot carries the UUID. */
+        return error("vfmig: found UUID %s on (pf=%s, vf_id=%u) "
+                     "but image was dumped from vf_id=%u; "
+                     "orchestrator must provision matching slot "
+                     "on destination (see §3.5.3.1)",
+                     uuid_str(vf_image.uuid), matched_pf,
+                     matched_vf_id, vf_image.vf_id);
+
     /* Phase B: was the prerestore binary run for this VF? */
     if matched_q.restored == 1:
         /* Yes -- skip LOAD, plugin proceeds to uobject restore. */
@@ -1447,20 +1552,26 @@ for each vf_image in dump.vfs:
      * (matched_pf, matched_vf_id). */
 ```
 
-The flow has exactly one identity check (UUID match) and one
-state check (`restored`), both pulled from the same QUERY_VF
-roundtrip:
+The flow has one paired identity check
+(`(vf_uuid, vf_id)` match) and one state check
+(`restored`), all pulled from the same QUERY_VF roundtrip:
 
-* `q.vf_uuid == vf_image.uuid` -- this is the right VF (the
-  one the orchestrator earmarked for this dump).
+* `q.vf_uuid == vf_image.uuid` AND `q.vf_id ==
+  vf_image.vf_id` -- this is the right VF on the right
+  slot (the one the orchestrator earmarked for this dump,
+  on the slot the kernel/FW model requires; see
+  §3.5.3.1).
 * `q.restored == 1` (or 0, branching to monolithic) -- has
   the prerestore binary already driven LOAD?
 
-If no PF/vf_id has the matching UUID, restore refuses --
-there is no fallback to dump-recorded `vf_id`, since the
-orchestrator may have moved the workload to a different
-slot or PF. CRIU never picks a destination VF on its own;
-the orchestrator owns that decision via the UUID stamp.
+If no PF has the matching UUID at all, or the matching UUID
+landed on the wrong slot, restore refuses with separate,
+distinct error messages so the operator can tell which half
+of the contract was violated. There is no fallback to
+UUID-only matching nor to dump-recorded `vf_id` coercion:
+the orchestrator owns the destination slot decision via
+both `sriov_numvfs` provisioning and the `SET_VF_UUID`
+call, and CRIU never picks a destination VF on its own.
 
 A VF whose UUID doesn't match any dump in the current
 restore session is left alone -- it belongs to some other
@@ -1598,6 +1709,21 @@ Same outcome as above -- plugin's UUID-match scan finds no
 hit, refuses. Orchestrator-side mistake; orchestrator-side
 fix.
 
+**Orchestrator stamps the right UUID on the wrong `vf_id`
+slot:** Plugin's `init()` walk finds the UUID hit but on a
+slot that disagrees with `image.vf_id`. Hard refuse with a
+*distinct* error: "found UUID X on (pf=..., vf_id=Z) but
+image was dumped from vf_id=Y; orchestrator must provision
+matching slot on destination (see §3.5.3.1)". The
+distinct-error rule matters because the operator's recovery
+is different: they have stamped the right workload identity
+but on the wrong slot, so the fix is "tear down the
+destination's `sriov_numvfs`, re-provision so the matching
+`vf_id` slot exists, re-stamp the UUID there", not "find
+which workload is missing its UUID stamp". CRIU does not
+silently coerce LOAD onto the orchestrator's chosen slot
+because cross-slot LOAD isn't supported (§3.5.3.1).
+
 **Orchestrator stamps the same UUID on two different VFs
 (orchestrator bug):** Plugin's `init()` walk finds the first
 match and uses it; the duplicate is silently ignored. This is
@@ -1605,6 +1731,14 @@ an orchestrator-side invariant violation -- the kernel's
 `SET_VF_UUID` doesn't enforce host-wide uniqueness because
 that requires cross-PF coordination the kernel has no good
 hook for. Documented as the orchestrator's responsibility.
+Note that under the `(vf_uuid, vf_id)` paired-match
+contract, "two VFs with the same UUID on the same host"
+becomes meaningfully harder to hit by accident -- the
+orchestrator would have to stamp the UUID *twice on
+matching `vf_id` slots across two different PFs* for the
+first-match-wins behaviour to be observable; stamping
+twice on different slots is detected as a slot-mismatch
+refuse on whichever PF the resolver hits first.
 
 **Operator runs criu restore expecting prerestore but it
 didn't run:** UUID match found (orchestrator did its
@@ -1917,14 +2051,51 @@ same hard error. No fallback to vf0's slot just because it's
 "available" -- CRIU does not pick destination VFs on its
 own.
 
-### 9.7 Same UUID stamped twice (orchestrator bug)
+### 9.7 Mismatch detection -- orchestrator stamped UUID on wrong slot
+
+Provision two SR-IOV VFs on the destination (sriov_numvfs=2),
+both `set_tracked=1`. The source dump was captured from
+`vf_id=0`. The orchestrator (incorrectly) stamps the matching
+`vf_uuid` onto `vf_id=1` instead, leaving `vf_id=0` with
+`vf_uuid=all-zeros`. Plugin's `init()` walk finds the UUID
+match on `vf_id=1` but `image.vf_id == 0`, so it refuses with
+a *distinct* error (separate from §9.5 / §9.6): "found UUID
+X on (pf=..., vf_id=1) but image was dumped from vf_id=0;
+orchestrator must provision matching slot on destination
+(see §3.5.3.1)". No fallback: cross-slot LOAD is not
+supported and CRIU does not silently coerce LOAD onto the
+orchestrator's chosen slot. The remediation is operator-side:
+re-provision so `vf_id=0` exists on the destination and stamp
+the UUID there.
+
+This scenario is also useful as a positive test for the
+"more than coincidence" UUID resolver -- swap the two
+stamps, so `vf_id=0` carries the matching UUID and `vf_id=1`
+carries a different (or zero) UUID. The resolver must skip
+past `vf_id=1` and bind to `vf_id=0`. With sriov_numvfs=1
+on both ends, the trivial degenerate case can't distinguish
+"resolver matched by UUID" from "resolver coincidentally
+picked vf_id=0 because it's the only slot".
+
+### 9.8 Same UUID stamped twice (orchestrator bug)
 
 Provision two SR-IOV VFs and stamp the SAME `vf_uuid` on
 both via `SET_VF_UUID` (orchestrator-side mistake). The
 kernel-side ioctl does NOT enforce host-wide uniqueness so
-both stamps succeed. Plugin's init() finds the first match
-and uses it; the duplicate is silently ignored. Failure
-mode: harmless but wasteful; documented as the
+both stamps succeed. Plugin's `init()` finds the first match
+and uses it; the duplicate is silently ignored.
+
+Note that under the `(vf_uuid, vf_id)` paired-match
+contract this case is meaningfully harder to hit by accident
+than the pure UUID-only design implied: the orchestrator
+would have to stamp the UUID twice on slots that *both*
+match the image's `vf_id` (i.e. across two PFs, on the
+same `vf_id` slot of each). Stamping twice on different
+slots within the same PF surfaces as §9.7 (slot mismatch)
+on whichever PF the resolver hits first, not as silent
+duplication.
+
+Failure mode: harmless but wasteful; documented as the
 orchestrator's invariant.
 
 ## 10. YAML harness changes
@@ -1943,12 +2114,17 @@ destination.
   `vf_id`, `vf_uuid`. The harness generates the UUID once at
   test setup and uses the same value on both source and
   destination so the dump captures it and the restore looks
-  it up.
+  it up. Per §3.5.3.1 the same `vf_id` value must be used on
+  both sides; the YAML keeps them as separate keys (rather
+  than collapsing to one shared field) so future tests can
+  *deliberately* mismatch them to exercise the slot-mismatch
+  refuse path (§9.7) without hand-rolling the YAML.
 * **`restore_vf` (new)**: invokes `mlx5_vfmig_restore_vf`.
   Takes `host`, `image_dir`. Asserts exit code 0 and a status
   line that includes the matched `(pf_bdf, vf_id)` tuple.
   No `vf_id` parameter: the binary discovers the matching VF
-  by `vf_uuid`.
+  by `vf_uuid`, then verifies its slot agrees with the
+  image's `vf_id` and refuses if not.
 * ~~**`refresh_av_dmac` (new)**: invokes the
   `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl via the CLI verb
   added to `tools/testing/mlx5_vfmig/tools/mlx5_vfmig.c` in
@@ -2112,6 +2288,28 @@ review items.
    kernel: should it be a separate plugin entry point, or
    internal to `apply_load_vhca_state()`? CRIU-side call this
    when the plugin work begins.
+
+5a. ~~**Cross-slot LOAD support
+   ("KS7.5").**~~ **Resolved 2026-06-10: not pursued.**
+   2026-06-10 cross-slot smoke (source `vf_id=0`, destination
+   `vf_id=1`, matching UUID) failed at `LOAD_VHCA_STATE` with
+   the kernel's `vfmig_iova` slot-grid cross-check
+   ("`vfmig_iova: vf 1 replay: wire claims slot N for IOVA X
+   but destination partitioning maps it to slot M`"). The
+   underlying cause is two `vf_id`-keyed FW invariants: the
+   per-VF IOVA window (`base = VFMIG_IOVA_BASE + vf_id *
+   VFMIG_IOVA_PER_VF`) and the FW E-Switch `vport_num`
+   (typically `vf_id + 1`, embedded in saved QPCs / FDB).
+   Relaxing the IOVA cross-check alone wouldn't be enough --
+   the FW state would still reference the old `vport_num`.
+   We considered an explicit kernel ask for cross-slot LOAD
+   (relaxed IOVA replay grid + vport rewriting + LOAD-time
+   audit) and rejected it: the orchestrator-side same-`vf_id`
+   constraint is cheap (the orchestrator already owns
+   provisioning), the kernel work would be large, and we
+   have no production motivation today. Recorded as a hard
+   contract in §3.5.3 + §3.5.3.1 + §9.7. Reopen this when a
+   real workload needs cross-slot.
 
 6. **KS7.3: relationship to `SET_TRACKED`.** Should
    `SET_VF_UUID` be a separate ioctl (as proposed in §3.5.4)
