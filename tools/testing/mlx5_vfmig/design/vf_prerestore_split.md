@@ -331,7 +331,7 @@ in the dump/restore plugin (see §3.5.3).
 
 | # | ask | where | status | size |
 |---|---|---|---|---|
-| KS7.1 | **VF loaded/unloaded indicator surfaced via `MLX5_VFMIG_IOC_QUERY_VF`** (ioctl 0x03 on the PF cdev). The existing `restored` field is set by `MLX5_VFMIG_IOC_MARK_RESTORED` during the destination LOAD lifecycle. The CRIU plugin's `init()` and the prerestore binary read `restored` from QUERY_VF to decide whether to drive `LOAD_VHCA_STATE` themselves. PF cdev is the right surface: it exists whenever the PF is up, doesn't depend on VF probe state, and iterates VFs via `0..num_vfs-1`. The same QUERY_VF call also returns the per-VF UUID added by KS7.3, so identity matching and load-state checking happen in a single roundtrip. | §3.1-§3.4 | LANDED (existing field; no new kernel work) | -- |
+| KS7.1 | **VF loaded/unloaded indicator surfaced via `MLX5_VFMIG_IOC_QUERY_VF`** (ioctl 0x03 on the PF cdev). The existing `restored` field is set by `MLX5_VFMIG_IOC_MARK_RESTORED` during the destination LOAD lifecycle. **2026-06-10 update:** the bit is **transient** -- it's consumed by `mlx5_vfmig_vf_consume_restored()` at VF probe time (i.e. inside the `bind` write), so a post-bind QUERY_VF reads `restored=0` regardless of whether `MARK_RESTORED` was just issued. The CRIU plugin's `init()` always runs post-bind, so it cannot use this bit; it instead checks `/sys/bus/pci/devices/<vf_bdf>/driver` symlink existence as the soft-fallback signal under the orchestrator contract "destination VF is bound only by prerestore (or by the plugin itself)". The prerestore binary -- when it lands -- can still consume `restored` legitimately because it queries QUERY_VF **before** driving the bind. PF cdev is still the right identity surface: KS7.3's `vf_uuid` lives there, so identity matching is a single-ioctl roundtrip per VF iterated. The bind-state check is a separate sysfs `lstat()` per matched VF. | §3 (implementation note) + §6.3 | LANDED (existing field; no new kernel work). Plugin uses sysfs bind-check, not the bit. | -- |
 | KS7.2 | ~~**`MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl** (§S6b "Alternative C" backstop). Landed in `b70b6624084a` with CLI wrapper in `1bbe576bc7c5`.~~ **REVERTED 2026-06-06** in `0a05d29edb2f` / `6055711aae44` / `5786cb303142`: post-RTR primary-AV refresh is not supported on mlx5 + CX-7 28.x. The §S6b problem this ioctl was meant to address turned out to be addressable orchestrator-side (KS7.4); see `qp_av_dmac_swap.md` STATUS banner for the resolution and Appendix A §12 of that doc for the FW post-mortem. | §4 (historical) | REVERTED | -- |
 | KS7.3 | **Orchestrator-owned per-VF UUID.** New `MLX5_VFMIG_IOC_SET_VF_UUID` write ioctl 0x12 on the PF cdev (called by the **orchestrator** when provisioning the VF; CRIU never calls it), plus a 16-byte `vf_uuid` field appended to the existing `MLX5_VFMIG_IOC_QUERY_VF` return struct (struct grows; ioctl number bumps via the `_IOWR` `sizeof` encoding; same ABI pattern as the earlier QUERY_QP grow). Storage is `uuid_t vf_uuid` on the per-VF context (`mlx5_vf_context.vf_uuid`), using the kernel's standard `<linux/uuid.h>` helpers (`uuid_is_null` / `uuid_equal` / `uuid_copy` / `import_uuid` / `export_uuid`); the value is cleared on SR-IOV teardown so a recycled slot starts fresh. CRIU dump reads `vf_uuid` via QUERY_VF and stores it in the plugin image; CRIU restore iterates VFs across eligible PFs to find the match. Required because `vhca_id` is not stable across SAVE/LOAD (§3.5) and the orchestrator's only collision detection today is a 60-second IOMMU-cmd-ring timeout. The orchestrator-side contract on top of this surface (§3.5.3) requires that the destination VF be stamped on the **same `vf_id` slot** as the source -- this is hard-enforced by CRIU restore via a paired `(vf_uuid, vf_id)` match because the kernel's per-VF IOVA window is `vf_id`-keyed and the FW E-Switch `vport_num` is `vf_id+1`-keyed (§3.5.3.1). **LANDED 2026-06-08** with kernel-matrix C probe (`uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig`) and lifecycle / multi-VF shell harness (`uobject_restore/vf_uuid/test_vf_uuid_lifecycle.sh`). | §3.5 | LANDED | tiny |
 | KS7.4 | **Per-VF identity migration on the destination, pre-LOAD_VHCA_STATE** (§S6b resolution). Orchestrator (or whatever provisioning tool drives the VF on the destination) sets `ip link set <PF> vf <VF_ID> mac <source-time-peer-vf-mac>`, `ip addr add <source-time-peer-vf-ip>`, and `ip neigh replace <source-time-local-ip> lladdr <source-time-local-vf-mac>` to mirror the source's per-VF identity. With those steps in place, the source-baked `path.rmac_*` in the saved QPC matches the actual peer's VF MAC at t=0 and `LOAD_VHCA_STATE` installs a QPC that's already correct. Empirically confirmed 2026-06-08 on `rdma_test_agent_vfmig_criu_swap_after_qp.yaml`. **No kernel surface required** -- existing `ip link set vf mac` / `ip addr` / `ip neigh` UAPIs are sufficient. Spec lives in §4.6. | §4.6 | RESOLVED orchestrator-side; no kernel work | -- |
@@ -369,6 +369,49 @@ harness changes (§10).
 No new kernel work. The CRIU plugin and the prerestore binary
 both consume the existing per-VF `restored` bit from
 `MLX5_VFMIG_IOC_QUERY_VF` (ioctl `0x03` on the PF cdev).
+
+> **Implementation note (2026-06-10): `restored` is transient,
+> consumed at probe time.** The kernel's per-VF
+> `sriov->vfs_ctx[vf_id].restored` is cleared by
+> `mlx5_vfmig_vf_consume_restored()` as soon as `mlx5_load_one()`
+> runs against the bound VF -- which happens immediately after the
+> prerestore (or plugin-monolithic) `driver_override + bind` step
+> in §3.1 step 7. Any `MLX5_VFMIG_IOC_QUERY_VF` issued **after**
+> the VF has been bound therefore reads `restored == 0`,
+> regardless of whether `MARK_RESTORED` was just issued moments
+> earlier. The bit's job is to drive the kernel-side post-LOAD
+> probe quirks (FW page recovery, replay accounting); it is not a
+> stable post-bind userspace signal.
+>
+> The CRIU plugin's `init()` always runs **after** the destination
+> VF is bound (either prerestore drove the bind, or the plugin's
+> own monolithic path drove it earlier in the same `init()`
+> invocation), so `QUERY_VF.restored` cannot serve as the
+> soft-fallback signal there. The plugin instead uses a
+> **`/sys/bus/pci/devices/<vf_bdf>/driver` symlink check** to
+> distinguish prerestore-bound from unbound. The orchestrator
+> contract "destination VF is bound **only** via prerestore (or
+> via the plugin itself)" is what makes the bind-state signal a
+> sufficient discriminator -- a destination VF that's bound when
+> the plugin's `init()` runs ⇒ prerestore drove the bind. See
+> `vfmig_is_vf_bound()` in `criu/plugins/rdma/mlx5_sriov_vfmig/
+> vfmig_restore.c` for the implementation.
+>
+> The prerestore binary -- when it lands -- still has a legitimate
+> use for the `restored` bit: it queries QUERY_VF **before**
+> driving step 7 (the bind), so it sees `restored == 0` if no LOAD
+> has been staged yet, or `restored == 1` if a previous prerestore
+> attempt staged a LOAD but the bind never ran. That's outside the
+> scope of the post-bind soft-fallback decision.
+>
+> Read: §3.1 step-7 documents `restored=1 ... persisting through
+> step 7 and beyond` -- that text is correct **on the kernel cdev
+> level until** the probe path runs `consume_restored`. In
+> practice the probe runs synchronously inside the `bind` write,
+> so for any post-bind userspace reader the bit is gone. The
+> `loaded/unloaded` model in §3 is still the correct mental model
+> -- we just learn the binary "is this VF loaded?" answer from
+> sysfs rather than from QUERY_VF.
 
 ### 3.1 The existing surface
 
@@ -465,16 +508,23 @@ The CRIU plugin's `init()` flow at restore time:
      (matched_pf, matched_vf_id) = match.
 
 2. for each matched (matched_pf, matched_vf_id):
-     query = QUERY_VF(matched_pf, matched_vf_id);
-     if query.restored == 1:
-         /* prerestore binary already drove LOAD; skip. */
+     vf_bdf = readlink("/sys/bus/pci/devices/<matched_pf>/virtfn<matched_vf_id>");
+     /*
+      * Soft-fallback signal: is the destination VF bound to a
+      * driver? See §3 implementation note -- QUERY_VF.restored
+      * is transient (consumed at probe), so we use the sysfs
+      * driver-symlink check instead.
+      */
+     if exists("/sys/bus/pci/devices/<vf_bdf>/driver"):
+         /* prerestore binary already drove LOAD + bind; skip. */
          log_prerestore_detected(entry, matched_pf, matched_vf_id);
      else:
          /* monolithic fallback: orchestrator stamped UUID but
-          * nobody ran prerestore. Drive LOAD inline against
+          * nobody ran prerestore. Drive LOAD + bind inline against
           * the matched VF. */
          log_prerestore_not_run(entry, matched_pf, matched_vf_id);
          apply_load_vhca_state(matched_pf, matched_vf_id, entry);
+         driver_override_and_bind(vf_bdf);
 
 3. proceed to PD/CQ/MR/QP restore against the matched VF tuple.
 ```
@@ -484,9 +534,11 @@ Both flows do **only reads** of `vf_uuid`. Neither calls
 VF by `(vf_uuid, vf_id)` and refuses if either half of the
 pair disagrees with the image.
 
-The `restored` bit and `vf_uuid` are returned in the same
-QUERY_VF roundtrip (KS7.1 + KS7.3 share the surface), so the
-match-and-decide step is a single ioctl per VF iterated.
+The `vf_uuid` and `vhca_id` are returned in the same QUERY_VF
+roundtrip (KS7.3 lives on the surface), so the match step is a
+single ioctl per VF iterated; the prerestore-vs-monolithic
+decision is then a sysfs `lstat()` per matched VF (see §3
+implementation note for why we don't use QUERY_VF.restored).
 
 The cross-PF iteration is the user's "check all UUIDs on all
 relevant PFs for a match" pattern -- it lets the orchestrator
@@ -1535,34 +1587,56 @@ for each vf_image in dump.vfs:
                      uuid_str(vf_image.uuid), matched_pf,
                      matched_vf_id, vf_image.vf_id);
 
-    /* Phase B: was the prerestore binary run for this VF? */
-    if matched_q.restored == 1:
-        /* Yes -- skip LOAD, plugin proceeds to uobject restore. */
+    /* Phase B: was the prerestore binary run for this VF?
+     *
+     * Signal: /sys/bus/pci/devices/<vf_bdf>/driver symlink
+     * existence (i.e. is the VF bound to a kernel driver?).
+     * NOT QUERY_VF.restored -- the kernel clears that bit at
+     * VF probe time (mlx5_vfmig_vf_consume_restored), so any
+     * post-bind QUERY_VF reads it as 0 regardless of whether
+     * MARK_RESTORED was just issued. Plugin's init() always
+     * runs post-bind (either prerestore drove the bind, or
+     * the plugin itself drove it earlier in this same init()
+     * invocation -- the monolithic path), so the restored bit
+     * is unusable here. Sysfs bind-state under the
+     * orchestrator contract "destination VF is bound only
+     * via prerestore (or via the plugin itself)" is the
+     * correct discriminator. See §3 implementation note. */
+    char vf_bdf[64];
+    readlink("/sys/bus/pci/devices/" + matched_pf +
+             "/virtfn" + matched_vf_id, vf_bdf);
+    if exists("/sys/bus/pci/devices/" + vf_bdf + "/driver"):
+        /* Yes -- prerestore drove LOAD + bind; plugin proceeds
+         * to uobject restore against the already-bound VF. */
         log_prerestore_detected(vf_image, matched_pf, matched_vf_id);
     else:
         /* No -- monolithic fallback: orchestrator stamped UUID but
-         * nobody ran prerestore. Drive LOAD inline against the
-         * matched VF. apply_load_vhca_state() also issues
+         * nobody ran prerestore. Drive LOAD + bind inline against
+         * the matched VF. apply_load_vhca_state() also issues
          * MARK_RESTORED but does NOT touch vf_uuid -- that's
          * already set by the orchestrator. */
         log_prerestore_not_run(vf_image, matched_pf, matched_vf_id);
         apply_load_vhca_state(matched_pf, matched_vf_id, vf_image);
+        driver_override_and_bind(vf_bdf);
 
     /* PD/CQ/MR/QP restore proceeds against
      * (matched_pf, matched_vf_id). */
 ```
 
 The flow has one paired identity check
-(`(vf_uuid, vf_id)` match) and one state check
-(`restored`), all pulled from the same QUERY_VF roundtrip:
+(`(vf_uuid, vf_id)` match) pulled from a QUERY_VF roundtrip,
+plus one bind-state check pulled from sysfs:
 
 * `q.vf_uuid == vf_image.uuid` AND `q.vf_id ==
   vf_image.vf_id` -- this is the right VF on the right
   slot (the one the orchestrator earmarked for this dump,
   on the slot the kernel/FW model requires; see
   §3.5.3.1).
-* `q.restored == 1` (or 0, branching to monolithic) -- has
-  the prerestore binary already driven LOAD?
+* `lstat("/sys/.../<vf_bdf>/driver")` -- has the prerestore
+  binary already driven LOAD + bind on this VF? (See §3
+  implementation note: we use sysfs bind-state, not
+  QUERY_VF.restored, because the latter is consumed at
+  probe time.)
 
 If no PF has the matching UUID at all, or the matching UUID
 landed on the wrong slot, restore refuses with separate,
