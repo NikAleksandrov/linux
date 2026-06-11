@@ -546,6 +546,46 @@ enum mlx5_ib_vfmig_methods {
 	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.3.4.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_QP,
+	/*
+	 * QUERY_PD: dump-side counterpart to UVERBS_METHOD_RESTORE_PD.
+	 * Same family as QUERY_CQ / QUERY_QP -- emit, for the PD resolved
+	 * through UVERBS_OBJECT_PD on the calling fd's ufile, the bytes a
+	 * CRIU plugin needs to drive RESTORE_PD on the destination side.
+	 *
+	 * This supersedes the earlier NLDEV driver-TLV discovery path
+	 * (mlx5/restrack.c fill_res_pd_entry emitting "fw_pdn"/"fw_uid"
+	 * under RDMA_NLDEV_ATTR_DRIVER), which was the odd one out: every
+	 * other adopted FW resource id (cqn via QUERY_CQ, qpn via
+	 * QUERY_QP) is discovered through a per-handle driver-private
+	 * QUERY method that returns a byte-equal RESP_BLOB. Moving PD onto
+	 * the same plane makes the family uniform and drops the
+	 * CAP_NET_ADMIN / cross-netns NLDEV dependency: CRIU now learns
+	 * the FW pdn on the uverbs fd it already holds for QUERY_CQ/_QP,
+	 * under the per-ucontext "if you can see the ucontext, you can
+	 * read its metadata" boundary.
+	 *
+	 * Two-part output:
+	 *   RESP_BLOB  struct mlx5_ib_restore_pd_req, byte-equal to what
+	 *              RESTORE_PD's UHW consumes (carries the FW pdn;
+	 *              reserved fields left zero so the restore path's
+	 *              "must be 0" checks pass round-trip). CRIU copies it
+	 *              verbatim into the RESTORE_PD UHW tail.
+	 *   RESP_UID   u32, the source PD's mpd->uid. DUMP-SIDE ONLY: this
+	 *              is NOT a restore input (RESTORE_PD sets mpd->uid =
+	 *              context->devx_uid from the adopted ucontext). It is
+	 *              surfaced so the CRIU plugin can confirm the source
+	 *              PD lived under the v0 host-privileged lane (uid == 0)
+	 *              and fail the dump early on a DEVX uid rather than
+	 *              producing an unrestorable image.
+	 *
+	 * Security boundary: the calling fd must own the PD uobject
+	 * referenced by HANDLE -- the IDR lookup against UVERBS_OBJECT_PD
+	 * resolves through ufile->idr, which is per-uverbs-fd. Same model
+	 * as QUERY_CQ / QUERY_QP.
+	 *
+	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.1.4.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_PD,
 };
 
 /*
@@ -648,6 +688,34 @@ enum mlx5_ib_vfmig_query_qp_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
+};
+
+/*
+ * Attrs for MLX5_IB_METHOD_VFMIG_QUERY_PD.
+ *
+ * The HANDLE is resolved via UVERBS_ATTR_IDR(UVERBS_OBJECT_PD,
+ * UVERBS_ACCESS_READ): the calling fd's ufile-idr must own this PD.
+ *
+ *   RESP_BLOB  struct mlx5_ib_restore_pd_req (goes verbatim into the
+ *              RESTORE_PD UHW tail at restore time). Carries the FW
+ *              pdn; the handler leaves req.reserved / req.reserved2
+ *              zero so the restore path's "must be 0" checks pass
+ *              round-trip. The byte-equal contract mirrors QUERY_CQ /
+ *              QUERY_QP -- CRIU plugin code is memcpy in, memcpy out.
+ *
+ *   RESP_UID   u32, the source PD's mpd->uid. Dump-side cross-check
+ *              only (not consumed by RESTORE_PD, which takes uid from
+ *              the adopted ucontext's devx_uid). Lets the plugin fail
+ *              the dump early if the source PD is not under the v0
+ *              host-privileged lane (uid != 0).
+ *
+ * Both outs are MANDATORY: a CRIU plugin that ignores either at dump
+ * time will produce an unrestorable image.
+ */
+enum mlx5_ib_vfmig_query_pd_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB,
+	MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID,
 };
 
 /*

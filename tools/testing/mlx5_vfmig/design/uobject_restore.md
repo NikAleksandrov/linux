@@ -608,8 +608,12 @@ plugin contribution.
 
 * **Discovery**: NLDEV `RES_PD_GET` (CTXN already emitted today). Yields
   hw-agnostic attrs (none beyond access flags, which aren't currently in
-  NLDEV but are recoverable from `ib_pd->flags`); plugin may add FW pdn
-  via `MLX5_IB_METHOD_VFMIG_QUERY_PD(handle)` returning `{fw_pdn}`.
+  NLDEV but are recoverable from `ib_pd->flags`); the plugin adds the FW
+  pdn via the **landed** `MLX5_IB_METHOD_VFMIG_QUERY_PD(handle)`, which
+  returns a `struct mlx5_ib_restore_pd_req` blob (byte-equal to what
+  `RESTORE_PD` consumes) plus the source PD's `uid` as a dump-side
+  cross-check out. See ?5.1.4 for the full rationale, including why this
+  superseded the earlier NLDEV `fw_pdn`/`fw_uid` driver-TLV path.
 * **Kernel verb**: `UVERBS_METHOD_RESTORE_PD(target_handle, alloc_flags,
   blob)`. Calls `ib_dev->ops.restore_pd()`.
 * **Driver-side (mlx5_vfmig)**: allocates a `mlx5_ib_pd`, calls FW
@@ -618,6 +622,112 @@ plugin contribution.
   `target_handle`.
 * **Driver-side (rxe)**: standard `rxe_alloc_pd()` plus install-at-handle.
   No FW state.
+
+#### 5.1.4 PD dump-side discovery: `MLX5_IB_METHOD_VFMIG_QUERY_PD`
+
+CRIU's PD dump phase needs exactly one field the destination's
+`RESTORE_PD` will consume: the FW `pdn` (`mpd->pdn`), so the
+destination ucontext adopts the same FW pdn that LOAD_VHCA_STATE
+preserved. PD is the simplest of the adopted-resource family --
+there is no umem and no source userspace VA, just the FW
+resource id and the owning `uid`.
+
+**Why this is the QUERY family's last member, not an NLDEV TLV**
+
+The first cut of PD discovery emitted `fw_pdn` and `fw_uid` as
+driver-private TLVs nested under `RDMA_NLDEV_ATTR_DRIVER` from a
+`fill_res_pd_entry` hook in `mlx5/restrack.c`. That worked, but
+it made PD the odd one out: every other adopted FW resource id
+in this effort (`cqn` via `MLX5_IB_METHOD_VFMIG_QUERY_CQ`, `qpn`
+via `_QUERY_QP`) is discovered through a per-handle driver-private
+QUERY method that returns a byte-equal `RESP_BLOB`. Two specific
+problems with leaving PD on NLDEV:
+
+* **Layering asymmetry.** A CRIU plugin would have to special-case
+  PD: scrape a hex TLV string (`"fw_pdn"`) out of an
+  `RDMA_NLDEV_ATTR_DRIVER` nest for PD, but `memcpy` a fixed-layout
+  blob off a uverbs ioctl for CQ and QP. Same FW-resource-id
+  problem, two unrelated discovery shapes.
+* **Wider security scope than needed.** NLDEV is
+  `CAP_NET_ADMIN`-gated and visible across every netns. CRIU
+  already holds the dumpee's `uverbsfd` (the same fd it uses for
+  `INFO_HANDLES` / K8a `RES_HANDLE` joins and for QUERY_CQ/_QP),
+  so routing PD discovery through a uverbs ioctl gives the right
+  boundary -- "if you can see the ucontext, you can read its
+  metadata" -- without the `CAP_NET_ADMIN` / cross-netns surface.
+  Same argument ?5.2.4 made for not extending NLDEV with the CQ
+  user-VA fields, and ?7.7 for the MR fields.
+
+Note the core NLDEV `RES_PDN` attribute (`res->id`) stays as-is
+and is **not** the FW pdn -- it is the per-`ib_device` restrack
+`xa_alloc_cyclic` id used as the `rdma res show pd pdn=N` handle.
+The two coincide on freshly-booted devices but diverge once the
+restrack IDR has wrapped past the FW pdn allocator's high-water
+mark, which is exactly why CRIU needs the FW `pdn` explicitly
+rather than reusing `RES_PDN`.
+
+**Landed shape**
+
+`include/uapi/rdma/mlx5_user_ioctl_cmds.h`:
+
+```c
+enum mlx5_ib_vfmig_methods {
+    /* ... QUERY_UCONTEXT ... QUERY_CQ, QUERY_QP ... */
+    MLX5_IB_METHOD_VFMIG_QUERY_PD,    /* new -- appended last */
+};
+
+enum mlx5_ib_vfmig_query_pd_attrs {
+    MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+    MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB,   /* mlx5_ib_restore_pd_req, 16B */
+    MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID,    /* u32, mpd->uid */
+};
+```
+
+The HANDLE is `UVERBS_ATTR_IDR(UVERBS_OBJECT_PD,
+UVERBS_ACCESS_READ)` -- the calling fd's ufile-idr must own this
+PD, the IDR pins the uobject for the duration of the call. Same
+security boundary as `INFO_HANDLES(UVERBS_OBJECT_PD)` and as the
+QUERY_CQ / QUERY_QP handle attrs.
+
+**Byte-equal payload contract.** `RESP_BLOB` is byte-equal to
+`struct mlx5_ib_restore_pd_req` (16 bytes). The handler zeroes
+`reserved`/`reserved2` so the round-trip into RESTORE_PD's
+"must be 0" guards passes verbatim. `RESP_UID` is a dump-side
+cross-check **only** -- `RESTORE_PD` sets `mpd->uid` from the
+adopted ucontext's `devx_uid`, not from this value; the plugin
+uses it to fail the dump early if the source PD is not under the
+v0 host-privileged lane (`uid != 0`) rather than producing an
+unrestorable image. CRIU plugin code at the seam reduces to:
+
+```c
+/* dump phase */
+ioctl(uverbsfd, RDMA_VERBS_IOCTL, &query_pd_cmd);
+if (resp_uid != 0)
+    bail("source PD not on the uid==0 host lane");
+img.pd[i].blob = blob;             /* 16B verbatim */
+
+/* restore phase */
+restore_pd_cmd.uhw_in.data = (uintptr_t)&img.pd[i].blob;
+restore_pd_cmd.uhw_in.len  = sizeof(img.pd[i].blob);
+ioctl(dst_uverbsfd, RDMA_VERBS_IOCTL, &restore_pd_cmd);
+```
+
+No field-level marshaling, no NLDEV TLV scrape.
+
+**No kernel-mode rejection needed.** Unlike QUERY_CQ / QUERY_QP
+there is nothing to reject defensively: a PD has no umem and no
+source userspace VA, the IDR lookup came through a user ufile by
+construction (kernel PDs are not in any user idr), and `mpd->pdn`
+is the 24-bit FW resource id, non-zero for any live PD.
+
+**Validator.** `tools/testing/mlx5_vfmig/uobject_restore/pd_query/
+pd_query_probe_mlx5_vfmig.c` is the single-process byte-equality
+probe. It allocs real PDs via `ibv_alloc_pd`, reads view (A) via
+`mlx5dv_init_obj(MLX5DV_OBJ_PD)` (`dvpd.pdn`), reads view (B) via
+`MLX5_IB_METHOD_VFMIG_QUERY_PD`, and asserts `blob.pdn ==
+dvpd.pdn`, the two reserved-zero contracts, and `resp_uid == 0`
+(plain `ibv_alloc_pd` is the uid==0 lane). Subtests cover happy
+path, invalid-handle (-ENOENT), and multi-PD disambiguation.
 
 ### 5.2 CQ + comp channel fd
 

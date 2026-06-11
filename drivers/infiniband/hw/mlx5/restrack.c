@@ -201,64 +201,10 @@ static int fill_res_qp_entry_raw(struct sk_buff *msg, struct ib_qp *ibqp)
 			    ibqp->qp_num);
 }
 
-/*
- * fill_res_pd_entry: emit mlx5-private TLVs alongside the core
- * RES_PD attributes so userspace can recover the actual FW pdn and
- * uid for a PD without resorting to driver-private mlx5dv calls.
- *
- * Background. The core NLDEV PD entry contains RDMA_NLDEV_ATTR_RES_PDN
- * which the kernel populates with res->id -- the per-ib_device
- * restrack xa_alloc_cyclic ID. That is the netlink-level "handle"
- * userspace uses to look up the PD via `rdma res show pd pdn=N`, NOT
- * the FW pdn returned by MLX5_CMD_OP_ALLOC_PD (mpd->pdn). The two
- * happen to coincide on freshly-booted devices but diverge as soon
- * as the per-device restrack IDR has wrapped enough to overtake the
- * FW pdn allocator's high-water mark.
- *
- * For CRIU SR-IOV-VFMIG PD restore we need the *FW* pdn to feed back
- * into mlx5_ib_restore_pd_req.pdn so the destination ucontext adopts
- * the same FW pdn that LOAD_VHCA_STATE preserved. Driver-private
- * TLVs nested under RDMA_NLDEV_ATTR_DRIVER are the established
- * pattern (see fill_res_mr_entry / fill_res_qp_entry above) and
- * keep the core RES_PDN ABI intact.
- *
- * We emit both pdn and uid because mlx5_ib_restore_pd needs the
- * (pdn, uid) pair to validate the adoption is safe: a uid mismatch
- * between source and destination ucontexts produces the same
- * FW BAD_PARAM/BAD_RES symptoms as a stale pdn would.
- *
- * Only emitted for user-allocated PDs (rdma_is_kernel_res() == false);
- * kernel-internal PDs have no SR-IOV-VFMIG audience.
- */
-static int fill_res_pd_entry(struct sk_buff *msg, struct ib_pd *ibpd)
-{
-	struct mlx5_ib_pd *mpd = to_mpd(ibpd);
-	struct nlattr *table_attr;
-
-	if (rdma_is_kernel_res(&ibpd->res))
-		return 0;
-
-	table_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_DRIVER);
-	if (!table_attr)
-		return -EMSGSIZE;
-
-	if (rdma_nl_put_driver_u32_hex(msg, "fw_pdn", mpd->pdn))
-		goto err;
-	if (rdma_nl_put_driver_u32(msg, "fw_uid", mpd->uid))
-		goto err;
-
-	nla_nest_end(msg, table_attr);
-	return 0;
-err:
-	nla_nest_cancel(msg, table_attr);
-	return -EMSGSIZE;
-}
-
 static const struct ib_device_ops restrack_ops = {
 	.fill_res_cq_entry_raw = fill_res_cq_entry_raw,
 	.fill_res_mr_entry = fill_res_mr_entry,
 	.fill_res_mr_entry_raw = fill_res_mr_entry_raw,
-	.fill_res_pd_entry = fill_res_pd_entry,
 	.fill_res_qp_entry = fill_res_qp_entry,
 	.fill_res_qp_entry_raw = fill_res_qp_entry_raw,
 	.fill_stat_mr_entry = fill_stat_mr_entry,

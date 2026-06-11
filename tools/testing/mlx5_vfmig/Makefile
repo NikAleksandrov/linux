@@ -22,6 +22,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/cq_restore/cq_restore_probe_rxe		\
 	uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig	\
 	uobject_restore/cq_query/cq_query_probe_mlx5_vfmig	\
+	uobject_restore/pd_query/pd_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig	\
 	uobject_restore/qp_query/qp_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_query/qp_nlattr_probe		\
@@ -149,6 +150,18 @@ uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig: \
 # process boundary.
 uobject_restore/cq_query/cq_query_probe_mlx5_vfmig: \
 		uobject_restore/cq_query/cq_query_probe_mlx5_vfmig.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
+
+# QUERY_PD + mlx5_ib QUERY_PD dump-side probe
+# (design/uobject_restore.md §5.1.4). Single-process byte-equality
+# validator: libibverbs+libmlx5 to alloc a real PD and read the
+# (A) "FW pdn" view via mlx5dv_init_obj(MLX5DV_OBJ_PD), then raw
+# uverbs ioctl to drive MLX5_IB_METHOD_VFMIG_QUERY_PD for the (B)
+# kernel view. Asserts blob.pdn == dvpd.pdn and resp_uid == 0 (the
+# v0 host-privileged lane) so a CRIU dumper can substitute the
+# QUERY_PD ioctl for the NLDEV fw_pdn driver-TLV path it replaced.
+uobject_restore/pd_query/pd_query_probe_mlx5_vfmig: \
+		uobject_restore/pd_query/pd_query_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
 
 # RESTORE_QP + mlx5_ib_restore_qp S6b end-to-end probe
