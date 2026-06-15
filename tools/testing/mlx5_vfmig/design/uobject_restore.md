@@ -724,10 +724,25 @@ is the 24-bit FW resource id, non-zero for any live PD.
 pd_query_probe_mlx5_vfmig.c` is the single-process byte-equality
 probe. It allocs real PDs via `ibv_alloc_pd`, reads view (A) via
 `mlx5dv_init_obj(MLX5DV_OBJ_PD)` (`dvpd.pdn`), reads view (B) via
-`MLX5_IB_METHOD_VFMIG_QUERY_PD`, and asserts `blob.pdn ==
-dvpd.pdn`, the two reserved-zero contracts, and `resp_uid == 0`
-(plain `ibv_alloc_pd` is the uid==0 lane). Subtests cover happy
-path, invalid-handle (-ENOENT), and multi-PD disambiguation.
+`MLX5_IB_METHOD_VFMIG_QUERY_PD`, and asserts the verb-mechanics
+contract -- `blob.pdn == dvpd.pdn` plus the two reserved-zero
+fields -- unconditionally. `resp_uid` is *reported as a lane*, not
+asserted to a fixed value: every PD inherits its ucontext's
+`devx_uid`, so the probe annotates `uid==0` as the v0-supported
+(non-DEVX) lane and `uid!=0` as the libmlx5 auto-DEVX lane (which
+the CRIU dump policy refuses at the `QUERY_UCONTEXT`
+`meta.devx_uid` gate, not inside QUERY_PD). The multi-PD subtest
+additionally asserts both PDs report the *same* uid (shared
+`context->devx_uid` invariant). Subtests cover happy path,
+invalid-handle (-ENOENT), and multi-PD disambiguation.
+
+Empirical note: on rdma-core 39 (Ubuntu) running the probe under
+`sudo`, libmlx5 auto-allocates a DEVX uid for the default context,
+so the probe reports the auto-DEVX lane (`uid != 0`, e.g. `uid=2`)
+and the `pdn` byte-equal contract still passes. To exercise the
+`uid==0` lane explicitly, run a context that does not obtain a
+DEVX uid (no DEVX privilege); the verb itself behaves identically
+either way -- only the lane annotation changes.
 
 ### 5.2 CQ + comp channel fd
 

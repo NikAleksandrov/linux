@@ -28,23 +28,48 @@
  *       as a scalar dump-side cross-check out.
  *
  * In a single-process probe (A) and (B) describe the same live PD, so
- * we demand strict equality:
+ * the verb-mechanics contract we demand is:
  *
- *     blob.pdn       == dvpd.pdn
+ *     blob.pdn       == dvpd.pdn          (byte-equal FW pdn)
  *     blob.reserved  == 0
  *     blob.reserved2 == 0
- *     resp_uid       == 0   (plain ibv_alloc_pd: no DEVX, uid==0 lane)
+ *
+ * The fourth out, resp_uid, is the source ucontext's devx_uid (every
+ * PD under a context inherits it; mlx5_ib_alloc_pd sets mpd->uid =
+ * context->devx_uid). It is NOT a fixed value this probe can demand:
+ *
+ *   - uid == 0  is the v0-supported lane: a non-DEVX ucontext. CRIU's
+ *     dump policy accepts these; RESTORE_PD lands every adopted FW
+ *     resource in the uid=0 host-privileged ungated lane.
+ *   - uid != 0  is the libmlx5 auto-DEVX lane: modern rdma-core
+ *     (>= ~v36) allocates a DEVX uid at context-open time when the
+ *     process has the privilege for it (e.g. run under sudo). v0 of
+ *     the CRIU plugin *refuses* such sources at the QUERY_UCONTEXT
+ *     meta.devx_uid gate (see mlx5_user_ioctl_cmds.h @devx_uid and
+ *     design/uobject_restore.md §5.1.4 / §S3b), because the dest VF's
+ *     FW rejects the unregistered uid post-LOAD.
+ *
+ * So this probe validates the verb mechanics unconditionally and
+ * *reports* the uid lane: uid==0 is annotated "v0-supported lane
+ * confirmed"; uid!=0 is annotated "auto-DEVX lane (v0 dump policy
+ * would refuse this source)" -- still a PASS for the verb, since the
+ * pdn byte-equal contract is what QUERY_PD owes its caller. The
+ * uid==0 dump-time refusal is CRIU plugin policy, enforced at the
+ * QUERY_UCONTEXT seam, not inside QUERY_PD.
  *
  * Subtests:
  *
- *   1. happy path. Single PD. Strict equality on all four fields.
+ *   1. happy path. Single PD. pdn byte-equality + reserved-zero;
+ *      uid lane reported.
  *
  *   2. invalid handle. QUERY_PD on an unallocated handle
  *      (HANDLE == 0xdeadbeef) must return -ENOENT (the IDR lookup
  *      miss from uverbs_ioctl.c). Validates the dispatcher gate.
  *
  *   3. multi-PD. Two distinct PDs. Each query returns its own correct
- *      pdn -- catches any "global state" / "wrong pd" bug.
+ *      pdn -- catches any "global state" / "wrong pd" bug. Both PDs
+ *      live under the same ucontext, so their uids must match
+ *      (shared context->devx_uid invariant).
  *
  * Build:
  *   make -C tools/testing/mlx5_vfmig \
@@ -283,17 +308,20 @@ static int compare_views(const struct pd_obs *o, const char *label)
 			(unsigned long long)o->blob.reserved2);
 		ok = 0;
 	}
-	if (o->uid != 0) {
-		fprintf(stderr,
-			"pdq[%s]: resp_uid=%u (expected 0; plain ibv_alloc_pd is the uid==0 lane)\n",
-			label, o->uid);
-		ok = 0;
-	}
 
-	if (ok)
+	if (ok) {
 		fprintf(stderr,
 			"pdq[%s]: STRONG byte-equal: pdn=0x%x uid=%u\n",
 			label, o->blob.pdn, o->uid);
+		if (o->uid == 0)
+			fprintf(stderr,
+				"pdq[%s]: uid lane: 0 -- v0-supported (non-DEVX) lane confirmed\n",
+				label);
+		else
+			fprintf(stderr,
+				"pdq[%s]: uid lane: %u -- libmlx5 auto-DEVX lane; v0 dump policy would refuse this source at the QUERY_UCONTEXT meta.devx_uid gate (verb mechanics still valid)\n",
+				label, o->uid);
+	}
 	return ok ? 0 : -1;
 }
 
@@ -381,6 +409,12 @@ static int subtest_multi_pd(struct ibv_context *ctx)
 	if (obs_a.blob.pdn == obs_b.blob.pdn) {
 		fprintf(stderr, "pdq[multi]: pdn collision (both 0x%x)\n",
 			obs_a.blob.pdn);
+		goto out;
+	}
+	if (obs_a.uid != obs_b.uid) {
+		fprintf(stderr,
+			"pdq[multi]: uid mismatch (A=%u B=%u) -- both PDs share one ucontext, devx_uid must match\n",
+			obs_a.uid, obs_b.uid);
 		goto out;
 	}
 	rc = 0;
