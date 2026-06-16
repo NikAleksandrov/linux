@@ -24,7 +24,9 @@ PROBE_BINARIES :=						\
 	uobject_restore/cq_query/cq_query_probe_mlx5_vfmig	\
 	uobject_restore/pd_query/pd_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig	\
+	uobject_restore/qp_restore/qp_restore_probe_rxe		\
 	uobject_restore/qp_query/qp_query_probe_mlx5_vfmig	\
+	uobject_restore/qp_query/qp_query_probe_rxe		\
 	uobject_restore/qp_query/qp_nlattr_probe		\
 	uobject_restore/vf_uuid/vf_uuid_probe_mlx5_vfmig	\
 	save_load/multi_load_gates/multi_load_stage_gate_probe	\
@@ -188,6 +190,28 @@ uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig: \
 uobject_restore/qp_query/qp_query_probe_mlx5_vfmig: \
 		uobject_restore/qp_query/qp_query_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs -lmlx5
+
+# QUERY_QP + FREEZE_DATAPATH rxe dump-side probe (S6a A4,
+# design/uobject_restore.md §5.3.7). Single-process: libibverbs builds a
+# real RC QP self-loopback at RTS, then raw uverbs ioctl drives
+# RXE_IB_METHOD_VFMIG_QUERY_QP (field fidelity vs ibv_query_qp) and the
+# RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH freeze/resume lifecycle. rxe object
+# ids inlined in the source (system rdma-core uapi has no rxe driver
+# namespace). No restore-mode ucontext needed.
+uobject_restore/qp_query/qp_query_probe_rxe: \
+		uobject_restore/qp_query/qp_query_probe_rxe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# RESTORE_QP + rxe_restore_qp S6a A5 end-to-end probe
+# (design/uobject_restore.md §9.1 S6a). Builds an RC QP via raw uverbs,
+# QUERY_QP-snapshots it, FREEZE_DATAPATHs + destroys the source, then on
+# a RXE_ALLOC_UCTX_RESTORE_MODE ucontext replays RESTORE_PD + RESTORE_CQ
+# + RESTORE_QP at the source qpn from the snapshot and re-QUERY_QPs the
+# restored QP to assert byte-equality. UAPI ids inlined for the same
+# reason as the other rxe restore probes.
+uobject_restore/qp_restore/qp_restore_probe_rxe: \
+		uobject_restore/qp_restore/qp_restore_probe_rxe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 # Raw NLDEV netlink dumper for QP + CQ resource entries
 # (design/uobject_restore.md §5.3.4). Validation tool for the

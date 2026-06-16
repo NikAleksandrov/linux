@@ -108,13 +108,19 @@ int rxe_qp_chk_init(struct rxe_dev *rxe, struct ib_qp_init_attr *init);
 int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 		     struct ib_qp_init_attr *init,
 		     struct rxe_create_qp_resp __user *uresp,
-		     struct ib_pd *ibpd, struct ib_udata *udata);
+		     struct ib_pd *ibpd, struct ib_udata *udata,
+		     u64 sq_forced_vm_pgoff, u64 rq_forced_vm_pgoff);
+int rxe_qp_restore_wire_state(struct rxe_qp *qp,
+			      const struct rxe_restore_qp_req *req,
+			      enum ib_qp_state state);
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init);
 int rxe_qp_chk_attr(struct rxe_dev *rxe, struct rxe_qp *qp,
 		    struct ib_qp_attr *attr, int mask);
 int rxe_qp_from_attr(struct rxe_qp *qp, struct ib_qp_attr *attr,
 		     int mask, struct ib_udata *udata);
 int rxe_qp_to_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask);
+void rxe_qp_pause(struct rxe_qp *qp);
+void rxe_qp_resume(struct rxe_qp *qp);
 void rxe_qp_error(struct rxe_qp *qp);
 int rxe_qp_chk_destroy(struct rxe_qp *qp);
 void rxe_qp_cleanup(struct rxe_pool_elem *elem);

@@ -233,7 +233,8 @@ static void rxe_qp_init_misc(struct rxe_dev *rxe, struct rxe_qp *qp,
 
 static int rxe_init_sq(struct rxe_qp *qp, struct ib_qp_init_attr *init,
 		       struct ib_udata *udata,
-		       struct rxe_create_qp_resp __user *uresp)
+		       struct rxe_create_qp_resp __user *uresp,
+		       u64 forced_vm_pgoff)
 {
 	struct rxe_dev *rxe = to_rdev(qp->ibqp.device);
 	int wqe_size;
@@ -254,10 +255,15 @@ static int rxe_init_sq(struct rxe_qp *qp, struct ib_qp_init_attr *init,
 		goto err_out;
 	}
 
-	/* prepare info for caller to mmap send queue if user space qp */
+	/*
+	 * prepare info for caller to mmap send queue if user space qp.
+	 * @forced_vm_pgoff is non-zero only on the CRIU restore path
+	 * (rxe_restore_qp), pinning the SQ ring mmap at the source's
+	 * offset; the create path passes 0 for monotonic allocation.
+	 */
 	err = do_mmap_info(rxe, uresp ? &uresp->sq_mi : NULL, udata,
 			   qp->sq.queue->buf, qp->sq.queue->buf_size,
-			   &qp->sq.queue->ip, 0);
+			   &qp->sq.queue->ip, forced_vm_pgoff);
 	if (err) {
 		rxe_err_qp(qp, "do_mmap_info failed, err = %d\n", err);
 		goto err_free;
@@ -282,7 +288,8 @@ err_out:
 
 static int rxe_qp_init_req(struct rxe_dev *rxe, struct rxe_qp *qp,
 			   struct ib_qp_init_attr *init, struct ib_udata *udata,
-			   struct rxe_create_qp_resp __user *uresp)
+			   struct rxe_create_qp_resp __user *uresp,
+			   u64 sq_forced_vm_pgoff)
 {
 	int err;
 
@@ -304,7 +311,7 @@ static int rxe_qp_init_req(struct rxe_dev *rxe, struct rxe_qp *qp,
 	 */
 	qp->src_port = RXE_ROCE_V2_SPORT + (hash_32(qp_num(qp), 14) & 0x3fff);
 
-	err = rxe_init_sq(qp, init, udata, uresp);
+	err = rxe_init_sq(qp, init, udata, uresp, sq_forced_vm_pgoff);
 	if (err)
 		return err;
 
@@ -326,7 +333,8 @@ static int rxe_qp_init_req(struct rxe_dev *rxe, struct rxe_qp *qp,
 
 static int rxe_init_rq(struct rxe_qp *qp, struct ib_qp_init_attr *init,
 		       struct ib_udata *udata,
-		       struct rxe_create_qp_resp __user *uresp)
+		       struct rxe_create_qp_resp __user *uresp,
+		       u64 forced_vm_pgoff)
 {
 	struct rxe_dev *rxe = to_rdev(qp->ibqp.device);
 	int wqe_size;
@@ -345,10 +353,14 @@ static int rxe_init_rq(struct rxe_qp *qp, struct ib_qp_init_attr *init,
 		goto err_out;
 	}
 
-	/* prepare info for caller to mmap recv queue if user space qp */
+	/*
+	 * prepare info for caller to mmap recv queue if user space qp.
+	 * @forced_vm_pgoff is non-zero only on the CRIU restore path;
+	 * see the SQ counterpart in rxe_init_sq.
+	 */
 	err = do_mmap_info(rxe, uresp ? &uresp->rq_mi : NULL, udata,
 			   qp->rq.queue->buf, qp->rq.queue->buf_size,
-			   &qp->rq.queue->ip, 0);
+			   &qp->rq.queue->ip, forced_vm_pgoff);
 	if (err) {
 		rxe_err_qp(qp, "do_mmap_info failed, err = %d\n", err);
 		goto err_free;
@@ -372,7 +384,8 @@ err_out:
 static int rxe_qp_init_resp(struct rxe_dev *rxe, struct rxe_qp *qp,
 			    struct ib_qp_init_attr *init,
 			    struct ib_udata *udata,
-			    struct rxe_create_qp_resp __user *uresp)
+			    struct rxe_create_qp_resp __user *uresp,
+			    u64 rq_forced_vm_pgoff)
 {
 	int err;
 
@@ -380,7 +393,7 @@ static int rxe_qp_init_resp(struct rxe_dev *rxe, struct rxe_qp *qp,
 	skb_queue_head_init(&qp->resp_pkts);
 
 	if (!qp->srq) {
-		err = rxe_init_rq(qp, init, udata, uresp);
+		err = rxe_init_rq(qp, init, udata, uresp, rq_forced_vm_pgoff);
 		if (err)
 			return err;
 	}
@@ -393,12 +406,17 @@ static int rxe_qp_init_resp(struct rxe_dev *rxe, struct rxe_qp *qp,
 	return 0;
 }
 
-/* called by the create qp verb */
+/*
+ * called by the create qp verb (sq/rq_forced_vm_pgoff == 0) and by the
+ * CRIU restore qp verb (rxe_restore_qp), which passes the source-side
+ * ring mmap offsets so the dumped VMAs map back 1:1 on the destination.
+ */
 int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 		     struct ib_qp_init_attr *init,
 		     struct rxe_create_qp_resp __user *uresp,
 		     struct ib_pd *ibpd,
-		     struct ib_udata *udata)
+		     struct ib_udata *udata,
+		     u64 sq_forced_vm_pgoff, u64 rq_forced_vm_pgoff)
 {
 	int err;
 	struct rxe_cq *rcq = to_rcq(init->recv_cq);
@@ -422,11 +440,11 @@ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 
 	rxe_qp_init_misc(rxe, qp, init);
 
-	err = rxe_qp_init_req(rxe, qp, init, udata, uresp);
+	err = rxe_qp_init_req(rxe, qp, init, udata, uresp, sq_forced_vm_pgoff);
 	if (err)
 		goto err1;
 
-	err = rxe_qp_init_resp(rxe, qp, init, udata, uresp);
+	err = rxe_qp_init_resp(rxe, qp, init, udata, uresp, rq_forced_vm_pgoff);
 	if (err)
 		goto err2;
 
@@ -456,6 +474,92 @@ err1:
 	rxe_put(pd);
 
 	return err;
+}
+
+/*
+ * CRIU restore (S6a A2): stamp a freshly-created QP with the captured
+ * wire state from the rxe_restore_qp_req UHW and land it directly at
+ * its final IBTA state. No ib_modify_qp chain runs -- this is the
+ * software-device mirror of mlx5 adopting a LOAD_VHCA_STATE-preserved
+ * QPC. The caller (rxe_restore_qp) has already created the QP at the
+ * source qpn via rxe_qp_from_init with the source ring vm_pgoffs, so
+ * qp->valid is set and the rings are mapped; here we overwrite the
+ * attr / AV / PSN / cursor state that create-time defaults got wrong.
+ *
+ * The PSNs and SQ cursor are set to the *live* source values
+ * (next-to-send, next-ack-expected, next-recv-expected) rather than
+ * the modify-time bases, because an in-flight QP's cursors have
+ * advanced past sq_psn/rq_psn and ib_modify_qp cannot express them.
+ *
+ * rd_atomic depths are stored verbatim (the source already rounded
+ * them up to a power of two at modify time, so re-rounding here would
+ * be a no-op and would break QUERY_QP byte-fidelity at A4).
+ */
+int rxe_qp_restore_wire_state(struct rxe_qp *qp,
+			      const struct rxe_restore_qp_req *req,
+			      enum ib_qp_state state)
+{
+	unsigned long flags;
+	int err;
+
+	/* address path + transport attrs (mirrors rxe_qp_from_attr) */
+	memcpy(&qp->pri_av, &req->av, sizeof(qp->pri_av));
+
+	qp->attr.dest_qp_num	 = req->dest_qp_num;
+	qp->attr.qkey		 = req->qkey;
+	qp->attr.qp_access_flags = req->qp_access_flags;
+	qp->attr.pkey_index	 = req->pkey_index;
+	qp->attr.port_num	 = req->port_num;
+
+	qp->attr.path_mtu	 = req->path_mtu;
+	qp->mtu			 = ib_mtu_enum_to_int(req->path_mtu);
+
+	qp->attr.retry_cnt	 = req->retry_cnt;
+	qp->comp.retry_cnt	 = req->retry_cnt;
+	qp->attr.rnr_retry	 = req->rnr_retry;
+	qp->comp.rnr_retry	 = req->rnr_retry;
+	qp->attr.min_rnr_timer	 = req->min_rnr_timer;
+
+	qp->attr.timeout	 = req->timeout;
+	if (req->timeout == 0) {
+		qp->qp_timeout_jiffies = 0;
+	} else {
+		/* spec: timeout = 4.096 * 2 ^ timeout [us] */
+		int j = nsecs_to_jiffies(4096ULL << req->timeout);
+
+		qp->qp_timeout_jiffies = j ? j : 1;
+	}
+
+	qp->attr.max_rd_atomic	 = req->max_rd_atomic;
+	atomic_set(&qp->req.rd_atomic, req->max_rd_atomic);
+
+	if (req->max_dest_rd_atomic) {
+		qp->attr.max_dest_rd_atomic = req->max_dest_rd_atomic;
+		err = alloc_rd_atomic_resources(qp, req->max_dest_rd_atomic);
+		if (err)
+			return err;
+	}
+
+	qp->attr.sq_psn		 = req->sq_psn & BTH_PSN_MASK;
+	qp->attr.rq_psn		 = req->rq_psn & BTH_PSN_MASK;
+
+	/*
+	 * live cursors: the per-flight state ib_modify_qp can't carry.
+	 * Masked to PSN width to match the wire bookkeeping.
+	 */
+	qp->req.psn		 = req->req_psn & BTH_PSN_MASK;
+	qp->comp.psn		 = req->comp_psn & BTH_PSN_MASK;
+	qp->resp.psn		 = req->resp_psn & BTH_PSN_MASK;
+	qp->resp.msn		 = req->resp_msn;
+	qp->req.wqe_index	 = req->req_wqe_index;
+	atomic_set(&qp->ssn, req->ssn);
+
+	spin_lock_irqsave(&qp->state_lock, flags);
+	qp->attr.qp_state	 = state;
+	qp->attr.cur_qp_state	 = state;
+	spin_unlock_irqrestore(&qp->state_lock, flags);
+
+	return 0;
 }
 
 /* called by the query qp verb */
@@ -596,6 +700,31 @@ static void rxe_qp_reset(struct rxe_qp *qp)
 	/* reenable tasks */
 	rxe_enable_task(&qp->recv_task);
 	rxe_enable_task(&qp->send_task);
+}
+
+/*
+ * CRIU dump (S6a A3): non-destructively freeze a QP's datapath so a
+ * consistent PSN/cursor snapshot can be taken. Unlike rxe_qp_reset /
+ * rxe_qp_error this touches NO IBTA state -- it only drains and parks
+ * the requester/completer (send_task) and responder (recv_task) work
+ * so no packet/WQE processing advances the PSNs mid-snapshot. Mirrors
+ * mlx5's SAVE_VHCA_STATE freeze; the QP stays in whatever state it was
+ * (typically RTS) and ibv_query_qp still reports that state.
+ *
+ * rxe_disable_task drains any in-flight run and blocks until the task
+ * is quiescent, so on return the datapath is guaranteed idle.
+ */
+void rxe_qp_pause(struct rxe_qp *qp)
+{
+	rxe_disable_task(&qp->send_task);
+	rxe_disable_task(&qp->recv_task);
+}
+
+/* CRIU dump (S6a A3): undo rxe_qp_pause; re-arm the datapath tasks. */
+void rxe_qp_resume(struct rxe_qp *qp)
+{
+	rxe_enable_task(&qp->send_task);
+	rxe_enable_task(&qp->recv_task);
 }
 
 /* move the qp to the error state */
