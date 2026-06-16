@@ -17,6 +17,16 @@
  *                    pack the full rxe wire state into a payload
  *                    byte-equal to struct rxe_restore_qp_req so the
  *                    destination can restore the QP single-shot.
+ *   QUERY_CQ         dump-side counterpart to UVERBS_METHOD_RESTORE_CQ:
+ *                    return a CQ's ring mmap offset + entry count so the
+ *                    dumper sources both RESTORE_CQ inputs (the forced
+ *                    vm_pgoff and the cqe) authoritatively from the
+ *                    kernel, keyed by CQ handle. This retires the smaps
+ *                    cdev-VMA FIFO crutch the CQ-only path relied on,
+ *                    which a mixed PD+CQ+QP ufile would otherwise corrupt
+ *                    (QP rings land in the same FIFO but are sourced via
+ *                    QUERY_QP, never popped -- so a CQ could pop a QP
+ *                    ring's offset). See uobject_restore.md §5.3.6.
  */
 #ifndef RXE_USER_IOCTL_CMDS_H
 #define RXE_USER_IOCTL_CMDS_H
@@ -31,6 +41,7 @@ enum rxe_ib_objects {
 enum rxe_ib_vfmig_methods {
 	RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_METHOD_VFMIG_QUERY_QP,
+	RXE_IB_METHOD_VFMIG_QUERY_CQ,
 };
 
 /*
@@ -50,6 +61,11 @@ enum rxe_ib_vfmig_freeze_datapath_attrs {
 enum rxe_ib_vfmig_query_qp_attrs {
 	RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+};
+
+enum rxe_ib_vfmig_query_cq_attrs {
+	RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
 };
 
 #endif

@@ -245,6 +245,33 @@ struct rxe_restore_cq_req {
 	__aligned_u64 reserved;
 };
 
+/*
+ * Driver-private payload for RXE_IB_METHOD_VFMIG_QUERY_CQ (dump side).
+ *
+ * Returned via the method's UHW-less PTR_OUT blob. The dumper reads a
+ * live CQ's two RESTORE_CQ inputs straight from the kernel, keyed by CQ
+ * handle:
+ *
+ *   @vm_pgoff  the CQ ring's mmap byte offset (cq->queue->ip->info.offset,
+ *              the same value rxe_create_cq_resp::mi.offset handed the
+ *              dumpee at create time). Replayed into
+ *              rxe_restore_cq_req::vm_pgoff so the restored ring binds at
+ *              the source offset and the dumped VMA maps back 1:1.
+ *   @cqe       the CQ's user-visible entry count (cq->ibcq.cqe). Replayed
+ *              into the RESTORE_CQ CQE method attr so the rebuilt ring has
+ *              identical geometry (and thus identical mmap size).
+ *
+ * Sourcing both from this verb -- instead of scraping the cdev-VMA pgoff
+ * from /proc/pid/smaps and the cqe from NLDEV -- makes CQ restore
+ * VA-ordering-immune and symmetric with the QUERY_QP path, which is the
+ * precondition for restoring a realistic PD + CQ(s) + QP(s) ufile.
+ */
+struct rxe_query_cq_resp {
+	__aligned_u64 vm_pgoff;
+	__u32 cqe;
+	__u32 reserved;
+};
+
 struct rxe_create_qp_resp {
 	struct mminfo rq_mi;
 	struct mminfo sq_mi;

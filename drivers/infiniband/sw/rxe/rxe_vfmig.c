@@ -23,8 +23,19 @@
  *                    CRIU runs in its own address space, so the dumpee's
  *                    kernel-side QP state must come from the kernel.
  *
- * Both methods take a QP IDR handle (UVERBS_ACCESS_READ) on the dumpee's
- * own uverbs fd; the security boundary is the ufile that owns the QP.
+ *   QUERY_CQ         dump-side counterpart to UVERBS_METHOD_RESTORE_CQ.
+ *                    Returns a CQ's ring mmap offset + entry count
+ *                    (struct rxe_query_cq_resp) so the dumper sources both
+ *                    RESTORE_CQ inputs from the kernel keyed by CQ handle,
+ *                    rather than scraping the offset from the dumpee's
+ *                    smaps cdev VMAs. That FIFO crutch cannot survive a
+ *                    mixed CQ+QP ufile (QP rings are also cdev VMAs but
+ *                    are sourced via QUERY_QP, so they pollute the FIFO);
+ *                    QUERY_CQ makes CQ and QP uniformly kernel-sourced.
+ *
+ * The QP methods take a QP IDR handle and QUERY_CQ takes a CQ IDR handle
+ * (UVERBS_ACCESS_READ) on the dumpee's own uverbs fd; the security
+ * boundary is the ufile that owns the object.
  */
 
 #include <rdma/uverbs_ioctl.h>
@@ -145,6 +156,30 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
 			      &blob, sizeof(blob));
 }
 
+static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_CQ)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_cq *ibcq = uverbs_attr_get_obj(
+		attrs, RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE);
+	struct rxe_query_cq_resp blob = {};
+	struct rxe_cq *cq;
+
+	if (IS_ERR(ibcq))
+		return PTR_ERR(ibcq);
+
+	cq = to_rcq(ibcq);
+
+	/* Kernel-mode CQs have no user mmap ring to round-trip. */
+	if (!cq->is_user || !cq->queue || !cq->queue->ip)
+		return -ENXIO;
+
+	blob.vm_pgoff = cq->queue->ip->info.offset;
+	blob.cqe      = ibcq->cqe;
+
+	return uverbs_copy_to(attrs, RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+			      &blob, sizeof(blob));
+}
+
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE,
@@ -165,10 +200,21 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(struct rxe_restore_qp_req),
 			    UA_MANDATORY));
 
+DECLARE_UVERBS_NAMED_METHOD(
+	RXE_IB_METHOD_VFMIG_QUERY_CQ,
+	UVERBS_ATTR_IDR(RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE,
+			UVERBS_OBJECT_CQ,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+			    UVERBS_ATTR_TYPE(struct rxe_query_cq_resp),
+			    UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	RXE_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH),
-	&UVERBS_METHOD(RXE_IB_METHOD_VFMIG_QUERY_QP));
+	&UVERBS_METHOD(RXE_IB_METHOD_VFMIG_QUERY_QP),
+	&UVERBS_METHOD(RXE_IB_METHOD_VFMIG_QUERY_CQ));
 
 const struct uapi_definition rxe_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_VFMIG),

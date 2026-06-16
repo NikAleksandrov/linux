@@ -84,12 +84,23 @@ struct ib_uverbs_ioctl_hdr {
 #define RXE_IB_OBJECT_VFMIG			(UVERBS_ID_DRIVER_NS + 0u)
 #define RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_METHOD_VFMIG_QUERY_QP		((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_METHOD_VFMIG_QUERY_CQ		((1u << UVERBS_ID_NS_SHIFT) + 2u)
 
 #define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE (1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE    ((1u << UVERBS_ID_NS_SHIFT) + 1u)
 
 #define RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
+
+#define RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
+
+/* Mirror of include/uapi/rdma/rdma_user_rxe.h struct rxe_query_cq_resp. */
+struct rxe_query_cq_resp_local {
+	uint64_t	vm_pgoff;
+	uint32_t	cqe;
+	uint32_t	reserved;
+};
 
 /*
  * Mirror of include/uapi/rdma/rdma_user_rxe.h struct rxe_av and
@@ -181,6 +192,39 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	n++;
 
 	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB;
+	cmd.attrs[n].len	= sizeof(*blob_out);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= (uintptr_t)blob_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+static int do_vfmig_query_cq(int fd, uint32_t cq_handle,
+			     struct rxe_query_cq_resp_local *blob_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[2];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id	= RXE_IB_OBJECT_VFMIG;
+	cmd.hdr.method_id	= RXE_IB_METHOD_VFMIG_QUERY_CQ;
+	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
+
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE;
+	cmd.attrs[n].len	= 0;
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= cq_handle;
+	n++;
+
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB;
 	cmd.attrs[n].len	= sizeof(*blob_out);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)blob_out;
@@ -432,11 +476,63 @@ static int subtest_query_fields(struct ibv_context *ctx, struct rc_qp *p)
 	return fails;
 }
 
+static int subtest_query_cq(struct ibv_context *ctx, struct rc_qp *p)
+{
+	struct rxe_query_cq_resp_local blob = {};
+	int ret, fails = 0;
+
+	printf("[2] QUERY_CQ field fidelity (vm_pgoff + cqe)\n");
+
+	ret = do_vfmig_query_cq(ctx->cmd_fd, p->cq->handle, &blob);
+	if (ret) {
+		fprintf(stderr, "  FAIL QUERY_CQ ioctl: %s%s\n", strerror(-ret),
+			ret == -EOPNOTSUPP
+			? " (RXE_IB_METHOD_VFMIG_QUERY_CQ not registered?)"
+			: "");
+		return 1;
+	}
+
+#define CHECK(cond, fmt, ...)						\
+	do {								\
+		if (cond) {						\
+			printf("  PASS " fmt "\n", ##__VA_ARGS__);	\
+		} else {						\
+			fprintf(stderr, "  FAIL " fmt "\n", ##__VA_ARGS__); \
+			fails++;					\
+		}							\
+	} while (0)
+
+	/*
+	 * cqe is the user-visible entry count. rxe rounds the requested
+	 * count up to a power of two inside rxe_cq_chk_attr but reports the
+	 * installed value back via ibv_cq->cqe; QUERY_CQ must echo that same
+	 * value so RESTORE_CQ rebuilds an identically-sized ring.
+	 */
+	CHECK(blob.cqe == (uint32_t)p->cq->cqe, "cqe=%u (ibv cqe=%u)",
+	      blob.cqe, p->cq->cqe);
+	CHECK(blob.vm_pgoff != 0, "vm_pgoff=0x%llx (non-zero user ring)",
+	      (unsigned long long)blob.vm_pgoff);
+	CHECK(blob.reserved == 0, "reserved=0");
+#undef CHECK
+
+	/* bogus handle must be rejected, mirroring QUERY_QP. */
+	ret = do_vfmig_query_cq(ctx->cmd_fd, 0xdeadbeefu, &blob);
+	if (ret == -ENOENT) {
+		printf("  PASS QUERY_CQ(0xdeadbeef) -> -ENOENT\n");
+	} else {
+		fprintf(stderr,
+			"  FAIL QUERY_CQ(0xdeadbeef) -> %s (expected -ENOENT)\n",
+			ret ? strerror(-ret) : "0 (success)");
+		fails++;
+	}
+	return fails;
+}
+
 static int subtest_freeze_lifecycle(struct ibv_context *ctx, struct rc_qp *p)
 {
 	int ret, fails = 0;
 
-	printf("[2] FREEZE_DATAPATH freeze/resume lifecycle\n");
+	printf("[3] FREEZE_DATAPATH freeze/resume lifecycle\n");
 
 	ret = do_vfmig_freeze(ctx->cmd_fd, p->qp->handle, 1);
 	if (ret == 0)
@@ -463,7 +559,7 @@ static int subtest_bad_handle(struct ibv_context *ctx)
 	struct rxe_restore_qp_req_local blob = {};
 	int ret;
 
-	printf("[3] QUERY_QP(bogus handle) -> -ENOENT\n");
+	printf("[4] QUERY_QP(bogus handle) -> -ENOENT\n");
 	ret = do_vfmig_query_qp(ctx->cmd_fd, 0xdeadbeefu, &blob);
 	if (ret == -ENOENT) {
 		printf("  PASS QUERY_QP(0xdeadbeef) -> -ENOENT\n");
@@ -513,6 +609,7 @@ int main(int argc, char **argv)
 	printf("  setup: RC QP 0x%x at RTS (self-loopback)\n", p.qp->qp_num);
 
 	fails += subtest_query_fields(ctx, &p);
+	fails += subtest_query_cq(ctx, &p);
 	fails += subtest_freeze_lifecycle(ctx, &p);
 	fails += subtest_bad_handle(ctx);
 

@@ -52,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <netinet/in.h>
@@ -346,7 +347,8 @@ static int do_restore_pd(int fd, uint32_t target_handle)
  */
 static int do_restore_cq(int fd, uint32_t target_handle, uint32_t cqe,
 			 uint64_t user_handle, uint32_t comp_vector,
-			 uint32_t *resp_cqe_out)
+			 uint32_t *resp_cqe_out,
+			 struct rxe_mminfo_local *mi_out)
 {
 	struct rxe_create_cq_resp_local uhw_out = {};
 	struct {
@@ -400,6 +402,8 @@ static int do_restore_cq(int fd, uint32_t target_handle, uint32_t cqe,
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
+	if (mi_out)
+		*mi_out = uhw_out.mi;
 	return 0;
 }
 
@@ -420,7 +424,8 @@ static int do_restore_qp(int fd, uint32_t target_handle, uint32_t pd_handle,
 			 uint64_t user_handle,
 			 const struct ib_uverbs_qp_cap_local *cap,
 			 const struct rxe_restore_qp_req_local *uhw,
-			 uint32_t *resp_qpn_out)
+			 uint32_t *resp_qpn_out,
+			 struct rxe_create_qp_resp_local *resp_out)
 {
 	struct rxe_create_qp_resp_local uhw_out = {};
 	struct {
@@ -504,6 +509,8 @@ static int do_restore_qp(int fd, uint32_t target_handle, uint32_t pd_handle,
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
+	if (resp_out)
+		*resp_out = uhw_out;
 	return 0;
 }
 
@@ -860,6 +867,8 @@ int main(int argc, char **argv)
 	struct ibv_qp_init_attr qiattr = {};
 	struct ib_uverbs_get_context_resp gctx = {};
 	uint32_t src_qpn, resp_qpn = 0, resp_cqe = 0;
+	struct rxe_mminfo_local cq_mi = {};
+	struct rxe_create_qp_resp_local qp_resp = {};
 	uint32_t list_handles[32] = {};
 	uint32_t total = 0;
 	int n, i, fd_restore = -1, ret, fails = 0;
@@ -974,7 +983,7 @@ int main(int argc, char **argv)
 		goto out_restore;
 	}
 	ret = do_restore_cq(fd_restore, CQ_TARGET_HANDLE, CQE_REQUESTED,
-			    USER_HANDLE_TAG, 0, &resp_cqe);
+			    USER_HANDLE_TAG, 0, &resp_cqe, &cq_mi);
 	if (ret) {
 		fprintf(stderr, "  FAIL RESTORE_CQ: %s\n", strerror(-ret));
 		fails++;
@@ -988,7 +997,7 @@ int main(int argc, char **argv)
 	ret = do_restore_qp(fd_restore, QP_TARGET_HANDLE, PD_TARGET_HANDLE,
 			    CQ_TARGET_HANDLE, CQ_TARGET_HANDLE,
 			    IB_QPT_RC_LOCAL, IB_QPS_RTS_LOCAL,
-			    USER_HANDLE_TAG, &cap, &snap, &resp_qpn);
+			    USER_HANDLE_TAG, &cap, &snap, &resp_qpn, &qp_resp);
 	if (ret) {
 		fprintf(stderr, "  FAIL RESTORE_QP: %s%s\n", strerror(-ret),
 			ret == -EOPNOTSUPP
@@ -1052,8 +1061,73 @@ int main(int argc, char **argv)
 		printf("  PASS restored QP wire state byte-identical to source\n");
 	}
 
-	/* [7] tear the restored QP down cleanly. */
-	printf("[7] DESTROY_QP(0x%x)\n", QP_TARGET_HANDLE);
+	/*
+	 * [7] Actually mmap the three forced-offset rings (CQ + SQ + RQ)
+	 * on the single restore-mode cdev fd. This is the load-bearing
+	 * multi-mmap-per-ufile check: a realistic restored QP needs >= 3
+	 * mappings to coexist on one fd, each pinned at the *source*
+	 * vm_pgoff via rxe_create_mmap_info(forced_offset=...). rxe_mmap
+	 * matches a pending entry by (context, byte-offset) and removes
+	 * it; distinct source offsets must therefore all resolve. A
+	 * regression in the forced-offset claim (e.g. a too-broad
+	 * collision that drops a pending entry, or an offset the kernel
+	 * never published) surfaces here as the second/third mmap()
+	 * failing -EINVAL ("unable to find pending mmap info").
+	 *
+	 * The mminfo.offset values are byte offsets (vm_pgoff <<
+	 * PAGE_SHIFT) straight from each restore method's UHW_OUT, so
+	 * they feed mmap()'s offset argument directly.
+	 */
+	printf("[7] mmap CQ+SQ+RQ rings (3 forced offsets) on one cdev fd\n");
+	{
+		const struct {
+			const char		*name;
+			struct rxe_mminfo_local	mi;
+		} rings[] = {
+			{ "CQ", cq_mi },
+			{ "SQ", qp_resp.sq_mi },
+			{ "RQ", qp_resp.rq_mi },
+		};
+		void *maps[3] = { MAP_FAILED, MAP_FAILED, MAP_FAILED };
+		unsigned int k;
+
+		for (k = 0; k < 3; k++) {
+			if (rings[k].mi.size == 0) {
+				fprintf(stderr,
+					"  FAIL %s ring: kernel published size=0"
+					" (UHW_OUT mminfo not filled)\n",
+					rings[k].name);
+				fails++;
+				continue;
+			}
+			maps[k] = mmap(NULL, rings[k].mi.size,
+				       PROT_READ | PROT_WRITE, MAP_SHARED,
+				       fd_restore,
+				       (off_t)rings[k].mi.offset);
+			if (maps[k] == MAP_FAILED) {
+				fprintf(stderr,
+					"  FAIL mmap %s ring (off=0x%llx"
+					" size=%u): %s\n",
+					rings[k].name,
+					(unsigned long long)rings[k].mi.offset,
+					rings[k].mi.size, strerror(errno));
+				fails++;
+			} else {
+				/* touch first word to fault the page in */
+				*(volatile uint32_t *)maps[k];
+				printf("  PASS mmap %s ring off=0x%llx size=%u\n",
+				       rings[k].name,
+				       (unsigned long long)rings[k].mi.offset,
+				       rings[k].mi.size);
+			}
+		}
+		for (k = 0; k < 3; k++)
+			if (maps[k] != MAP_FAILED)
+				munmap(maps[k], rings[k].mi.size);
+	}
+
+	/* [8] tear the restored QP down cleanly. */
+	printf("[8] DESTROY_QP(0x%x)\n", QP_TARGET_HANDLE);
 	ret = do_destroy_qp(fd_restore, QP_TARGET_HANDLE);
 	if (ret) {
 		fprintf(stderr, "  FAIL DESTROY_QP(restored): %s\n",
