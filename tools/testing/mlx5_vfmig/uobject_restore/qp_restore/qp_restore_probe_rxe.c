@@ -154,6 +154,7 @@ enum {
 #define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE    ((1u << UVERBS_ID_NS_SHIFT) + 1u)
 #define RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
 
 /* ib_qp_type / ib_qp_state values used by the RESTORE_QP method args. */
 #define IB_QPT_RC_LOCAL				2
@@ -519,8 +520,10 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[2];
+		struct ib_uverbs_attr		attrs[3];
 	} cmd = {};
+	/* RESP_USER_HANDLE is mandatory but unused by the restore probe. */
+	uint64_t user_handle = 0;
 	unsigned int n = 0;
 
 	cmd.hdr.object_id	= RXE_IB_OBJECT_VFMIG;
@@ -537,6 +540,12 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	cmd.attrs[n].len	= sizeof(*blob_out);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)blob_out;
+	n++;
+
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE;
+	cmd.attrs[n].len	= sizeof(user_handle);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= (uintptr_t)&user_handle;
 	n++;
 
 	cmd.hdr.num_attrs = n;

@@ -21,6 +21,10 @@
  *        - blob.sq_psn     == attr.sq_psn (modify-time base)
  *        - blob.{req,resp}_psn are sane (>= their bases, wrapped to 24b)
  *        - blob.sq_vm_pgoff / rq_vm_pgoff are non-zero (user rings)
+ *        - RESP_USER_HANDLE (the async-event cookie) is non-zero;
+ *          cap / qp_type / qp_state are intentionally not emitted by
+ *          the verb (CRIU sources those from the standard query_qp +
+ *          NLDEV), so the probe does not look for them
  *   3. FREEZE_DATAPATH(freeze=1) then FREEZE_DATAPATH(freeze=0): both
  *      return 0 on the live user QP. (Negative gates: kernel QP -> ENXIO
  *      is exercised indirectly; bad handle -> ENOENT below.)
@@ -91,6 +95,7 @@ struct ib_uverbs_ioctl_hdr {
 
 #define RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
 
 #define RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
@@ -173,11 +178,12 @@ struct rxe_restore_qp_req_local {
 /* ----------------------- ioctl helpers ----------------------------------- */
 
 static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
-			     struct rxe_restore_qp_req_local *blob_out)
+			     struct rxe_restore_qp_req_local *blob_out,
+			     uint64_t *user_handle_out)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[2];
+		struct ib_uverbs_attr		attrs[3];
 	} cmd = {};
 	unsigned int n = 0;
 
@@ -195,6 +201,12 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	cmd.attrs[n].len	= sizeof(*blob_out);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)blob_out;
+	n++;
+
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE;
+	cmd.attrs[n].len	= sizeof(*user_handle_out);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= (uintptr_t)user_handle_out;
 	n++;
 
 	cmd.hdr.num_attrs = n;
@@ -415,6 +427,7 @@ static int subtest_query_fields(struct ibv_context *ctx, struct rc_qp *p)
 	struct rxe_restore_qp_req_local blob = {};
 	struct ibv_qp_attr attr = {};
 	struct ibv_qp_init_attr iattr = {};
+	uint64_t user_handle = 0;
 	int ret, fails = 0;
 
 	printf("[1] QUERY_QP field fidelity vs ibv_query_qp\n");
@@ -427,7 +440,8 @@ static int subtest_query_fields(struct ibv_context *ctx, struct rc_qp *p)
 		return 1;
 	}
 
-	ret = do_vfmig_query_qp(ctx->cmd_fd, p->qp->handle, &blob);
+	ret = do_vfmig_query_qp(ctx->cmd_fd, p->qp->handle, &blob,
+				&user_handle);
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_QP ioctl: %s%s\n", strerror(-ret),
 			ret == -EOPNOTSUPP
@@ -472,6 +486,13 @@ static int subtest_query_fields(struct ibv_context *ctx, struct rc_qp *p)
 	      (blob.comp_psn & ~BTH_PSN_MASK) == 0,
 	      "live cursors masked to 24b (req=0x%x comp=0x%x resp=0x%x)",
 	      blob.req_psn, blob.comp_psn, blob.resp_psn);
+	/*
+	 * user_handle is the async-event cookie ibv_create_qp stamped on
+	 * the QP uobject; CRIU preserves it across restore. libibverbs
+	 * always records a non-zero tag for a user-mode QP.
+	 */
+	CHECK(user_handle != 0, "user_handle=0x%llx (non-zero async cookie)",
+	      (unsigned long long)user_handle);
 #undef CHECK
 	return fails;
 }
@@ -557,10 +578,11 @@ static int subtest_freeze_lifecycle(struct ibv_context *ctx, struct rc_qp *p)
 static int subtest_bad_handle(struct ibv_context *ctx)
 {
 	struct rxe_restore_qp_req_local blob = {};
+	uint64_t user_handle = 0;
 	int ret;
 
 	printf("[4] QUERY_QP(bogus handle) -> -ENOENT\n");
-	ret = do_vfmig_query_qp(ctx->cmd_fd, 0xdeadbeefu, &blob);
+	ret = do_vfmig_query_qp(ctx->cmd_fd, 0xdeadbeefu, &blob, &user_handle);
 	if (ret == -ENOENT) {
 		printf("  PASS QUERY_QP(0xdeadbeef) -> -ENOENT\n");
 		return 0;

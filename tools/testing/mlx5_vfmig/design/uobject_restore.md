@@ -1198,13 +1198,28 @@ enum mlx5_ib_vfmig_methods {
 enum mlx5_ib_vfmig_query_qp_attrs {
     MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,         /* mlx5_ib_restore_qp_req, 64B */
-    MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE,         /* u32, mqp->type */
-    MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE,        /* u32, mqp->state */
     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,  /* u64, ib_qp_user_handle */
-    MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP,          /* struct ib_uverbs_qp_cap */
     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS, /* u32, mqp->flags */
 };
 ```
+
+**Trimmed to non-standard-queryable state only.** A driver-private
+`QUERY_QP` returns only QP state the standard
+`IB_USER_VERBS_CMD_QUERY_QP` verb (and NLDEV) cannot express. CRIU's
+hardware-generic dump path issues the standard `query_qp` on the
+dumpee's QP (it already holds the owning uctx fd + the QP IDR handle --
+the same precondition this private verb needs) and takes `cap` from
+there (creation-static, so order-insensitive w.r.t. FREEZE_DATAPATH),
+cross-checking `qp_state` / PSNs against NLDEV with `qp_type` from
+NLDEV `RES_TYPE`. So `RESP_CAP` (superseded by standard `query_qp`
+cap), `RESP_STATE` (superseded by standard `query_qp` qp_state / NLDEV
+`RES_STATE`), and `RESP_TYPE` (superseded by NLDEV `RES_TYPE`) were
+removed; dropping them from the middle of the enum renumbered the
+trailing ids, which is fine for these out-of-tree verbs (the in-tree
+probe and CRIU-side UAPI mirror move in lockstep). What remains is
+`RESP_BLOB` (FW-private), `RESP_USER_HANDLE` (the async-event cookie,
+not standard-queryable), and `RESP_CREATE_FLAGS` (not in the legacy
+`query_qp` resp).
 
 The HANDLE is `UVERBS_ATTR_IDR(UVERBS_OBJECT_QP,
 UVERBS_ACCESS_READ)` -- the calling fd's ufile-idr must own this
@@ -1224,13 +1239,15 @@ at the seam reduces to:
 
 ```c
 /* dump phase */
-ioctl(uverbsfd, RDMA_VERBS_IOCTL, &query_qp_cmd);
+ioctl(uverbsfd, RDMA_VERBS_IOCTL, &query_qp_cmd);   /* private verb */
 img.qp[i].blob          = blob;          /* 64B verbatim */
-img.qp[i].type          = resp_type;
-img.qp[i].state         = resp_state;
 img.qp[i].user_handle   = resp_user_handle;
-img.qp[i].cap           = resp_cap;
 img.qp[i].create_flags  = resp_create_flags;
+
+ioctl(uverbsfd, ..., &std_query_qp_cmd);            /* standard verb */
+img.qp[i].type          = std_attr.qp_type;         /* + NLDEV RES_TYPE */
+img.qp[i].state         = std_attr.qp_state;        /* + NLDEV RES_STATE */
+img.qp[i].cap           = std_init.cap;
 
 /* restore phase */
 restore_qp_cmd.uhw_in.data    = (uintptr_t)&img.qp[i].blob;
@@ -1243,7 +1260,8 @@ restore_qp_cmd.create_flags   = img.qp[i].create_flags;
 ioctl(dst_uverbsfd, RDMA_VERBS_IOCTL, &restore_qp_cmd);
 ```
 
-No field-level marshaling, no `mlx5dv` anywhere.
+No field-level marshaling for the private blob, no `mlx5dv` anywhere;
+`cap` / `type` / `state` come from the standard `query_qp` + NLDEV.
 
 **Type gate.** v0 accepts the IBTA QP types whose mlx5_ib
 representation lives in `mlx5_ib_qp.trans_qp` *and* whose
@@ -1264,16 +1282,14 @@ should not see them in `INFO_HANDLES(QP)` anyway (kernel QPs are
 not in any user ufile's idr). The check is defensive belt &
 suspenders, mirror of the QUERY_CQ kernel-mode reject.
 
-**Cap is best-effort.** mlx5 doesn't track every cap field on
-user-mode QPs (see `mlx5_ib_query_qp` in `qp.c`: for user QPs
-`max_send_wr / max_send_sge` are 0 because those values are
-libmlx5-internal post-rounding). The handler emits a useful
-echo (`max_send_wr = sq.wqe_cnt`, `max_recv_wr = rq.wqe_cnt`,
-`max_recv_sge = rq.max_gs`, `max_inline_data = max_inline_data`,
-`max_send_sge = 1`) -- the mlx5 RESTORE_QP handler doesn't
-validate cap content (the actual WQ shape comes from the UHW's
-`{sq,rq}_wqe_count`); the field is forward-compat surface for a
-future driver that may consult it.
+**Cap / type / state are not emitted.** Earlier revisions of this
+verb echoed `RESP_CAP` / `RESP_TYPE` / `RESP_STATE`; all three were
+dropped because CRIU sources them from the standard `query_qp` verb
+(`cap`, creation-static) and NLDEV (`RES_TYPE` / `RES_STATE`) -- see
+the "trimmed to non-standard-queryable state only" note above. The
+v0 type gate survives internally as a check on `mqp->type` (so
+RAW_PACKET / XRC / GSI / DCT / DCI still reject with `-EOPNOTSUPP`),
+even though the type value is no longer part of the response.
 
 **`ib_qp_user_handle` accessor.** `struct ib_qp.uobject` is
 opaquely typed `struct ib_uqp_object *` (XRC bookkeeping requires
@@ -1296,16 +1312,17 @@ probe. It creates real QPs via `ibv_create_qp`, reads view (A)
 via `mlx5dv_init_obj(MLX5DV_OBJ_QP)`, reads view (B) via
 `MLX5_IB_METHOD_VFMIG_QUERY_QP`, and asserts strict equality
 across `qpn`, `sq_wqe_count`, `rq_wqe_count`, `rq_wqe_shift`,
-`buf_addr`, `(db_addr & PAGE_MASK)`, `type`, `state`,
-`create_flags` plus the sentinel-zero contracts on
-`sq_buf_addr`, `uidx`, `ece_options`, `reserved`, `reserved2`.
-Subtests cover happy path (RESET -> INIT for non-trivial
-state), invalid-handle (-ENOENT), multi-QP disambiguation,
-type echo (RC vs UD distinct resp_type), and state echo
-(RESET -> INIT round-trip via `ibv_modify_qp`). Build-clean
-against current libibverbs + libmlx5; full byte-equal
-contract validation against ConnectX hardware deferred to the
-next hardware run (compiles + lint-clean on this branch).
+`buf_addr`, `(db_addr & PAGE_MASK)`, `create_flags` plus the
+sentinel-zero contracts on `sq_buf_addr`, `uidx`, `ece_options`,
+`reserved`, `reserved2`. Subtests cover happy path (RESET ->
+INIT for non-trivial state), invalid-handle (-ENOENT), and
+multi-QP disambiguation (distinct `qpn` / `buf_addr` /
+`user_handle`). The earlier type-echo and state-echo subtests
+were retired with `RESP_TYPE` / `RESP_STATE` (those scalars now
+come from the standard `query_qp` + NLDEV). Build-clean against
+current libibverbs + libmlx5; full byte-equal contract
+validation against ConnectX hardware deferred to the next
+hardware run (compiles + lint-clean on this branch).
 
 #### 5.3.5 PSN preservation: per-driver split
 
@@ -3135,7 +3152,7 @@ round-trip is PD + MR + CQ + QP; SRQ/AH/CC/AEF land after.
   | S6b B2 | `mlx5_ib_restore_qp` handler + `dev_ops.restore_qp` slot + `UVERBS_METHOD_RESTORE_QP` core dispatch + FW-qpn-adopt helper (`mlx5_qpc_adopt_qp` -- mirrors S5b B2/B3 `mlx5_core_adopt_cq`). Core attr set (mandatory: HANDLE / PD\_HANDLE / SEND\_CQ\_HANDLE / RECV\_CQ\_HANDLE / TYPE / STATE / USER\_HANDLE / CAP (re-uses `struct ib_uverbs_qp_cap`); optional: SRQ\_HANDLE, CREATE\_FLAGS, EVENT\_FD; UHW; output: RESP\_QPN). Stub scope: kernel-side `mlx5_ib_qp` + `mlx5_core_qp` registration only (mutex / state / type / flags / port=1 / bfregn / has\_rq / cq\_{recv,send}\_list / qps\_list / `trans_qp.base.{container_mibqp, mqp.{qpn, uid=context->devx_uid, pid}}`). WQ-ring umem and DBR umem binding deferred to B3. | yes (2026-06-01) | **STRONG PASS** (hardware-validated 2026-06-02 via B4 harness end-to-end run after the `ib_set_device_ops` `restore_qp` slot was plumbed at commit 307787af956c "RDMA/core: Plumb restore_qp through ib_set_device_ops (S6b B2 fix)" -- without that follow-on, every RESTORE_QP short-circuited at the dispatcher's `if (!ib_dev->ops.restore_qp \|\| !ib_dev->ops.destroy_qp)` gate with -EOPNOTSUPP, masking the slot wiring with the same errno as the type-/state-switch reject paths). |
   | S6b B3 | bind helpers: `mlx5_vfmig_bind_user_qp` (mlx5_core, mirror of `mlx5_vfmig_bind_user_cq` keyed on `(KIND_QP, qpn)`); `mlx5_ib_umem_restore_qp` (mlx5_ib, single bind covering RQ + SQ in one contiguous mapping with access=0 since FW only reads WQE descriptors out of the WQ-ring umem); reuses `mlx5_ib_db_map_user_restore` from S5b B3 for the doorbell page. `mlx5_ib_restore_qp` extended to bind both umems, stamp `qp->{rq,sq}.{wqe_cnt, wqe_shift, offset}` + `base->ubuffer.{buf_addr, buf_size, umem}` from `set_user_buf_size`-equivalent arithmetic on UHW `(rq_wqe_count, rq_wqe_shift, sq_wqe_count)`, force `bfregn = MLX5_IB_INVALID_BFREG` (UHW carries source's UAR index, not a kernel-allocator slot), wire `mqp.event = mlx5_ib_qp_event` via `mlx5_ib_set_user_qp_event_callback`, and register into `dev->qp_list` / `send_cq->list_send_qp` / `recv_cq->list_recv_qp` via `mlx5_ib_register_user_qp_in_dev_lists` so destroy_qp_common's unconditional `list_del` chain matches. | yes (2026-06-01) | **STRONG PASS** (hardware-validated 2026-06-02 via B4 harness happy-path subtest 10 + Phase G QPC byte-equality cross-check + subtest 13 leaf-DESTROY_QP -- the bind helpers correctly wire the source's WQ-ring umem and doorbell-page umem onto the destination's adopted qpn, the kernel registers the QP into the same per-CQ / per-PD lists `destroy_qp_common` walks, and DESTROY_QP unwinds without a stuck `list_del` or umem leak). |
   | S6b B4 | live verb path adopts qpn cleanly (`qp_restore_probe_mlx5_vfmig` + `test_qp_restore_mlx5_vfmig.sh` -- gate, UAPI rejects, RTS-with-pending-WRs happy path, byte-equal QPC subset vs. source pre-SAVE). Probe subtest battery: gate (no VFMIG_RESTORE → -EPERM, exercised via RESTORE_PD because RESTORE_QP's mandatory PD/SEND_CQ/RECV_CQ IDR refs short-circuit at -ENOENT before the gate fires; the gate predicate is shared across all four RESTORE_* dispatchers via `restore_check_ucontext`), RESTORE_PD + RESTORE_CQ setup chain (positive), 5 UAPI rejects (qpn=0 / qpn high bits / reserved!=0 / uidx high bits / rq_wqe_shift out of [4,16]), 2 dispatcher rejects (qp_type=XRC_INI / qp_state=SQE), happy path (RESP_QPN echoes req.qpn; INFO_HANDLES contains qp_target_handle), collision (-EBUSY), READY checkpoint (harness drives `MLX5_VFMIG_IOC_QUERY_QP` while QP is alive), v0 dealloc (DESTROY_QP succeeds + INFO_HANDLES drops the handle -- ASYMMETRIC with CQ subtest 10 / PD subtest 7 because QP is a leaf in the FW resource graph; SYMMETRIC with MR subtest 8). Harness Phases A-I: source VF + RoCE netdev up → fork `fw_id_continuity_probe` with `--qp-state RTS --post-recv-wrs N` (N=4 default; populates RTS-set + RQ counters) → pre-SAVE QUERY_QP snapshot → SAVE → dest VF + LOAD + bind → fork dst probe with all 14 source-side fields (pdn, cqn/cqe/cqe_size/cq_buf_addr/cq_db_addr, qpn/sq_wqe_count/rq_wqe_count/rq_wqe_shift/qp_buf_addr/qp_db_addr, qp_type=RC, qp_state=RTS) → live-verb-path QUERY_QP byte-comparison (state-independent + INIT-set + RTR-set AV/PSNs + RTS-set retry/PSNs + queue counters touched by post_recv) → quit dst probe → DESTROY_QP success → manifest. Verdict matrix: PASS / WEAK PASS (verb path landed but QPC snapshot diverged → adopt-QP wiring or LOAD preservation suspect; cross-check K6 §6.3 piggyback in isolation) / FAIL (verb path failed; bullets common causes). Prerequisite: `fw_id_continuity_probe` extended to emit QP context (`sq_wqe_count`, `rq_wqe_count`, `rq_wqe_shift`, `qp_buf_addr` = `dvqp.rq.buf` since libmlx5 lays out RQ at offset 0 within the shared WQ buffer, `qp_db_addr` = `dvqp.dbrec`) via `mlx5dv_init_obj(MLX5DV_OBJ_QP)`. | yes (2026-06-01) | **STRONG PASS** (hardware-validated 2026-06-02). Full PASS battery: subtests 1, setup A/B, 3-9 (UAPI/dispatcher rejects), happy path (subtest 10), collision (subtest 11), Phase G QPC byte-equality vs. source pre-SAVE under live verb path (state, pd, q_key, uar_page, log_{page,sq,rq}_size, log_msg_max, user_index, cqn_snd, cqn_rcv, sw/hw rq counters, path_mtu, min_rnr_nak, log_rra_max, remote_qpn, primary_address_path 44-byte AV, next_rcv_psn, log_sra_max, retry_count, rnr_retry, next_send_psn, last_acked_psn -- 24 fields), subtest 13 leaf-DESTROY_QP semantics. Two harness-side bugs were found and fixed during validation: (a) FIFO SIGPIPE race in `start_{src,dst}_probe`'s `while IFS= read -r line < $fifo`-per-iteration pattern, fixed by holding fifo_out on a dedicated fd across the loop (commit cf8251f89e48); (b) subtest 1 anchored on RESTORE_QP whose mandatory IDR attrs short-circuit at -ENOENT before the gate fires, re-anchored on RESTORE_PD which has no IDR pre-conditions and reaches the shared `restore_check_ucontext` gate immediately (commit 8470fea1f23b). |
-  | S6b B5 | dump-side verb (`MLX5_IB_METHOD_VFMIG_QUERY_QP` + `qp_query_probe_mlx5_vfmig` + `test_qp_query_mlx5_vfmig.sh` runner): kernel reads `base->mqp.qpn` / `trans_qp.base.ubuffer.umem->address` / `mlx5_ib_db_user_virt(&mqp->db)` / WQ-ring shape (`{sq,rq}.wqe_cnt`, `rq.wqe_shift`) / `mqp->flags_en` and emits a 64-byte payload byte-equal to `mlx5_ib_restore_qp_req` plus five scalar outs (type / state / user_handle / cap / create_flags). FW-side fields (uidx / bfreg_index / ece_options) are emitted as sentinels (0 / `MLX5_IB_INVALID_BFREG` / 0) since the QPC's user_index / uar_page / ece_options round-trip intact across LOAD per the K7 byte-equal proof and `mlx5_ib_restore_qp` validates-and-discards them. Mirror of S5b B5 for QP. Re-uses the `mlx5_ib_db_user_virt` accessor lifted at S5b B5 (designed to also serve QP per §5.2.4 lift-time docstring). Adds an `ib_qp_user_handle` accessor in `core/verbs.c` (declared in `<rdma/ib_verbs.h>`) because `struct ib_qp.uobject` is opaquely typed `struct ib_uqp_object *` (XRC bookkeeping requires the embedded `ib_uevent_object`), so driver-side dump verbs cannot reach `qp->uobject->uevent.uobject.user_handle` directly -- minimum API surface, EXPORT_SYMBOL'd for module use, returns 0 for kernel-mode QPs. CQ has no parallel accessor because `ib_cq.uobject` is `struct ib_uobject *` directly. Type gate (-EOPNOTSUPP for non-{RC,UC,UD}) mirrors `mlx5_ib_restore_qp`'s v0 type set; kernel-mode QP gate (-ENXIO when `ubuffer.umem == NULL` or `db_user_virt == 0`) mirrors QUERY_CQ. Cap is best-effort (mlx5 doesn't track max_send_wr / max_send_sge for user QPs per `mlx5_ib_query_qp`); the dispatcher seam doesn't validate cap content -- forward-compat surface only. | yes (2026-06-01) | **STRONG PASS** (hardware-validated 2026-06-02 via `test_qp_query_mlx5_vfmig.sh` on `mlx5_2`, phys_port_cnt=1). All 5 single-process subtests byte-equal across (A) `mlx5dv_init_obj(MLX5DV_OBJ_QP)` view and (B) kernel ioctl view: happy path (qpn / sq_wqe_count / rq_wqe_count / rq_wqe_shift / buf_addr / db_addr / type / state / user_handle / cap / create_flags), invalid-handle gate (-ENOENT), multi-QP disambiguation (two distinct QPs with distinct qpn / user_handle / buf_addr), type echo (RC vs UD distinct enum values), state echo (RESET -> INIT round-trip via `ibv_modify_qp`). Cross-process B6-style harness rejected as redundant: QUERY_QP is pure introspection, both processes would read from the same kernel state, and a wire-format misalignment would diverge identically across processes. The cross-process round-trip contract is already locked down at S6b B4 by the qp_restore harness's Phase G (which runs `MLX5_VFMIG_IOC_QUERY_QP` on the destination's adopted qpn and asserts byte-equality against the source pre-SAVE QPC snapshot). |
+  | S6b B5 | dump-side verb (`MLX5_IB_METHOD_VFMIG_QUERY_QP` + `qp_query_probe_mlx5_vfmig` + `test_qp_query_mlx5_vfmig.sh` runner): kernel reads `base->mqp.qpn` / `trans_qp.base.ubuffer.umem->address` / `mlx5_ib_db_user_virt(&mqp->db)` / WQ-ring shape (`{sq,rq}.wqe_cnt`, `rq.wqe_shift`) / `mqp->flags_en` and emits a 64-byte payload byte-equal to `mlx5_ib_restore_qp_req` plus two scalar outs (user_handle / create_flags); cap / qp_type / qp_state were trimmed (CRIU sources them from the standard `query_qp` verb + NLDEV `RES_TYPE`/`RES_STATE`), leaving only state with no standard/NLDEV surface. FW-side fields (uidx / bfreg_index / ece_options) are emitted as sentinels (0 / `MLX5_IB_INVALID_BFREG` / 0) since the QPC's user_index / uar_page / ece_options round-trip intact across LOAD per the K7 byte-equal proof and `mlx5_ib_restore_qp` validates-and-discards them. Mirror of S5b B5 for QP. Re-uses the `mlx5_ib_db_user_virt` accessor lifted at S5b B5 (designed to also serve QP per §5.2.4 lift-time docstring). Adds an `ib_qp_user_handle` accessor in `core/verbs.c` (declared in `<rdma/ib_verbs.h>`) because `struct ib_qp.uobject` is opaquely typed `struct ib_uqp_object *` (XRC bookkeeping requires the embedded `ib_uevent_object`), so driver-side dump verbs cannot reach `qp->uobject->uevent.uobject.user_handle` directly -- minimum API surface, EXPORT_SYMBOL'd for module use, returns 0 for kernel-mode QPs. CQ has no parallel accessor because `ib_cq.uobject` is `struct ib_uobject *` directly. Type gate (-EOPNOTSUPP for non-{RC,UC,UD}) mirrors `mlx5_ib_restore_qp`'s v0 type set; kernel-mode QP gate (-ENXIO when `ubuffer.umem == NULL` or `db_user_virt == 0`) mirrors QUERY_CQ. Cap is best-effort (mlx5 doesn't track max_send_wr / max_send_sge for user QPs per `mlx5_ib_query_qp`); the dispatcher seam doesn't validate cap content -- forward-compat surface only. | yes (2026-06-01) | **STRONG PASS** (hardware-validated 2026-06-02 via `test_qp_query_mlx5_vfmig.sh` on `mlx5_2`, phys_port_cnt=1). All 5 single-process subtests byte-equal across (A) `mlx5dv_init_obj(MLX5DV_OBJ_QP)` view and (B) kernel ioctl view: happy path (qpn / sq_wqe_count / rq_wqe_count / rq_wqe_shift / buf_addr / db_addr / type / state / user_handle / cap / create_flags), invalid-handle gate (-ENOENT), multi-QP disambiguation (two distinct QPs with distinct qpn / user_handle / buf_addr), type echo (RC vs UD distinct enum values), state echo (RESET -> INIT round-trip via `ibv_modify_qp`). Cross-process B6-style harness rejected as redundant: QUERY_QP is pure introspection, both processes would read from the same kernel state, and a wire-format misalignment would diverge identically across processes. The cross-process round-trip contract is already locked down at S6b B4 by the qp_restore harness's Phase G (which runs `MLX5_VFMIG_IOC_QUERY_QP` on the destination's adopted qpn and asserts byte-equality against the source pre-SAVE QPC snapshot). |
   | S6a A1 | UAPI `rxe_restore_qp_req` (sq_vm_pgoff / rq_vm_pgoff / req.psn / resp.psn / req.wqe_index / per-state attrs not on `ib_qp_attr`) | pending | -- |
   | S6a A2 | `rxe_restore_qp` handler: alloc fresh `rxe_qp` at source qpn, stamp every attr, set `qp->state` to captured final state, propagate `q->index` from buf indices, set `qp->req.psn` / `qp->resp.psn` / `qp->req.wqe_index`. Single-shot, no `ib_modify_qp` | pending | -- |
   | S6a A3 | `RXE_METHOD_VFMIG_FREEZE_DATAPATH` ucontext-scope verb + `rxe_qp_pause` / `rxe_qp_resume` helpers (?5.3.7). Non-destructive, no IBTA state-machine touch. mlx5_vfmig has no symmetric verb (FW SAVE_VHCA_STATE is the freeze) | pending | -- |

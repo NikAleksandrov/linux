@@ -15,9 +15,11 @@
 # The kernel-side fields it reads
 # (qp->trans_qp.base.{mqp.qpn, ubuffer.umem->address},
 # mlx5_ib_db_user_virt(&qp->db), qp->{sq,rq}.{wqe_cnt}, qp->
-# rq.wqe_shift, qp->flags_en, qp->state, qp->qp_type, the
+# rq.wqe_shift, qp->flags_en, qp->flags, the
 # ib_uobject->user_handle via ib_qp_user_handle()) exist on
-# every user-mode QP on every mlx5 ib_device. The probe is its
+# every user-mode QP on every mlx5 ib_device. cap / qp_type /
+# qp_state are no longer part of the verb -- CRIU sources those
+# from the standard query_qp + NLDEV. The probe is its
 # own pass-criterion validator: it allocates real QPs via
 # libibverbs, reads view (A) via mlx5dv_init_obj(MLX5DV_OBJ_QP),
 # reads view (B) via the new ioctl, and asserts strict byte-
@@ -28,8 +30,6 @@
 #   1. happy path     -- single RC QP, RESET -> INIT, byte-equal blob+scalars
 #   2. invalid handle -- HANDLE=0xdeadbeef must -ENOENT
 #   3. multi-QP       -- two distinct QPs, each query returns its own fields
-#   4. type echo      -- UD QP, resp_type matches IBTA enum
-#   5. state echo     -- RESET / INIT round-trip via ibv_modify_qp
 #
 # Usage:
 #   sudo ./test_qp_query_mlx5_vfmig.sh                  # mlx5_0 default

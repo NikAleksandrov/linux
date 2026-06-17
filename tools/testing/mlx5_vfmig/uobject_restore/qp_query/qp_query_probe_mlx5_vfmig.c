@@ -18,8 +18,11 @@
  *       handler reads qp->trans_qp.base.{mqp.qpn, ubuffer.umem->
  *       address}, mlx5_ib_db_user_virt(&qp->db), the WQ-ring shape
  *       (sq/rq.wqe_cnt + rq.wqe_shift), and packs a 64-byte
- *       mlx5_ib_restore_qp_req blob plus five scalar outs (type /
- *       state / user_handle / cap / create_flags).
+ *       mlx5_ib_restore_qp_req blob plus two scalar outs (user_handle /
+ *       create_flags). cap / qp_type / qp_state are no longer emitted
+ *       by the verb -- CRIU sources those from the standard
+ *       IB_USER_VERBS_CMD_QUERY_QP verb + NLDEV -- so this probe no
+ *       longer cross-checks them.
  *
  * In a single-process probe (this binary), (A) and (B) describe the
  * same live QP in the same address space, so we can demand strict
@@ -37,16 +40,11 @@
  *     blob.ece_options  == 0
  *     blob.reserved     == 0
  *     blob.reserved2    == 0
- *     resp_type         == ibv_qp.qp_type
- *     resp_state        == ibv_qp_attr.qp_state (post ibv_query_qp)
  *     resp_user_handle  == matches the source-side libibverbs handle
  *                          stamped by ib_uverbs_create_qp; we cannot
  *                          read it from libibverbs but multi-QP
  *                          disambiguation (subtest 3) checks it is
  *                          unique-per-QP and stable.
- *     resp_cap          == best-effort echo (handler emits
- *                          {sq,rq}.wqe_cnt for max_{send,recv}_wr;
- *                          rq.max_gs / max_inline_data tracked).
  *     resp_create_flags == 0 (no IB_QP_CREATE_* flags via
  *                          libibverbs default ibv_create_qp).
  *
@@ -94,14 +92,6 @@
  *      state" / "wrong qp" bug where the handler reads from the
  *      wrong mlx5_ib_qp. Asserts qpn / buf_addr / db_addr (modulo
  *      shared DBR page) / user_handle distinctness.
- *
- *   4. type echo. A UD QP (qp_type=IBV_QPT_UD) must come back
- *      with resp_type matching the IBTA enum value mlx5 uses
- *      internally for UD. Catches any "we hard-coded RC" bug.
- *
- *   5. state echo. RESET / INIT round-trip. Verifies resp_state
- *      tracks ibv_modify_qp transitions through the kernel's
- *      mlx5_ib_modify_qp.
  *
  * The probe is libibverbs + libmlx5; we genuinely need mlx5dv to
  * have a (A)-view to compare against. fw_id_continuity_probe is
@@ -157,20 +147,6 @@ struct mlx5_ib_restore_qp_req {
 	uint32_t	reserved;
 	uint32_t	reserved2;
 } __attribute__((aligned(8)));
-
-/*
- * Mirror of include/uapi/rdma/ib_user_ioctl_verbs.h struct
- * ib_uverbs_qp_cap. 5 u32 fields = 20 bytes. The QUERY_QP handler
- * emits a best-effort echo of the cap ibv_create_qp returned to
- * the source.
- */
-struct probe_qp_cap {
-	uint32_t	max_send_wr;
-	uint32_t	max_recv_wr;
-	uint32_t	max_send_sge;
-	uint32_t	max_recv_sge;
-	uint32_t	max_inline_data;
-};
 
 /*
  * MLX5_IB_INVALID_BFREG -- sentinel the handler emits in
@@ -233,15 +209,14 @@ struct ib_uverbs_ioctl_hdr {
 
 /*
  * Mirror of enum mlx5_ib_vfmig_query_qp_attrs. HANDLE is the IDR-
- * resolved QP uobject; the six RESP_* are u32 / u64 / blob outs.
+ * resolved QP uobject; the three RESP_* are blob / u64 / u32 outs.
+ * cap / qp_type / qp_state were dropped from the verb (CRIU sources
+ * them from the standard query_qp + NLDEV), so the ids renumbered.
  */
 #define MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE		(1u << UVERBS_ID_NS_SHIFT)
 #define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB		(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 1u)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE		(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 2u)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE		(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 3u)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE	(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 4u)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP		(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 5u)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS	(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 6u)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE	(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 2u)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS	(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE + 3u)
 
 /* ---------------------------------------------------------------------- */
 /*                            helpers                                     */
@@ -314,21 +289,17 @@ static int probe_ilog2(uint32_t x)
 
 /*
  * Issue MLX5_IB_METHOD_VFMIG_QUERY_QP on @fd (the libibverbs cmd_fd)
- * for the QP at ufile @qp_handle. Fills @blob_out / @type_out /
- * @state_out / @user_handle_out / @cap_out / @flags_out on success.
- * Returns 0 or -errno.
+ * for the QP at ufile @qp_handle. Fills @blob_out / @user_handle_out /
+ * @flags_out on success. Returns 0 or -errno.
  */
 static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 			     struct mlx5_ib_restore_qp_req *blob_out,
-			     uint32_t *type_out,
-			     uint32_t *state_out,
 			     uint64_t *user_handle_out,
-			     struct probe_qp_cap *cap_out,
 			     uint32_t *flags_out)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[7];
+		struct ib_uverbs_attr		attrs[4];
 	} cmd = {};
 	unsigned int n = 0;
 
@@ -352,28 +323,10 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	cmd.attrs[n].data	= (uintptr_t)blob_out;
 	n++;
 
-	cmd.attrs[n].attr_id	= MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE;
-	cmd.attrs[n].len	= sizeof(*type_out);
-	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data	= (uintptr_t)type_out;
-	n++;
-
-	cmd.attrs[n].attr_id	= MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE;
-	cmd.attrs[n].len	= sizeof(*state_out);
-	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data	= (uintptr_t)state_out;
-	n++;
-
 	cmd.attrs[n].attr_id	= MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE;
 	cmd.attrs[n].len	= sizeof(*user_handle_out);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)user_handle_out;
-	n++;
-
-	cmd.attrs[n].attr_id	= MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP;
-	cmd.attrs[n].len	= sizeof(*cap_out);
-	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data	= (uintptr_t)cap_out;
 	n++;
 
 	cmd.attrs[n].attr_id	= MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS;
@@ -509,14 +462,10 @@ static int probe_qp_to_init(struct ibv_qp *qp, uint8_t port_num)
 
 struct qp_obs {
 	struct mlx5_ib_restore_qp_req	blob;
-	uint32_t			type;
-	uint32_t			state;
 	uint64_t			user_handle;
-	struct probe_qp_cap		cap;
 	uint32_t			create_flags;
 	struct mlx5dv_qp		dv;
 	uint32_t			expected_qpn;
-	uint32_t			expected_state;
 };
 
 /*
@@ -610,18 +559,6 @@ static int compare_views(const struct qp_obs *o, const char *label)
 		ok = 0;
 	}
 
-	if (o->state != o->expected_state) {
-		fprintf(stderr,
-			"qpq[%s]: resp_state=%u != expected=%u\n",
-			label, o->state, o->expected_state);
-		ok = 0;
-	}
-	if (o->cap.max_recv_wr == 0 && o->dv.rq.wqe_cnt != 0) {
-		fprintf(stderr,
-			"qpq[%s]: resp_cap.max_recv_wr=0 but dvqp.rq.wqe_cnt=%u\n",
-			label, o->dv.rq.wqe_cnt);
-		ok = 0;
-	}
 	if (o->create_flags != 0) {
 		fprintf(stderr,
 			"qpq[%s]: resp_create_flags=0x%x (expected 0; ibv_create_qp default sets none)\n",
@@ -633,18 +570,13 @@ static int compare_views(const struct qp_obs *o, const char *label)
 		fprintf(stderr,
 			"qpq[%s]: STRONG byte-equal: qpn=0x%x sq_wqe_count=%u "
 			"rq_wqe_count=%u rq_wqe_shift=%u buf_addr=0x%llx "
-			"db_addr=0x%llx type=%u state=%u user_handle=0x%llx "
-			"cap={s_wr=%u r_wr=%u s_sge=%u r_sge=%u inl=%u} "
-			"create_flags=0x%x\n",
+			"db_addr=0x%llx user_handle=0x%llx create_flags=0x%x\n",
 			label, o->blob.qpn, o->blob.sq_wqe_count,
 			o->blob.rq_wqe_count, o->blob.rq_wqe_shift,
 			(unsigned long long)o->blob.buf_addr,
 			(unsigned long long)o->blob.db_addr,
-			o->type, o->state,
 			(unsigned long long)o->user_handle,
-			o->cap.max_send_wr, o->cap.max_recv_wr,
-			o->cap.max_send_sge, o->cap.max_recv_sge,
-			o->cap.max_inline_data, o->create_flags);
+			o->create_flags);
 	}
 	return ok ? 0 : -1;
 }
@@ -669,11 +601,9 @@ static int subtest_happy(struct ibv_context *ctx, uint8_t port_num,
 		goto out;
 
 	obs.expected_qpn = p.qp->qp_num;
-	obs.expected_state = (uint32_t)IBV_QPS_INIT;
 
 	if (do_vfmig_query_qp(ctx->cmd_fd, p.qp->handle,
-			      &obs.blob, &obs.type, &obs.state,
-			      &obs.user_handle, &obs.cap,
+			      &obs.blob, &obs.user_handle,
 			      &obs.create_flags)) {
 		fprintf(stderr, "qpq[%s]: VFMIG_QUERY_QP failed: %s\n",
 			label, strerror(errno));
@@ -693,14 +623,12 @@ out:
 static int subtest_invalid_handle(struct ibv_context *ctx)
 {
 	struct mlx5_ib_restore_qp_req blob;
-	struct probe_qp_cap cap = {};
-	uint32_t type = 0, state = 0, flags = 0;
+	uint32_t flags = 0;
 	uint64_t user_handle = 0;
 	int err;
 
 	err = do_vfmig_query_qp(ctx->cmd_fd, 0xdeadbeefu,
-				&blob, &type, &state, &user_handle,
-				&cap, &flags);
+				&blob, &user_handle, &flags);
 	if (err == 0) {
 		fprintf(stderr, "qpq[invalid]: succeeded on bogus handle 0xdeadbeef (must -ENOENT)\n");
 		return -1;
@@ -735,16 +663,12 @@ static int subtest_multi_qp(struct ibv_context *ctx)
 		goto out;
 
 	oa.expected_qpn   = pa.qp->qp_num;
-	oa.expected_state = (uint32_t)IBV_QPS_RESET;
 	ob.expected_qpn   = pb.qp->qp_num;
-	ob.expected_state = (uint32_t)IBV_QPS_RESET;
 
 	if (do_vfmig_query_qp(ctx->cmd_fd, pa.qp->handle,
-			      &oa.blob, &oa.type, &oa.state,
-			      &oa.user_handle, &oa.cap, &oa.create_flags) ||
+			      &oa.blob, &oa.user_handle, &oa.create_flags) ||
 	    do_vfmig_query_qp(ctx->cmd_fd, pb.qp->handle,
-			      &ob.blob, &ob.type, &ob.state,
-			      &ob.user_handle, &ob.cap, &ob.create_flags)) {
+			      &ob.blob, &ob.user_handle, &ob.create_flags)) {
 		fprintf(stderr, "qpq[multi]: QUERY_QP failed: %s\n",
 			strerror(errno));
 		goto out;
@@ -775,115 +699,6 @@ out:
 	probe_qp_free(&pb);
 out_a:
 	probe_qp_free(&pa);
-	return rc;
-}
-
-/*
- * Subtest 4: type echo. Build a UD QP, verify resp_type isn't 0 / not
- * the RC value the happy-path subtest exercised. The kernel emits
- * mqp->type which is the IBTA enum value mlx5 uses internally; we
- * cross-check that two QPs of distinct types yield distinct resp_type.
- */
-static int subtest_type_echo(struct ibv_context *ctx)
-{
-	struct probe_qp prc = {}, pud = {};
-	struct mlx5_ib_restore_qp_req blob;
-	struct probe_qp_cap cap = {};
-	uint32_t rc_type = 0, ud_type = 0;
-	uint32_t state = 0, flags = 0;
-	uint64_t user_handle = 0;
-	int rc = -1;
-
-	if (probe_qp_alloc(ctx, IBV_QPT_RC, 16, 16, 1, 1, &prc))
-		return -1;
-	if (probe_qp_alloc(ctx, IBV_QPT_UD, 16, 16, 1, 1, &pud))
-		goto out_rc;
-
-	if (do_vfmig_query_qp(ctx->cmd_fd, prc.qp->handle,
-			      &blob, &rc_type, &state, &user_handle,
-			      &cap, &flags)) {
-		fprintf(stderr, "qpq[type]: QUERY_QP(RC) failed: %s\n",
-			strerror(errno));
-		goto out;
-	}
-	if (do_vfmig_query_qp(ctx->cmd_fd, pud.qp->handle,
-			      &blob, &ud_type, &state, &user_handle,
-			      &cap, &flags)) {
-		fprintf(stderr, "qpq[type]: QUERY_QP(UD) failed: %s\n",
-			strerror(errno));
-		goto out;
-	}
-
-	if (rc_type == ud_type) {
-		fprintf(stderr,
-			"qpq[type]: resp_type does not distinguish RC vs UD (both=%u)\n",
-			rc_type);
-		goto out;
-	}
-
-	fprintf(stderr,
-		"qpq[type]: PASS resp_type(RC)=%u resp_type(UD)=%u (distinct)\n",
-		rc_type, ud_type);
-	rc = 0;
-out:
-	probe_qp_free(&pud);
-out_rc:
-	probe_qp_free(&prc);
-	return rc;
-}
-
-/*
- * Subtest 5 (state echo): RESET -> INIT round-trip. Query at RESET,
- * then ibv_modify_qp(INIT), then re-query and confirm resp_state
- * tracks the kernel's mlx5_ib_modify_qp transition.
- */
-static int subtest_state_echo(struct ibv_context *ctx, uint8_t port_num)
-{
-	struct probe_qp p = {};
-	struct mlx5_ib_restore_qp_req blob;
-	struct probe_qp_cap cap = {};
-	uint32_t type = 0, state_reset = 0, state_init = 0, flags = 0;
-	uint64_t user_handle = 0;
-	int rc = -1;
-
-	if (probe_qp_alloc(ctx, IBV_QPT_RC, 16, 16, 1, 1, &p))
-		return -1;
-
-	if (do_vfmig_query_qp(ctx->cmd_fd, p.qp->handle,
-			      &blob, &type, &state_reset, &user_handle,
-			      &cap, &flags)) {
-		fprintf(stderr, "qpq[state]: QUERY_QP(RESET) failed: %s\n",
-			strerror(errno));
-		goto out;
-	}
-	if (state_reset != (uint32_t)IBV_QPS_RESET) {
-		fprintf(stderr, "qpq[state]: pre-modify resp_state=%u (want RESET=%u)\n",
-			state_reset, (uint32_t)IBV_QPS_RESET);
-		goto out;
-	}
-
-	if (probe_qp_to_init(p.qp, port_num))
-		goto out;
-
-	if (do_vfmig_query_qp(ctx->cmd_fd, p.qp->handle,
-			      &blob, &type, &state_init, &user_handle,
-			      &cap, &flags)) {
-		fprintf(stderr, "qpq[state]: QUERY_QP(INIT) failed: %s\n",
-			strerror(errno));
-		goto out;
-	}
-	if (state_init != (uint32_t)IBV_QPS_INIT) {
-		fprintf(stderr, "qpq[state]: post-modify resp_state=%u (want INIT=%u)\n",
-			state_init, (uint32_t)IBV_QPS_INIT);
-		goto out;
-	}
-
-	fprintf(stderr,
-		"qpq[state]: PASS RESET=%u -> INIT=%u\n",
-		state_reset, state_init);
-	rc = 0;
-out:
-	probe_qp_free(&p);
 	return rc;
 }
 
@@ -929,10 +744,6 @@ int main(int argc, char **argv)
 	if (subtest_invalid_handle(ctx))
 		goto out;
 	if (subtest_multi_qp(ctx))
-		goto out;
-	if (subtest_type_echo(ctx))
-		goto out;
-	if (subtest_state_echo(ctx, port_num))
 		goto out;
 
 	fprintf(stderr, "qpq: ALL SUBTESTS PASS\n");
