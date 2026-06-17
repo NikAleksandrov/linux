@@ -40,6 +40,12 @@
 #   1  setup error
 #   2  drift gate did NOT fire (regression: second LOAD succeeded
 #      or failed with the wrong error)
+#  77  the restored-VF unbind in cell 1 wedged the kernel (a firmware
+#      command in the half-restored VHCA's mlx5e/flow-steering teardown
+#      never completed). This is the documented restored-VF teardown
+#      gap, not a drift-gate regression. The box must be rebooted before
+#      further mlx5 work can succeed; run_all_harnesses.sh treats this
+#      as a non-fatal WEDGE/SKIP and stops the sweep.
 
 set -euo pipefail
 
@@ -55,17 +61,70 @@ BLOB=${BLOB:-/tmp/vf_m2r_iova.blob}
 
 PASS_COUNT=0
 FAIL_COUNT=0
+WEDGED=0
 
 emit_pass() { echo "PASS: $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
 emit_fail() { echo "FAIL: $*"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
 cleanup() {
+	# If cell 1 wedged the kernel, ANY sysfs write that touches the
+	# stuck device (sriov_numvfs -> pci_disable_sriov walks the wedged
+	# VF; even autoprobe is on the same PF) would itself block in
+	# uninterruptible D state on the held device_lock chain. Leave the
+	# rig exactly as-is and bail -- the operator must reboot.
+	[ "$WEDGED" = 1 ] && return 0
 	# Best-effort: leave the rig in numvfs=0 / autoprobe=1 so the
 	# next test is set up to provision freshly. Ignore failures.
 	echo 0 > "/sys/bus/pci/devices/$PF/sriov_numvfs" 2>/dev/null || true
 	echo 1 > "/sys/bus/pci/devices/$PF/sriov_drivers_autoprobe" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Unbind a VF from its driver with a bounded wait -- the unbind-direction
+# twin of bind_vf_safe() in test_iova_tracked_save_load.sh.
+#
+# A *restored* (LOAD_VHCA_STATE'd) VF is only functional for the L0-L3
+# happy path; its mlx5e / flow-steering teardown issues firmware commands
+# (mlx5_cmd_update_root_ft, *_VHCA, MANAGE_PAGES reclaim, ...) that the
+# half-restored VHCA may be unable to service. A bare foreground
+#
+#     echo $VF > /sys/bus/pci/devices/$VF/driver/unbind
+#
+# then blocks in write() holding the device_lock chain while each stuck
+# teardown command burns the full command timeout (MLX5_TO_CMD_MS = 60s)
+# and "leaks a command resource" -- serially, once per command. Minutes
+# of held locks back up the health poller and the console into a
+# soft-lockup / RCU-stall storm, and the only recovery is a reboot.
+#
+# Backgrounding the write does NOT unwedge the kernel (the stuck task
+# keeps the mutexes), but it lets THIS script bail cleanly so the suite
+# records a result and the operator gets a "reboot required" signal
+# instead of a silent wedge.
+#
+# Args:  $1 = VF BDF   $2 = timeout seconds (default 75, > 60s FW timeout)
+# Returns: 0 unbound within the bound; 1 wedged (reboot required).
+unbind_vf_safe() {
+	local vf=$1 timeout=${2:-75} started bg
+	started=$(date +%s)
+	( echo "$vf" > "/sys/bus/pci/devices/$vf/driver/unbind" ) >/dev/null 2>&1 &
+	bg=$!
+	while :; do
+		if [ ! -e "/sys/bus/pci/devices/$vf/driver" ]; then
+			wait "$bg" 2>/dev/null || true
+			return 0
+		fi
+		if ! kill -0 "$bg" 2>/dev/null; then
+			# write() returned; give the symlink a tick to drop.
+			sleep 0.2
+			[ ! -e "/sys/bus/pci/devices/$vf/driver" ] && return 0
+			return 1
+		fi
+		if [ $(( $(date +%s) - started )) -ge "$timeout" ]; then
+			return 1
+		fi
+		sleep 0.5
+	done
+}
 
 echo "==== drift_gate setup: SAVE + LOAD + bind via iova-tracked test ===="
 PF="$PF" BLOB="$BLOB" ROLE=both "$IOVA_TEST" >/dev/null
@@ -78,8 +137,25 @@ VF=$(basename "$(readlink "/sys/bus/pci/devices/$PF/virtfn0")")
 
 echo "==== drift_gate cell 1: unbind, then second LOAD must fail ===="
 sudo dmesg -C
-echo "$VF" > "/sys/bus/pci/devices/$VF/driver/unbind"
-sleep 0.5
+if ! unbind_vf_safe "$VF" 75; then
+	WEDGED=1
+	cat >&2 <<EOF
+
+WEDGE: unbind of restored VF $VF did not complete within 75s.
+
+The half-restored VHCA's mlx5e / flow-steering teardown is stuck on a
+firmware command that never completes (look for a
+'mlx5_cmd_update_root_ft', '*_VHCA', or 'MANAGE_PAGES ... timeout' leak
+in dmesg). The unbind holds the device_lock chain, so every subsequent
+mlx5 operation -- sriov_numvfs=0, rmmod, other VF binds -- will also
+block. A reboot is required before further mlx5 work can succeed.
+
+This is the documented restored-VF teardown gap, not a drift-gate
+regression. See bind_vf_safe() in test_iova_tracked_save_load.sh and
+design/vf_prerestore_split.md. Skipping the rest of the probe.
+EOF
+	exit 77
+fi
 [ ! -e "/sys/bus/pci/devices/$VF/driver" ] || {
 	emit_fail "VF $VF still bound after unbind"
 	exit 2

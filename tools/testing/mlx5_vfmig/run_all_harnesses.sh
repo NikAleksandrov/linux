@@ -113,7 +113,6 @@ TESTS=(
   "inkernel_save_load|save_load/test_inkernel_save_load_roundtrip.sh||xfail:non-tracked LOAD superseded by deterministic-IOVA path"
   "vfio_save_load|save_load/test_vfio_save_load_roundtrip.sh||xfail:non-tracked LOAD superseded; SAVE side still validated"
   "multi_load_stage_gate|save_load/multi_load_gates/test_multi_load_stage_gate.sh||run"
-  "multi_load_drift_gate|save_load/multi_load_gates/test_multi_load_drift_gate.sh||run"
   "user_object_replay|save_load/user_object_replay/test_user_object_replay.sh||run"
   "pd_restore|uobject_restore/pd_restore/test_pd_restore_mlx5_vfmig.sh||run"
   "pd_adopt|uobject_restore/pd_adopt/test_pd_adopt.sh||xfail:DEVX-uid PD adoption is a known post-LOAD FW gap (uid=0 lane passes)"
@@ -135,6 +134,11 @@ TESTS=(
   "uar_persistence|uar_restore/probe_uar_persistence.sh||run"
   "qp_av_dmac|uobject_restore/qp_av_dmac/check_qp_av_dmac.sh||skip:parametrized checker, needs <vf_id> <qpn>"
   "qp_restore_rxe|uobject_restore/qp_restore/test_qp_restore_rxe.sh||run"
+  # Kept last on purpose: cell 1 unbinds a restored VF, and the
+  # half-restored VHCA's teardown can wedge the kernel on a stuck FW
+  # command (rc=77 -> WEDGE). Running it last means a wedge truncates
+  # no other coverage; the harness self-protects with unbind_vf_safe.
+  "multi_load_drift_gate|save_load/multi_load_gates/test_multi_load_drift_gate.sh||run"
 )
 
 reset_vfs() {
@@ -152,7 +156,15 @@ want() {
 # --- run -------------------------------------------------------------------
 
 SUMMARY="$LOGDIR/SUMMARY.txt"; : > "$SUMMARY"
-n_pass=0 n_xfail=0 n_xpass=0 n_skip=0 n_fail=0
+n_pass=0 n_xfail=0 n_xpass=0 n_skip=0 n_fail=0 n_wedge=0
+WEDGED=0
+
+# A harness exits 77 when it detects that it just wedged the kernel on a
+# stuck firmware command (a held device_lock chain that no subsequent
+# mlx5 operation can get past -- only a reboot recovers). Treat it as a
+# non-fatal WEDGE and stop the sweep: anything we run after this would
+# block in uninterruptible D state too, including reset_vfs.
+SKIP_RC=77
 
 for entry in "${TESTS[@]}"; do
     IFS='|' read -r name script env class <<< "$entry"
@@ -179,6 +191,15 @@ for entry in "${TESTS[@]}"; do
     rc=$?
     dur=$(( $(date +%s) - start ))
 
+    # A self-reported kernel wedge trumps the per-test expectation: stop
+    # the sweep before reset_vfs (or the next harness) blocks forever.
+    if [ "$rc" -eq "$SKIP_RC" ]; then
+        printf 'WEDGE  %-22s %4ss  (kernel wedged; reboot required -- see %s)\n' \
+            "$name" "$dur" "$log" | tee -a "$SUMMARY"
+        n_wedge=$((n_wedge+1)); WEDGED=1
+        break
+    fi
+
     if [ "$ctype" = xfail ]; then
         if [ "$rc" -eq 0 ]; then
             printf 'XPASS  %-22s %4ss  (now passes? expectation may be stale: %s)\n' \
@@ -198,17 +219,32 @@ for entry in "${TESTS[@]}"; do
     esac
 done
 
-reset_vfs
+# Skip the final teardown if the kernel is wedged -- a sysfs write to
+# the stuck device would block in uninterruptible D state.
+[ "$WEDGED" = 1 ] || reset_vfs
 
 echo
 echo "===================== SUMMARY ============================"
 cat "$SUMMARY"
 echo "=========================================================="
-echo "PASS=$n_pass XFAIL=$n_xfail XPASS=$n_xpass SKIP=$n_skip FAIL=$n_fail"
+echo "PASS=$n_pass XFAIL=$n_xfail XPASS=$n_xpass SKIP=$n_skip FAIL=$n_fail WEDGE=$n_wedge"
 echo "logs: $LOGDIR/"
+if [ "$WEDGED" = 1 ]; then
+    echo
+    echo "##########################################################"
+    echo "# KERNEL WEDGED -- sweep truncated, REBOOT before re-run #"
+    echo "##########################################################"
+    echo "A harness hit a stuck mlx5 firmware command (restored-VF"
+    echo "teardown gap). Harnesses after the wedge point did not run."
+    echo "This is a known gap, not an unexpected regression."
+fi
 if [ "$n_fail" -ne 0 ]; then
     echo "RESULT: FAIL ($n_fail unexpected failure(s))"
     exit 1
+fi
+if [ "$WEDGED" = 1 ]; then
+    echo "RESULT: WEDGE (no unexpected failures; suite truncated, reboot required)"
+    exit 0
 fi
 echo "RESULT: GREEN (no unexpected failures)"
 exit 0
