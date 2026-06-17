@@ -642,8 +642,16 @@ enum mlx5_ib_vfmig_query_cq_attrs {
  * The HANDLE is resolved via UVERBS_ATTR_IDR(UVERBS_OBJECT_QP,
  * UVERBS_ACCESS_READ): the calling fd's ufile-idr must own this QP.
  *
- * The five RESP_* outs together provide everything UVERBS_METHOD_RESTORE_QP
- * consumes for an mlx5 QP that was created from userspace:
+ * Principle: a driver-private QUERY_QP returns only QP state that the
+ * standard IB_USER_VERBS_CMD_QUERY_QP verb (and NLDEV) cannot express.
+ * The dumper already holds the owning uctx fd + the QP IDR handle, so it
+ * sources cap from the standard query_qp (cap is creation-static, hence
+ * order-insensitive w.r.t. FREEZE_DATAPATH), qp_type from NLDEV
+ * RES_TYPE, and qp_state from query_qp / NLDEV RES_STATE. Those three
+ * are therefore NOT re-exported here.
+ *
+ * The three RESP_* outs are everything left that has no standard /
+ * NLDEV surface:
  *
  *   RESP_BLOB         struct mlx5_ib_restore_qp_req (64 bytes; goes
  *                     verbatim into UVERBS_ATTR_RESTORE_QP_UHW_IN /
@@ -657,36 +665,21 @@ enum mlx5_ib_vfmig_query_cq_attrs {
  *                     v0 design's whole reason for existing -- CRIU
  *                     plugin code is memcpy in, memcpy out.
  *
- *   RESP_TYPE         u32, the source's mqp->type. Goes into
- *                     UVERBS_ATTR_RESTORE_QP_TYPE. Constrained to
- *                     RC / UC / UD at v0 (handler -EOPNOTSUPP for
- *                     RAW_PACKET / XRC / GSI / DCT/DCI).
- *
- *   RESP_STATE        u32, the source's mqp->state. Goes into
- *                     UVERBS_ATTR_RESTORE_QP_STATE.
- *
  *   RESP_USER_HANDLE  u64, the source's ibqp->uobject->user_handle.
  *                     Goes into UVERBS_ATTR_RESTORE_QP_USER_HANDLE.
- *
- *   RESP_CAP          struct ib_uverbs_qp_cap; goes into
- *                     UVERBS_ATTR_RESTORE_QP_CAP. Best-effort echo
- *                     of the cap ibv_create_qp returned to the
- *                     source (see method comment for the per-field
- *                     derivation).
+ *                     Not standard-queryable.
  *
  *   RESP_CREATE_FLAGS u32, the source's mqp->flags. Goes into
- *                     UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS.
+ *                     UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS. Not present
+ *                     in the legacy query_qp resp.
  *
- * All six (HANDLE + five RESP_*) are MANDATORY: a CRIU plugin that
+ * All four (HANDLE + three RESP_*) are MANDATORY: a CRIU plugin that
  * ignores any of them at dump time will produce an unrestorable image.
  */
 enum mlx5_ib_vfmig_query_qp_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
-	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE,
-	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
-	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
 };
 

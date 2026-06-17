@@ -913,7 +913,10 @@ DECLARE_UVERBS_NAMED_METHOD(
  * UVERBS_OBJECT_QP on the calling fd's ufile, the bytes a CRIU plugin
  * needs to drive UVERBS_METHOD_RESTORE_QP on the destination side.
  *
- * Six-part output:
+ * Three-part output (only state with no standard / NLDEV surface;
+ * cap / qp_type / qp_state are sourced by the dumper from the standard
+ * IB_USER_VERBS_CMD_QUERY_QP verb + NLDEV, so this verb no longer
+ * re-exports them):
  *   RESP_BLOB         struct mlx5_ib_restore_qp_req (64 bytes), byte-
  *                     equal to what RESTORE_QP's UHW will consume. The
  *                     handler leaves req.{reserved, reserved2} zero so
@@ -924,34 +927,22 @@ DECLARE_UVERBS_NAMED_METHOD(
  *                     across LOAD_VHCA_STATE intact (see K7 byte-equal
  *                     proof, design §6.3 / S6 wider sweep), and the
  *                     RESTORE_QP handler validates-and-discards them.
- *   RESP_TYPE         qp->type, the source's mlx5-internal QP type
- *                     enum (RC/UC/UD only at v0).
- *   RESP_STATE        qp->state, the source's kernel-tracked QP state
- *                     (kept live by mlx5_ib_modify_qp).
  *   RESP_USER_HANDLE  ibqp->uobject->user_handle, the userspace tag
- *                     ib_uverbs_create_qp recorded at create.
- *   RESP_CAP          struct ib_uverbs_qp_cap; best-effort echo of the
- *                     cap that ibv_create_qp returned to the source.
- *                     mlx5 doesn't track every cap field on user-mode
- *                     QPs (see mlx5_ib_query_qp); we emit qp->sq.wqe_cnt
- *                     for max_send_wr, qp->rq.wqe_cnt for max_recv_wr,
- *                     qp->rq.max_gs for max_recv_sge, qp->max_inline_data
- *                     for max_inline_data, and 1 for max_send_sge. The
- *                     mlx5 RESTORE_QP handler doesn't validate cap
- *                     content (the actual WQ shape comes from the UHW's
- *                     {sq,rq}_wqe_count); the field is forward-compat
- *                     surface for a future driver that may consult it.
+ *                     ib_uverbs_create_qp recorded at create. Not
+ *                     standard-queryable.
  *   RESP_CREATE_FLAGS qp->flags (the IB_QP_CREATE_* mask captured at
- *                     create time -- same field mlx5_ib_query_qp
- *                     returns).
+ *                     create time). Not present in the legacy
+ *                     query_qp resp.
  *
  * Precondition: the QP must be a user-mode QP whose mlx5_ib representation
  * lives in trans_qp (RC / UC / UD). Other QP types -- raw_packet (uses
  * raw_packet_qp; no trans_qp), XRC INI/TGT, GSI, DCT, DCI -- reject
  * with -EOPNOTSUPP. This mirrors the v0 type set mlx5_ib_restore_qp
- * accepts. Kernel-mode QPs (no umem) reject with -ENXIO, mirroring
- * the QUERY_CQ kernel-mode rejection: there are no source userspace
- * VAs to emit and RESTORE_QP would have nothing to consume.
+ * accepts; the gate is kept as an internal mqp->type check even though
+ * the type value is no longer emitted. Kernel-mode QPs (no umem) reject
+ * with -ENXIO, mirroring the QUERY_CQ kernel-mode rejection: there are
+ * no source userspace VAs to emit and RESTORE_QP would have nothing to
+ * consume.
  *
  * The IDR lookup for HANDLE goes through the calling fd's ufile and
  * grabs UVERBS_ACCESS_READ on the QP uobject for the duration of
@@ -965,9 +956,6 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(
 	struct mlx5_ib_qp *mqp;
 	struct mlx5_ib_qp_base *base;
 	struct mlx5_ib_restore_qp_req blob = {};
-	struct ib_uverbs_qp_cap cap = {};
-	u32 type;
-	u32 state;
 	u64 user_handle;
 	u32 create_flags;
 	int err;
@@ -1068,46 +1056,16 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(
 	blob.bfreg_index = MLX5_IB_INVALID_BFREG;
 	blob.ece_options = 0;
 
-	type = mqp->type;
-	state = mqp->state;
 	user_handle = ib_qp_user_handle(ibqp);
 	create_flags = mqp->flags;
-
-	/*
-	 * Cap is best-effort: see method comment for the per-field
-	 * derivation. mlx5_ib_query_qp shows that for user-mode QPs
-	 * the kernel doesn't track max_send_wr / max_send_sge (those
-	 * are libmlx5-internal post-rounding values); we emit
-	 * qp->sq.wqe_cnt for max_send_wr (closest kernel echo of the
-	 * post-rounding SQ depth) and 1 for max_send_sge (no kernel
-	 * field; cap on the dispatcher seam is forward-compat surface,
-	 * not a validation gate for the mlx5 RESTORE_QP handler).
-	 */
-	cap.max_send_wr = mqp->sq.wqe_cnt;
-	cap.max_recv_wr = mqp->rq.wqe_cnt;
-	cap.max_send_sge = 1;
-	cap.max_recv_sge = mqp->rq.max_gs;
-	cap.max_inline_data = mqp->max_inline_data;
 
 	err = uverbs_copy_to(attrs,
 		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB, &blob, sizeof(blob));
 	if (err)
 		return err;
 	err = uverbs_copy_to(attrs,
-		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE, &type, sizeof(type));
-	if (err)
-		return err;
-	err = uverbs_copy_to(attrs,
-		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE, &state, sizeof(state));
-	if (err)
-		return err;
-	err = uverbs_copy_to(attrs,
 		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
 		&user_handle, sizeof(user_handle));
-	if (err)
-		return err;
-	err = uverbs_copy_to(attrs,
-		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP, &cap, sizeof(cap));
 	if (err)
 		return err;
 	return uverbs_copy_to(attrs,
@@ -1124,17 +1082,8 @@ DECLARE_UVERBS_NAMED_METHOD(
 	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
 			    UVERBS_ATTR_TYPE(struct mlx5_ib_restore_qp_req),
 			    UA_MANDATORY),
-	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE,
-			    UVERBS_ATTR_TYPE(u32),
-			    UA_MANDATORY),
-	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE,
-			    UVERBS_ATTR_TYPE(u32),
-			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
 			    UVERBS_ATTR_TYPE(u64),
-			    UA_MANDATORY),
-	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP,
-			    UVERBS_ATTR_TYPE(struct ib_uverbs_qp_cap),
 			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
 			    UVERBS_ATTR_TYPE(u32),
