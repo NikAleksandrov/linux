@@ -16,7 +16,12 @@
  *   QUERY_QP         dump-side counterpart to UVERBS_METHOD_RESTORE_QP:
  *                    pack the full rxe wire state into a payload
  *                    byte-equal to struct rxe_restore_qp_req so the
- *                    destination can restore the QP single-shot.
+ *                    destination can restore the QP single-shot, plus
+ *                    the QP's userspace handle (the async-event cookie,
+ *                    not standard-queryable). cap / qp_type / qp_state
+ *                    are intentionally NOT emitted -- CRIU sources those
+ *                    from the standard IB_USER_VERBS_CMD_QUERY_QP verb
+ *                    and NLDEV.
  *   QUERY_CQ         dump-side counterpart to UVERBS_METHOD_RESTORE_CQ:
  *                    return a CQ's ring mmap offset + entry count so the
  *                    dumper sources both RESTORE_CQ inputs (the forced
@@ -61,6 +66,7 @@ enum rxe_ib_vfmig_freeze_datapath_attrs {
 enum rxe_ib_vfmig_query_qp_attrs {
 	RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+	RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
 };
 
 enum rxe_ib_vfmig_query_cq_attrs {

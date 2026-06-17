@@ -18,10 +18,16 @@
  *   QUERY_QP         dump-side counterpart to UVERBS_METHOD_RESTORE_QP.
  *                    Packs the full rxe wire state (AV, PSNs, cursors,
  *                    transport attrs, ring mmap offsets) into a payload
- *                    byte-equal to struct rxe_restore_qp_req. Solves the
- *                    cross-process problem librxe introspection cannot:
- *                    CRIU runs in its own address space, so the dumpee's
- *                    kernel-side QP state must come from the kernel.
+ *                    byte-equal to struct rxe_restore_qp_req, plus the
+ *                    QP's userspace handle (the async-event cookie).
+ *                    Solves the cross-process problem librxe
+ *                    introspection cannot: CRIU runs in its own address
+ *                    space, so the dumpee's kernel-side QP state must
+ *                    come from the kernel. cap / qp_type / qp_state are
+ *                    intentionally not emitted -- CRIU sources those
+ *                    from the standard IB_USER_VERBS_CMD_QUERY_QP verb
+ *                    and NLDEV; only state with no such surface lives
+ *                    here.
  *
  *   QUERY_CQ         dump-side counterpart to UVERBS_METHOD_RESTORE_CQ.
  *                    Returns a CQ's ring mmap offset + entry count
@@ -104,6 +110,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
 		attrs, RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE);
 	struct rxe_restore_qp_req blob = {};
 	struct rxe_qp *qp;
+	u64 user_handle;
 	int err;
 
 	if (IS_ERR(ibqp))
@@ -152,8 +159,20 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
 	blob.req_wqe_index	= qp->req.wqe_index;
 	blob.ssn		= atomic_read(&qp->ssn);
 
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
-			      &blob, sizeof(blob));
+	/*
+	 * The async-event cookie the source's ibv_create_qp recorded on
+	 * the QP uobject. Not standard-queryable, so CRIU must preserve
+	 * it through the kernel-sourced dump (mirrors the mlx5 verb).
+	 */
+	user_handle = ib_qp_user_handle(ibqp);
+
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
+
+	return uverbs_copy_to(attrs, RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+			      &user_handle, sizeof(user_handle));
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_CQ)(
@@ -198,6 +217,9 @@ DECLARE_UVERBS_NAMED_METHOD(
 			UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
 			    UVERBS_ATTR_TYPE(struct rxe_restore_qp_req),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+			    UVERBS_ATTR_TYPE(u64),
 			    UA_MANDATORY));
 
 DECLARE_UVERBS_NAMED_METHOD(
