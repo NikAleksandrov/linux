@@ -64,9 +64,9 @@ enum rxe_ib_vfmig_freeze_datapath_attrs {
 };
 
 enum rxe_ib_vfmig_query_qp_attrs {
-	RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
-	RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
-	RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+	RXE_IB_ATTR_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
+	RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 };
 
 enum rxe_ib_vfmig_query_cq_attrs {

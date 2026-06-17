@@ -107,7 +107,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
 	struct uverbs_attr_bundle *attrs)
 {
 	struct ib_qp *ibqp = uverbs_attr_get_obj(
-		attrs, RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE);
+		attrs, RXE_IB_ATTR_QUERY_QP_HANDLE);
 	struct rxe_restore_qp_req blob = {};
 	struct rxe_qp *qp;
 	u64 user_handle;
@@ -166,12 +166,12 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
 	 */
 	user_handle = ib_qp_user_handle(ibqp);
 
-	err = uverbs_copy_to(attrs, RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 			     &blob, sizeof(blob));
 	if (err)
 		return err;
 
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 			      &user_handle, sizeof(user_handle));
 }
 
@@ -211,14 +211,14 @@ DECLARE_UVERBS_NAMED_METHOD(
 
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_VFMIG_QUERY_QP,
-	UVERBS_ATTR_IDR(RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE,
+	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
 			UVERBS_OBJECT_QP,
 			UVERBS_ACCESS_READ,
 			UA_MANDATORY),
-	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 			    UVERBS_ATTR_TYPE(struct rxe_restore_qp_req),
 			    UA_MANDATORY),
-	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 			    UVERBS_ATTR_TYPE(u64),
 			    UA_MANDATORY));
 

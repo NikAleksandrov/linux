@@ -152,9 +152,9 @@ enum {
 #define RXE_IB_METHOD_VFMIG_QUERY_QP		((1u << UVERBS_ID_NS_SHIFT) + 1u)
 #define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE (1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE    ((1u << UVERBS_ID_NS_SHIFT) + 1u)
-#define RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
-#define RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
-#define RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
+#define RXE_IB_ATTR_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_ATTR_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
 
 /* ib_qp_type / ib_qp_state values used by the RESTORE_QP method args. */
 #define IB_QPT_RC_LOCAL				2
@@ -530,19 +530,19 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	cmd.hdr.method_id	= RXE_IB_METHOD_VFMIG_QUERY_QP;
 	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_QP_HANDLE;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_HANDLE;
 	cmd.attrs[n].len	= 0;
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= qp_handle;
 	n++;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_RESP_BLOB;
 	cmd.attrs[n].len	= sizeof(*blob_out);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)blob_out;
 	n++;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE;
 	cmd.attrs[n].len	= sizeof(user_handle);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)&user_handle;
