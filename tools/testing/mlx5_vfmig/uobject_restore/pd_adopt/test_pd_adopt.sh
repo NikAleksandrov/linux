@@ -327,18 +327,23 @@ echo "source ibdev: $SRC_IBDEV"
 
 echo "=== Phase B: source probe (allocates PD, holds it across SAVE) ==="
 sudo dmesg -C
+# Enable the mlx5_ib_dbg trace in mlx5_ib_alloc_ucontext that emits the
+# freshly-allocated devx_uid (vfmig_uctx_dbg). Replaces the older
+# vfmig_pd_dbg pr_info that was retired when the PD gate landed.
+echo 'func mlx5_ib_alloc_ucontext +p' | \
+    sudo tee /sys/kernel/debug/dynamic_debug/control >/dev/null 2>&1 || true
 start_src_probe "$SRC_IBDEV"
 echo "captured: src_pdn=$src_pdn (FW pdn from mlx5dv_pd)"
 
 # Capture the source ucontext's devx_uid from the kernel's
-# vfmig_pd_dbg pr_info that fired during ibv_alloc_pd inside the
+# vfmig_uctx_dbg trace that fires during ibv_open_device inside the
 # probe. Whether libibverbs opens DEVX or not depends on libmlx5's
 # defaults + MLX5_LIB_CAP_DYN_UAR negotiation; we read the truth
-# off the kernel side rather than guessing. Format of the dmesg
-# line: "vfmig_pd_dbg: alloc_pd ibdev=mlx5_X fw_pdn=0xY uid=Z udata=W".
+# off the kernel side rather than guessing. Format of the dmesg line:
+# "vfmig_uctx_dbg: alloc_ucontext ibdev=mlx5_X devx_uid=N adopted=0".
 src_devx_uid=$(sudo dmesg | \
-    grep -E "vfmig_pd_dbg: alloc_pd ibdev=$SRC_IBDEV .*uid=[0-9]+ udata=1" | \
-    tail -1 | sed -nE 's/.* uid=([0-9]+) .*/\1/p')
+    grep -E "vfmig_uctx_dbg: alloc_ucontext ibdev=$SRC_IBDEV devx_uid=[0-9]+ adopted=0" | \
+    tail -1 | sed -nE 's/.* devx_uid=([0-9]+) .*/\1/p')
 src_devx_uid=${src_devx_uid:-0}
 echo "captured: src_devx_uid=$src_devx_uid (0 == non-DEVX; non-zero == DEVX adoption lane)"
 
