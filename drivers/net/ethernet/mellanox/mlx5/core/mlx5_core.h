@@ -38,7 +38,7 @@
 #include <linux/sched.h>
 #include <linux/if_link.h>
 #include <linux/firmware.h>
-#include "vfmig_iova.h"
+#include "vfmig/vfmig_iova.h"
 #include <linux/mlx5/cq.h>
 #include <linux/mlx5/fs.h>
 #include <linux/mlx5/driver.h>

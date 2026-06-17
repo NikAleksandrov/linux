@@ -40,7 +40,7 @@
 #include <linux/mlx5/driver.h>
 
 #include "mlx5_core.h"
-#include "vfmig_iova.h"
+#include "vfmig/vfmig_iova.h"
 
 struct mlx5_db_pgdir {
 	struct list_head	list;

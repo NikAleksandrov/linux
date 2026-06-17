@@ -25,7 +25,7 @@ mlx5_core-y :=	main.o cmd.o debugfs.o fw.o eq.o uar.o pagealloc.o \
 # stub inlines in vfmig.h keep the call sites in main.c / sriov.c
 # building either way.
 #
-mlx5_core-$(CONFIG_MLX5_VFMIG) += vfmig.o vfmig_iova.o vfmig_dma_ops.o
+mlx5_core-$(CONFIG_MLX5_VFMIG) += vfmig/vfmig.o vfmig/vfmig_iova.o vfmig/vfmig_dma_ops.o
 
 #
 # Netdev basic

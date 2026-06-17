@@ -44,8 +44,8 @@
 #include "mlx5_core.h"
 #include "lib/eq.h"
 #include "lib/tout.h"
-#include "vfmig.h"
-#include "vfmig_iova.h"
+#include "vfmig/vfmig.h"
+#include "vfmig/vfmig_iova.h"
 #define CREATE_TRACE_POINTS
 #include "diag/cmd_tracepoint.h"
 

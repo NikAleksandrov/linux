@@ -38,7 +38,7 @@
 #include "mlx5_core.h"
 #include "lib/eq.h"
 #include "lib/tout.h"
-#include "vfmig_iova.h"
+#include "vfmig/vfmig_iova.h"
 
 enum {
 	MLX5_PAGES_CANT_GIVE	= 0,
