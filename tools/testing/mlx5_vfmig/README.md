@@ -3,7 +3,7 @@
 This directory holds the userspace tools, empirical probes, design
 documents, and shell-driven test harnesses used to develop the
 in-driver `/dev/mlx5_vfmig/<pf_bdf>` SAVE/LOAD/SUSPEND/RESUME control
-plane added in `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c`,
+plane added in `drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig.c`,
 plus the RDMA-uobject restore work that builds on top of it.
 
 The intended consumer is a CRIU-style checkpoint/restore agent that

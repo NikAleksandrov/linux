@@ -995,7 +995,7 @@ non-interference principle for restore-mode-only changes.
 | KS6b.3 | Decide on the `rdma_addr_find_l2_eth_by_grh_cached` non-blocking variant. | trivial | medium | **N/A** -- as-built helper uses `neigh_lookup` directly against the port's netdev (synchronous, cache-only, no ARP/NS solicit). See §10. v1's Policy B may revisit. |
 | KS6b.4 | Add the `local_ack_timeout_err` regression check to the `qp_restore_probe` harness: assert delta == 0 across one successful migrated-QP roundtrip after the fix lands. | small | medium | pending. |
 | KS6b.5 | (Optional) Policy B deferred-refresh on first post_send (§5.3). v1 follow-up. | medium | low | **N/A for the v0 harness** -- `mlx5_ib_post_send` is the kverbs `ib_device_ops.post_send` callback and is NOT reached for uverbs-created QPs (the data path goes directly to userspace SQ + UAR doorbell). For our use case Policy B would never fire. Replaced by KS6b.6 below. |
-| KS6b.6 | Dev-branch backup: userspace-triggered `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl driven from the harness AFTER `pin_static_neighbor_*` (see §11). The always-on path inside RESTORE_QP fires too early for the v0 harness ordering and hits Policy A; this ioctl is the manual escape hatch. | small | high | **DONE** -- handler in `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c`, CLI verb `mlx5_vfmig refresh_av_dmac <vf_id> <qpn>`, wrapper script `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/refresh_av_dmac.sh`. Pending end-to-end run. |
+| KS6b.6 | Dev-branch backup: userspace-triggered `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` ioctl driven from the harness AFTER `pin_static_neighbor_*` (see §11). The always-on path inside RESTORE_QP fires too early for the v0 harness ordering and hits Policy A; this ioctl is the manual escape hatch. | small | high | **DONE** -- handler in `drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig.c`, CLI verb `mlx5_vfmig refresh_av_dmac <vf_id> <qpn>`, wrapper script `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/refresh_av_dmac.sh`. Pending end-to-end run. |
 
 KS6b.0 + KS6b.1 unblocked the v0 RC datapath end-to-end (subject to
 KS6b.2 confirmation). KS6b.4 is the post-fix regression guard.
@@ -1223,14 +1223,14 @@ the harness log, and lets the harness drive ordering precisely.
 | component | what changed | LOC |
 |---|---|---|
 | `include/uapi/linux/mlx5_vfmig.h` | new `MLX5_VFMIG_IOC_REFRESH_AV_DMAC` (cmd 0x12) + `struct mlx5_vfmig_refresh_av_dmac` carrying `vf_id` / `qpn` inputs and pre-op / lookup / op / post-op output fields. | ~180 (incl. doc comment) |
-| `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c` | `vfmig_lookup_l2_dmac()` static helper (mirror of `mlx5_ib_lookup_l2_dmac` but uses `mlx5_uplink_netdev_get`), `vfmig_path_extract_dmac()` static helper, `vfmig_ioc_refresh_av_dmac()` handler, dispatch wiring. | ~230 |
+| `drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig.c` | `vfmig_lookup_l2_dmac()` static helper (mirror of `mlx5_ib_lookup_l2_dmac` but uses `mlx5_uplink_netdev_get`), `vfmig_path_extract_dmac()` static helper, `vfmig_ioc_refresh_av_dmac()` handler, dispatch wiring. | ~230 |
 | `tools/testing/mlx5_vfmig/tools/mlx5_vfmig.c` | new `do_refresh_av_dmac()` verb-handler with key=value output (including a derived `verdict=` line) and updated usage. | ~110 |
 | `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/refresh_av_dmac.sh` | new wrapper mirroring `check_qp_av_dmac.sh`'s PF/VF derivation; drives the ioctl and decodes the verdict. | ~140 |
 
 **Note: there is intentional code duplication** between
 `mlx5_ib_lookup_l2_dmac` (in `drivers/infiniband/hw/mlx5/qp.c`)
 and `vfmig_lookup_l2_dmac` (in
-`drivers/net/ethernet/mellanox/mlx5/core/vfmig.c`). The bodies are
+`drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig.c`). The bodies are
 ~50 LOC each and identical apart from how each side acquires the
 netdev (mlx5_ib uses `ib_device_get_netdev`; mlx5_core uses
 `mlx5_uplink_netdev_get`). A follow-up commit can pull the
@@ -1488,7 +1488,7 @@ will key off of.
   the same QUERY_QP -> neigh_lookup -> MODIFY_QP sequence from
   userspace, callable AFTER `pin_static_neighbor_*` runs.
   Implementation landed in `drivers/net/ethernet/mellanox/mlx5/
-  core/vfmig.c` (~230 LOC handler), `tools/testing/mlx5_vfmig/
+  core/vfmig/vfmig.c` (~230 LOC handler), `tools/testing/mlx5_vfmig/
   tools/mlx5_vfmig.c` (`refresh_av_dmac` verb), and
   `tools/testing/mlx5_vfmig/uobject_restore/qp_av_dmac/
   refresh_av_dmac.sh` wrapper. Module-parameter gate considered

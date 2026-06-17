@@ -12,7 +12,7 @@
 # What this validates
 # -------------------
 #   - vfmig_vf_id_busy_locked (drivers/net/ethernet/mellanox/mlx5/
-#     core/vfmig.c line 4199): the per-vf_id staging gate fires on
+#     core/vfmig/vfmig.c line 4199): the per-vf_id staging gate fires on
 #     concurrent LOAD fds and clears on close, and is keyed on
 #     vf_id (not on the PF or on whether a pending_load is
 #     installed).

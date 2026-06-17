@@ -15,7 +15,7 @@
  *   - a SAVE session on vf_id N likewise blocks a LOAD session
  *     on vf_id N (and vice versa), because the gate is shared
  *     across both kinds of sessions in vfmig_vf_id_busy_locked
- *     (line 4199 in drivers/net/ethernet/mellanox/mlx5/core/vfmig.c).
+ *     (line 4199 in drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig.c).
  *
  * The probe does NOT exercise the second staging gate
  * (vfmig_install_pending_load_locked) -- that one fires inside the
@@ -50,7 +50,7 @@
  *   release path takes the !image_staged branch and only frees the
  *   PD it allocated for the (would-have-been) MKEY (see
  *   vfmig_load_release_resources, drivers/net/ethernet/mellanox/
- *   mlx5/core/vfmig.c line ~3829). Slots are returned to the same
+ *   mlx5/core/vfmig/vfmig.c line ~3829). Slots are returned to the same
  *   "unset" state the probe found them in.
  *
  * Requires:

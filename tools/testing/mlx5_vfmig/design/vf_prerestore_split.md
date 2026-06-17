@@ -653,7 +653,7 @@ The earlier draft of this design used `vhca_id` to detect
 
 * Both the existing vfio mlx5 LM driver
   (`drivers/vfio/pci/mlx5/cmd.c`, `mlx5vf_cmd_get_vhca_id`)
-  and our PF-driven `mlx5_core/vfmig.c`
+  and our PF-driven `mlx5_core/vfmig/vfmig.c`
   (`vfmig_query_vhca_id`) query `vhca_id` from the **local**
   device on bind. SAVE_VHCA_STATE / LOAD_VHCA_STATE are
   parameterized by that local `vhca_id` -- both source and
@@ -800,7 +800,7 @@ a good place for. Documented as the orchestrator's invariant.
 
 The kernel computes each VF's per-VF IOVA window
 deterministically from `vf_id` (see
-`drivers/.../mlx5/core/vfmig_iova.c:vfmig_iova_domain_create`):
+`drivers/.../mlx5/core/vfmig/vfmig_iova.c:vfmig_iova_domain_create`):
 
 ```c
 base = VFMIG_IOVA_BASE + (u64)vf_id * VFMIG_IOVA_PER_VF;

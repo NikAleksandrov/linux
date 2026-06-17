@@ -60,7 +60,7 @@ pre-installed `awaiting_bind` entries.
 
 ### Stage 1 — landed
 
-* `drivers/net/ethernet/mellanox/mlx5/core/vfmig_dma_ops.c` exposing
+* `drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig_dma_ops.c` exposing
   `vfmig_dma_ops_attach(vf_pdev, dom)` /
   `vfmig_dma_ops_detach(vf_pdev, dom)`. Internally:
   * `.map_sg` / `.unmap_sg` / `.map_phys` / `.unmap_phys` route through
@@ -847,7 +847,7 @@ around `ib_umem_pin` + `ib_dma_map_sgtable_attrs`; no behaviour
 change for existing callers.
 
 **(b) vfmig primitive `vfmig_iova_bind_user_object`** -- new
-`drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c` entry point:
+`drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig_iova.c` entry point:
 
 ```c
 int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
@@ -1111,12 +1111,12 @@ invariant that requires the VF unbound at destroy.)
 * `drivers/infiniband/hw/mlx5/mr.c:1578` -- `mlx5_ib_reg_user_mr`.
 * `drivers/infiniband/hw/mlx5/main.c` -- `mlx5_ib_restore_mr` (S4b),
   the kernel verb stages 2+3 hang off.
-* `drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c` -- the v1
+* `drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig_iova.c` -- the v1
   allocator. `vfmig_iova_replay_external` (commit `504602987fb5`)
   is the stage-2 LOAD-side primitive; `vfmig_iova_replay_page` now
   routes `VFMIG_SLOT_USER_PAGE` to it instead of returning
   `-EOPNOTSUPP`.
-* `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c` -- LOAD-side
+* `drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig.c` -- LOAD-side
   state machine. Stage 2 added the parallel `VFMIG_LS_HUP_*` arc
   alongside the existing `VFMIG_LS_HP_*` (commit `c44a482a91ce`).
 * `tools/testing/mlx5_vfmig/save_load/user_object_replay/` --
@@ -1135,7 +1135,7 @@ Byte-level layout of `vfmig_host_user_page_record`, kind enum,
 `instance_key` encoding, state-machine arc.
 
 ```c
-/* drivers/net/ethernet/mellanox/mlx5/core/vfmig.c */
+/* drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig.c */
 #define VFMIG_WIRE_TAG_HOST_PAGE       0x4842   /* existing, kernel slots */
 #define VFMIG_WIRE_TAG_HOST_USER_PAGE  0x4855   /* NEW, user-side uobjects */
 
@@ -1289,7 +1289,7 @@ extracted head is otherwise identical to today's lines 178-255 of
 `drivers/infiniband/core/umem.c`.
 
 **Step 2: vfmig binding primitive.** In
-`drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c`:
+`drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig_iova.c`:
 
 ```c
 int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
