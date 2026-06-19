@@ -969,6 +969,15 @@ and gets the same bytes.
 
 ### 5.3 QP
 
+> **In-flight (non-drained) QP restore:** §5.3 covers the drained /
+> RTS-with-content milestone. Restoring a QP with *outstanding* datapath
+> state at snapshot (differing SQ producer/req.wqe_index/consumer,
+> pre-posted RQ recvs, RC responder resources) requires serializing the
+> live ring payload + all cursors + `qp->resp.resources` -- designed in
+> **`design/rxe_inflight_qp_restore.md`** (approach B1). That work assumes
+> the datapath is *paused* (not drained) at a consistent snapshot point,
+> which is the subject of **`design/snapshot_ordering_pause_capture.md`**.
+
 #### 5.3.1 v0 state coverage
 
 Each IBTA-defined QP state is handled, deferred, or refused at v0:

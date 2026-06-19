@@ -101,7 +101,11 @@ echo "$PRE"
 
 echo "=== Phase B: SAVE ==="
 sudo dmesg -C
+# snapshot-ordering: pause datapath (CRIU CHECKPOINT_DEVICES), then
+# capture (SAVE is suspend-aware and skips its own suspend), then resume.
+sudo "$TOOL" "$PF" suspend_vhca 0
 sudo "$TOOL" "$PF" save_vhca_state 0 "$BLOB" $SAVE_FLAGS
+sudo "$TOOL" "$PF" resume_vhca 0
 ls -l "$BLOB"
 SAVE_BYTES=$(stat -c %s "$BLOB")
 [ "$SAVE_BYTES" -gt 16 ] || { echo "blob suspiciously small: $SAVE_BYTES"; exit 1; }

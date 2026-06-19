@@ -112,6 +112,7 @@ TESTS=(
   "iova_tracked_save_load|save_load/test_iova_tracked_save_load.sh||run"
   "inkernel_save_load|save_load/test_inkernel_save_load_roundtrip.sh||xfail:non-tracked LOAD superseded by deterministic-IOVA path"
   "vfio_save_load|save_load/test_vfio_save_load_roundtrip.sh||xfail:non-tracked LOAD superseded; SAVE side still validated"
+  "suspend_resume_split|save_load/test_suspend_resume_split.sh||run"
   "multi_load_stage_gate|save_load/multi_load_gates/test_multi_load_stage_gate.sh||run"
   "user_object_replay|save_load/user_object_replay/test_user_object_replay.sh||run"
   "pd_restore|uobject_restore/pd_restore/test_pd_restore_mlx5_vfmig.sh||run"

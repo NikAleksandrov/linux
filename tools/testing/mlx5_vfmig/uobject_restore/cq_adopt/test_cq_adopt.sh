@@ -366,7 +366,11 @@ fi
 
 echo "=== Phase D: SAVE_VHCA_STATE ==="
 sudo dmesg -C
+# snapshot-ordering: pause datapath (CRIU CHECKPOINT_DEVICES), then
+# capture (SAVE is suspend-aware and skips its own suspend), then resume.
+sudo "$TOOL" "$PF" suspend_vhca 0
 sudo "$TOOL" "$PF" save_vhca_state 0 "$BLOB"
+sudo "$TOOL" "$PF" resume_vhca 0
 sudo chmod 0644 "$BLOB"
 SAVE_BYTES=$(stat -c %s "$BLOB")
 [ "$SAVE_BYTES" -gt 16 ] || { echo "FAIL: blob suspiciously small: $SAVE_BYTES"; exit 1; }
@@ -394,8 +398,7 @@ sudo "$TOOL" "$PF" load_vhca_state 0 "$BLOB"
 sudo "$TOOL" "$PF" mark_restored 0
 
 echo mlx5_core | sudo tee "$(vf_path $DST_VF)/driver_override" >/dev/null
-bind_vf_safe "$DST_VF" 60 "Phase F: dest VF bind"
-DST_IBDEV=$(wait_for_ib_dev "$DST_VF" 30) || {
+bind_vf_safe "$DST_VF" 60 "Phase F: dest VF bind"DST_IBDEV=$(wait_for_ib_dev "$DST_VF" 30) || {
     echo "FAIL: no ibdev for dest $DST_VF"
     exit 1
 }

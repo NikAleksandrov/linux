@@ -66,8 +66,8 @@ sudo dmesg | tail -20
 # 5. confirm subsequent ioctls still work (no UAF / no left-over state)
 sudo "$TOOL" "$PF" list
 
-# 6. MARK_RESTORED still works after a failed LOAD
-sudo "$TOOL" "$PF" mark_restored 0
+# 6. MARK_RESTORED (with defer_resume) still works after a failed LOAD
+sudo "$TOOL" "$PF" mark_restored 0 defer_resume
 sudo "$TOOL" "$PF" list
 
 # 7. driver_override + bind. We've not actually loaded valid state, so
@@ -78,6 +78,11 @@ sudo "$TOOL" "$PF" list
 echo mlx5_core | sudo tee /sys/bus/pci/devices/$VF/driver_override
 sudo dmesg -C
 echo "$VF" | sudo tee /sys/bus/pci/drivers/mlx5_core/bind || true
+
+# restore mirror: idempotent resume (no-op here since the synthetic
+# LOAD was rejected, so the VHCA was never parked); exercises the
+# RESUME_VHCA plumbing after a failed LOAD.
+sudo "$TOOL" "$PF" resume_vhca 0
 
 echo "--- dmesg after BIND ---"
 sudo dmesg | tail -30

@@ -223,7 +223,11 @@ EXPECT_DBR_COUNT=${EXPECT_DBR_COUNT:-${src_expected_dbr_min:-0}}
 # --- Phase C: SAVE --------------------------------------------------
 
 echo "=== Phase C: SAVE_VHCA_STATE on source ==="
+# snapshot-ordering: pause datapath (CRIU CHECKPOINT_DEVICES), then
+# capture (SAVE is suspend-aware and skips its own suspend), then resume.
+sudo "$TOOL" "$PF" suspend_vhca 0
 sudo "$TOOL" "$PF" save_vhca_state 0 "$BLOB"
+sudo "$TOOL" "$PF" resume_vhca 0
 sudo chmod 0644 "$BLOB"
 SAVE_BYTES=$(stat -c %s "$BLOB")
 echo "saved $SAVE_BYTES bytes to $BLOB"

@@ -214,7 +214,11 @@ echo "captured: src_devx_uid=$src_devx_uid"
 # --- Phase C --------------------------------------------------------
 
 echo "=== Phase C: SAVE_VHCA_STATE ==="
+# snapshot-ordering: pause datapath (CRIU CHECKPOINT_DEVICES), then
+# capture (SAVE is suspend-aware and skips its own suspend), then resume.
+sudo "$TOOL" "$PF" suspend_vhca 0
 sudo "$TOOL" "$PF" save_vhca_state 0 "$BLOB"
+sudo "$TOOL" "$PF" resume_vhca 0
 sudo chmod 0644 "$BLOB"
 SAVE_BYTES=$(stat -c %s "$BLOB")
 echo "  save bytes: $SAVE_BYTES"
@@ -242,8 +246,7 @@ sudo "$TOOL" "$PF" load_vhca_state 0 "$BLOB"
 sudo "$TOOL" "$PF" mark_restored 0
 
 echo mlx5_core | sudo tee "$(vf_path $DST_VF)/driver_override" >/dev/null
-bind_vf_safe "$DST_VF" 60 "Phase E"
-sleep 1
+bind_vf_safe "$DST_VF" 60 "Phase E"sleep 1
 DST_IBDEV=$(find_ib_dev_for_pci "$DST_VF") || { echo "FAIL: no ibdev"; exit 1; }
 echo "dest ibdev: $DST_IBDEV"
 
