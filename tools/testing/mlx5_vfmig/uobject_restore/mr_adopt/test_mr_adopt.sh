@@ -331,7 +331,8 @@ sudo "$TOOL" "$PF" load_vhca_state 0 "$BLOB"
 sudo "$TOOL" "$PF" mark_restored 0
 
 echo mlx5_core | sudo tee "$(vf_path $DST_VF)/driver_override" >/dev/null
-bind_vf_safe "$DST_VF" 60 "Phase E: dest VF bind"sleep 1
+bind_vf_safe "$DST_VF" 60 "Phase E: dest VF bind"
+sleep 1
 DST_IBDEV=$(find_ib_dev_for_pci "$DST_VF") || { echo "FAIL: no ibdev for dest $DST_VF"; exit 1; }
 echo "dest ibdev: $DST_IBDEV"
 
