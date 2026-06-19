@@ -3,11 +3,11 @@
  * Copyright (c) 2026, rxe CRIU migration. All rights reserved.
  *
  * Driver-private uverbs ioctl namespace for the Soft-RoCE (rxe) device.
- * Mirrors the mlx5 MLX5_IB_OBJECT_VFMIG surface but in the
+ * Mirrors the mlx5 driver-private migration object surface but in the
  * RDMA_DRIVER_RXE namespace: object/method/attr ids are scoped to the
  * rxe driver and never collide with another provider's ids.
  *
- * RXE_IB_OBJECT_VFMIG carries the rxe arm of the CRIU dump-side
+ * RXE_IB_OBJECT_MIGRATE carries the rxe arm of the CRIU dump-side
  * choreography (S6a). Its methods run on a per-process uverbs fd:
  *
  *   FREEZE_DATAPATH  non-destructively pause a QP's req/resp/comp
@@ -40,38 +40,52 @@
 #include <rdma/ib_user_ioctl_cmds.h>
 
 enum rxe_ib_objects {
-	RXE_IB_OBJECT_VFMIG = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_OBJECT_MIGRATE = (1U << UVERBS_ID_NS_SHIFT),
 };
 
-enum rxe_ib_vfmig_methods {
-	RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH = (1U << UVERBS_ID_NS_SHIFT),
-	RXE_IB_METHOD_VFMIG_QUERY_QP,
-	RXE_IB_METHOD_VFMIG_QUERY_CQ,
+enum rxe_ib_migrate_methods {
+	RXE_IB_METHOD_FREEZE_DATAPATH = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_METHOD_QUERY_QP,
+	RXE_IB_METHOD_QUERY_CQ,
+	RXE_IB_METHOD_FREEZE_CONTEXT,
 };
 
 /*
- * FREEZE_DATAPATH is per-QP rather than the ucontext-scope shape
- * sketched in uobject_restore.md §5.3.7: a driver module cannot reach
- * the core-internal ufile QP-type walk (uapi_get_object lives in
- * rdma_core.h), and per-QP composes cleanly with the plugin's existing
+ * FREEZE_DATAPATH is per-QP: it pauses/resumes one QP's worker tasks,
+ * keyed by a QP IDR handle. It composes cleanly with the plugin's
  * per-uobject enumeration (INFO_HANDLES -> FREEZE_DATAPATH -> QUERY_QP).
  * @FREEZE selects pause (1) vs resume (0); resume exists for test
  * symmetry, the dump flow never thaws (the dumpee is killed).
  */
-enum rxe_ib_vfmig_freeze_datapath_attrs {
-	RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
-	RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE,
+enum rxe_ib_freeze_datapath_attrs {
+	RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE,
 };
 
-enum rxe_ib_vfmig_query_qp_attrs {
+/*
+ * FREEZE_CONTEXT is the ucontext-scoped freeze-all: a single call that
+ * pauses (or resumes) every user QP owned by the calling uverbs fd, so
+ * CRIU can quiesce the whole RDMA datapath at the early CHECKPOINT_DEVICES
+ * hook with one ioctl, before per-QP fds are resolved/dumped. It takes no
+ * QP handle -- the caller is identified by ib_uverbs_get_ucontext() and
+ * the QP set is enumerated from rxe's own QP pool filtered by owning
+ * ucontext (a driver cannot reach the core-internal ufile object walk).
+ * Idempotent and order-independent vs FREEZE_DATAPATH (both drive the
+ * same per-QP rxe_qp_pause/resume). @FREEZE selects pause (1) / resume (0).
+ */
+enum rxe_ib_freeze_context_attrs {
+	RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE = (1U << UVERBS_ID_NS_SHIFT),
+};
+
+enum rxe_ib_query_qp_attrs {
 	RXE_IB_ATTR_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 	RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 };
 
-enum rxe_ib_vfmig_query_cq_attrs {
-	RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
-	RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+enum rxe_ib_query_cq_attrs {
+	RXE_IB_ATTR_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
 };
 
 #endif

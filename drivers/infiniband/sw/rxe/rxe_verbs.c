@@ -13,7 +13,7 @@
 #include "rxe_hw_counters.h"
 
 /* rxe driver-private uverbs object tree (FREEZE_DATAPATH, QUERY_QP). */
-extern const struct uapi_definition rxe_vfmig_defs[];
+extern const struct uapi_definition rxe_migrate_defs[];
 
 static int post_one_recv(struct rxe_rq *rq, const struct ib_recv_wr *ibwr);
 
@@ -2002,7 +2002,7 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name,
 	ib_set_device_ops(dev, &rxe_dev_ops);
 
 	/* rxe arm of the CRIU dump-side verbs (FREEZE_DATAPATH, QUERY_QP). */
-	dev->driver_def = rxe_vfmig_defs;
+	dev->driver_def = rxe_migrate_defs;
 
 	err = ib_device_set_netdev(&rxe->ib_dev, ndev, 1);
 	if (err)

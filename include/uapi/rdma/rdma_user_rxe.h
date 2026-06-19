@@ -246,7 +246,7 @@ struct rxe_restore_cq_req {
 };
 
 /*
- * Driver-private payload for RXE_IB_METHOD_VFMIG_QUERY_CQ (dump side).
+ * Driver-private payload for RXE_IB_METHOD_QUERY_CQ (dump side).
  *
  * Returned via the method's UHW-less PTR_OUT blob. The dumper reads a
  * live CQ's two RESTORE_CQ inputs straight from the kernel, keyed by CQ

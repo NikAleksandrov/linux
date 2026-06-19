@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
 /*
- * VFMIG (CRIU SR-IOV migration) driver-private uverbs methods for rxe.
+ * CRIU migration driver-private uverbs methods for rxe.
  *
  * This is the rxe arm of the dump-side choreography. The matching
  * restore path is the GENERIC UVERBS_OBJECT_RESTORE family
  * (RESTORE_PD/CQ/MR/QP) dispatched through ib_device_ops.restore_*;
- * rxe needs a driver-private object only for the two dump-side verbs
- * that have no hardware-generic shape:
+ * rxe needs a driver-private object (RXE_IB_OBJECT_MIGRATE) only for the
+ * dump-side verbs that have no hardware-generic shape:
  *
  *   FREEZE_DATAPATH  non-destructively pause a QP's send_task
  *                    (requester+completer) and recv_task (responder)
@@ -14,6 +14,12 @@
  *                    consumer indices while the plugin snapshots the QP
  *                    and CRIU snapshots the user VMAs. No IBTA state
  *                    transition. See uobject_restore.md §5.3.7.
+ *
+ *   FREEZE_CONTEXT   ucontext-scoped freeze-all: one call pauses/resumes
+ *                    every user QP owned by the calling uverbs fd, for
+ *                    CRIU's early CHECKPOINT_DEVICES hook (before per-QP
+ *                    fds are resolved). Enumerates rxe's QP pool filtered
+ *                    by owning ucontext.
  *
  *   QUERY_QP         dump-side counterpart to UVERBS_METHOD_RESTORE_QP.
  *                    Packs the full rxe wire state (AV, PSNs, cursors,
@@ -56,7 +62,7 @@
 #include <rdma/uverbs_named_ioctl.h>
 
 /* v0 QP type gate: the IBTA types rxe_restore_qp accepts. */
-static int rxe_vfmig_chk_qp_type(const struct ib_qp *ibqp)
+static int rxe_migrate_chk_qp_type(const struct ib_qp *ibqp)
 {
 	switch (ibqp->qp_type) {
 	case IB_QPT_RC:
@@ -68,11 +74,11 @@ static int rxe_vfmig_chk_qp_type(const struct ib_qp *ibqp)
 	}
 }
 
-static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH)(
+static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_DATAPATH)(
 	struct uverbs_attr_bundle *attrs)
 {
 	struct ib_qp *ibqp = uverbs_attr_get_obj(
-		attrs, RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE);
+		attrs, RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE);
 	struct rxe_qp *qp;
 	u8 freeze;
 	int err;
@@ -80,12 +86,12 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH)(
 	if (IS_ERR(ibqp))
 		return PTR_ERR(ibqp);
 
-	err = rxe_vfmig_chk_qp_type(ibqp);
+	err = rxe_migrate_chk_qp_type(ibqp);
 	if (err)
 		return err;
 
 	err = uverbs_copy_from(&freeze, attrs,
-			       RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE);
+			       RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE);
 	if (err)
 		return err;
 
@@ -103,7 +109,72 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH)(
 	return 0;
 }
 
-static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
+/*
+ * Ucontext-scoped freeze-all: pause (or resume) every user QP owned by
+ * the calling uverbs fd in a single call, for CRIU's early
+ * CHECKPOINT_DEVICES hook (one ioctl, before per-QP fds are dumped).
+ *
+ * A driver module cannot reach the core-internal ufile object walk, so
+ * the QP set is enumerated from rxe's own QP pool and filtered by owning
+ * ucontext. rxe_qp_pause() drains the worker tasks and can sleep, so we
+ * take a pool reference on each element under RCU and run the
+ * pause/resume outside the read-side critical section.
+ */
+static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_ucontext *ucontext = ib_uverbs_get_ucontext(attrs);
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+	struct rxe_pool *pool;
+	struct rxe_dev *rxe;
+	u8 freeze;
+	int err;
+
+	if (IS_ERR(ucontext))
+		return PTR_ERR(ucontext);
+
+	err = uverbs_copy_from(&freeze, attrs,
+			       RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE);
+	if (err)
+		return err;
+
+	rxe = to_rdev(ucontext->device);
+	pool = &rxe->qp_pool;
+
+	rcu_read_lock();
+	for (elem = xa_find(&pool->xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&pool->xa, &index, ULONG_MAX, XA_PRESENT)) {
+		struct rxe_qp *qp = elem->obj;
+
+		/* Pin across the (sleeping) pause; skip elems being freed. */
+		if (!kref_get_unless_zero(&elem->ref_cnt))
+			continue;
+		rcu_read_unlock();
+
+		/*
+		 * Only this ucontext's user QPs. Skip kernel QPs (no user
+		 * datapath) and QPs owned by other processes sharing the
+		 * device. Freezing is non-destructive (no IBTA transition),
+		 * so unlike the per-QP QUERY path there is no type gate.
+		 */
+		if (qp->is_user && ib_qp_ucontext(&qp->ibqp) == ucontext) {
+			if (freeze)
+				rxe_qp_pause(qp);
+			else
+				rxe_qp_resume(qp);
+		}
+
+		rxe_put(qp);
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	struct uverbs_attr_bundle *attrs)
 {
 	struct ib_qp *ibqp = uverbs_attr_get_obj(
@@ -116,7 +187,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
 	if (IS_ERR(ibqp))
 		return PTR_ERR(ibqp);
 
-	err = rxe_vfmig_chk_qp_type(ibqp);
+	err = rxe_migrate_chk_qp_type(ibqp);
 	if (err)
 		return err;
 
@@ -175,11 +246,11 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_QP)(
 			      &user_handle, sizeof(user_handle));
 }
 
-static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_CQ)(
+static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	struct uverbs_attr_bundle *attrs)
 {
 	struct ib_cq *ibcq = uverbs_attr_get_obj(
-		attrs, RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE);
+		attrs, RXE_IB_ATTR_QUERY_CQ_HANDLE);
 	struct rxe_query_cq_resp blob = {};
 	struct rxe_cq *cq;
 
@@ -195,22 +266,28 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_VFMIG_QUERY_CQ)(
 	blob.vm_pgoff = cq->queue->ip->info.offset;
 	blob.cqe      = ibcq->cqe;
 
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
 			      &blob, sizeof(blob));
 }
 
 DECLARE_UVERBS_NAMED_METHOD(
-	RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH,
-	UVERBS_ATTR_IDR(RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE,
+	RXE_IB_METHOD_FREEZE_DATAPATH,
+	UVERBS_ATTR_IDR(RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE,
 			UVERBS_OBJECT_QP,
 			UVERBS_ACCESS_READ,
 			UA_MANDATORY),
-	UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE,
+	UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE,
 			   UVERBS_ATTR_TYPE(u8),
 			   UA_MANDATORY));
 
 DECLARE_UVERBS_NAMED_METHOD(
-	RXE_IB_METHOD_VFMIG_QUERY_QP,
+	RXE_IB_METHOD_FREEZE_CONTEXT,
+	UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE,
+			   UVERBS_ATTR_TYPE(u8),
+			   UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	RXE_IB_METHOD_QUERY_QP,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
 			UVERBS_OBJECT_QP,
 			UVERBS_ACCESS_READ,
@@ -223,22 +300,23 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UA_MANDATORY));
 
 DECLARE_UVERBS_NAMED_METHOD(
-	RXE_IB_METHOD_VFMIG_QUERY_CQ,
-	UVERBS_ATTR_IDR(RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE,
+	RXE_IB_METHOD_QUERY_CQ,
+	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_CQ_HANDLE,
 			UVERBS_OBJECT_CQ,
 			UVERBS_ACCESS_READ,
 			UA_MANDATORY),
-	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
 			    UVERBS_ATTR_TYPE(struct rxe_query_cq_resp),
 			    UA_MANDATORY));
 
 DECLARE_UVERBS_GLOBAL_METHODS(
-	RXE_IB_OBJECT_VFMIG,
-	&UVERBS_METHOD(RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH),
-	&UVERBS_METHOD(RXE_IB_METHOD_VFMIG_QUERY_QP),
-	&UVERBS_METHOD(RXE_IB_METHOD_VFMIG_QUERY_CQ));
+	RXE_IB_OBJECT_MIGRATE,
+	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_DATAPATH),
+	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_QP),
+	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ),
+	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT));
 
-const struct uapi_definition rxe_vfmig_defs[] = {
-	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_VFMIG),
+const struct uapi_definition rxe_migrate_defs[] = {
+	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_MIGRATE),
 	{},
 };
