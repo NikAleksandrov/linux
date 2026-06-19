@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * qp_query_probe_rxe -- empirical validation of S6a A4:
- * RXE_IB_METHOD_VFMIG_QUERY_QP (design/uobject_restore.md §5.3.7 +
+ * RXE_IB_METHOD_QUERY_QP (design/uobject_restore.md §5.3.7 +
  * §9.1 S6a). Single-process; no restore-mode ucontext needed -- this
  * probe only exercises the dump-side QUERY_QP verb and the
  * FREEZE_DATAPATH lifecycle against a live RC QP.
@@ -29,6 +29,10 @@
  *      return 0 on the live user QP. (Negative gates: kernel QP -> ENXIO
  *      is exercised indirectly; bad handle -> ENOENT below.)
  *   4. QUERY_QP on a bogus handle -> -ENOENT.
+ *   5. FREEZE_CONTEXT(freeze=1/0): the handle-less, ucontext-scoped
+ *      freeze-all. Builds a second user QP in the same ucontext, then
+ *      drives freeze/resume (idempotent both ways) and composes with a
+ *      per-QP FREEZE_DATAPATH to prove the two paths coexist.
  *
  * Build:
  *   make -C tools/testing/mlx5_vfmig \
@@ -85,20 +89,23 @@ struct ib_uverbs_ioctl_hdr {
 #define UVERBS_ID_DRIVER_NS			(1u << UVERBS_ID_NS_SHIFT)
 
 /* Mirror of include/uapi/rdma/rxe_user_ioctl_cmds.h. */
-#define RXE_IB_OBJECT_VFMIG			(UVERBS_ID_DRIVER_NS + 0u)
-#define RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH	(1u << UVERBS_ID_NS_SHIFT)
-#define RXE_IB_METHOD_VFMIG_QUERY_QP		((1u << UVERBS_ID_NS_SHIFT) + 1u)
-#define RXE_IB_METHOD_VFMIG_QUERY_CQ		((1u << UVERBS_ID_NS_SHIFT) + 2u)
+#define RXE_IB_OBJECT_MIGRATE			(UVERBS_ID_DRIVER_NS + 0u)
+#define RXE_IB_METHOD_FREEZE_DATAPATH	(1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_METHOD_QUERY_QP		((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_METHOD_QUERY_CQ		((1u << UVERBS_ID_NS_SHIFT) + 2u)
+#define RXE_IB_METHOD_FREEZE_CONTEXT	((1u << UVERBS_ID_NS_SHIFT) + 3u)
 
-#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE (1u << UVERBS_ID_NS_SHIFT)
-#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE    ((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE (1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE    ((1u << UVERBS_ID_NS_SHIFT) + 1u)
+
+#define RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE     (1u << UVERBS_ID_NS_SHIFT)
 
 #define RXE_IB_ATTR_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
 #define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
 
-#define RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
-#define RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_QUERY_CQ_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_ATTR_QUERY_CQ_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
 
 /* Mirror of include/uapi/rdma/rdma_user_rxe.h struct rxe_query_cq_resp. */
 struct rxe_query_cq_resp_local {
@@ -187,8 +194,8 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	} cmd = {};
 	unsigned int n = 0;
 
-	cmd.hdr.object_id	= RXE_IB_OBJECT_VFMIG;
-	cmd.hdr.method_id	= RXE_IB_METHOD_VFMIG_QUERY_QP;
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_QUERY_QP;
 	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
 
 	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_HANDLE;
@@ -226,17 +233,17 @@ static int do_vfmig_query_cq(int fd, uint32_t cq_handle,
 	} cmd = {};
 	unsigned int n = 0;
 
-	cmd.hdr.object_id	= RXE_IB_OBJECT_VFMIG;
-	cmd.hdr.method_id	= RXE_IB_METHOD_VFMIG_QUERY_CQ;
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_QUERY_CQ;
 	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_CQ_HANDLE;
 	cmd.attrs[n].len	= 0;
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= cq_handle;
 	n++;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_CQ_RESP_BLOB;
 	cmd.attrs[n].len	= sizeof(*blob_out);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)blob_out;
@@ -258,17 +265,50 @@ static int do_vfmig_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
 	} cmd = {};
 	unsigned int n = 0;
 
-	cmd.hdr.object_id	= RXE_IB_OBJECT_VFMIG;
-	cmd.hdr.method_id	= RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH;
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_FREEZE_DATAPATH;
 	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE;
 	cmd.attrs[n].len	= 0;
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= qp_handle;
 	n++;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE;
+	cmd.attrs[n].len	= sizeof(freeze);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= freeze;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * FREEZE_CONTEXT is the handle-less, ucontext-scoped freeze-all: it
+ * pauses (freeze=1) or resumes (freeze=0) every user QP owned by this
+ * uverbs fd in one call. No QP handle -- the kernel resolves the caller
+ * via ib_uverbs_get_ucontext() and walks rxe's qp_pool filtered by
+ * owning ucontext (ib_qp_ucontext()).
+ */
+static int do_freeze_context(int fd, uint8_t freeze)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[1];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_FREEZE_CONTEXT;
+	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
+
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE;
 	cmd.attrs[n].len	= sizeof(freeze);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= freeze;
@@ -445,7 +485,7 @@ static int subtest_query_fields(struct ibv_context *ctx, struct rc_qp *p)
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_QP ioctl: %s%s\n", strerror(-ret),
 			ret == -EOPNOTSUPP
-			? " (rxe_vfmig_defs not wired into driver_def?)"
+			? " (rxe_migrate_defs not wired into driver_def?)"
 			: "");
 		return 1;
 	}
@@ -508,7 +548,7 @@ static int subtest_query_cq(struct ibv_context *ctx, struct rc_qp *p)
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_CQ ioctl: %s%s\n", strerror(-ret),
 			ret == -EOPNOTSUPP
-			? " (RXE_IB_METHOD_VFMIG_QUERY_CQ not registered?)"
+			? " (RXE_IB_METHOD_QUERY_CQ not registered?)"
 			: "");
 		return 1;
 	}
@@ -592,6 +632,62 @@ static int subtest_bad_handle(struct ibv_context *ctx)
 	return 1;
 }
 
+/*
+ * Exercise the new context-scoped freeze verb on the live kernel. A
+ * second user QP is built in the same ucontext so the freeze-all walks
+ * a >1-element qp_pool (distinguishing it from the per-QP
+ * FREEZE_DATAPATH). Validates: verb registration, ucontext resolution
+ * (ib_qp_ucontext), multi-QP pool iteration, idempotency on both
+ * freeze and resume, and composition with the per-QP verb (rxe's
+ * pause/resume are boolean, so a single resume fully re-arms a QP that
+ * was paused by both paths).
+ */
+static int subtest_freeze_context(struct ibv_context *ctx, struct rc_qp *p)
+{
+	struct rc_qp p2 = {};
+	bool have_p2;
+	int ret, fails = 0;
+
+	printf("[5] FREEZE_CONTEXT ucontext-scoped freeze-all\n");
+
+	have_p2 = (build_rts_loopback(ctx, &p2) == 0);
+	printf("  setup: %s in this ucontext\n",
+	       have_p2 ? "2 RC QPs" : "1 RC QP (second QP setup skipped)");
+
+#define STEP(call, desc)						\
+	do {								\
+		ret = (call);						\
+		if (ret == 0) {						\
+			printf("  PASS %s -> 0\n", desc);		\
+		} else {						\
+			fprintf(stderr, "  FAIL %s -> %s%s\n", desc,	\
+				strerror(-ret),				\
+				ret == -EOPNOTSUPP			\
+				? " (FREEZE_CONTEXT not registered?)"	\
+				: "");					\
+			fails++;					\
+		}							\
+	} while (0)
+
+	STEP(do_freeze_context(ctx->cmd_fd, 1), "FREEZE_CONTEXT(freeze=1)");
+	STEP(do_freeze_context(ctx->cmd_fd, 1),
+	     "FREEZE_CONTEXT(freeze=1) again (idempotent)");
+	STEP(do_vfmig_freeze(ctx->cmd_fd, p->qp->handle, 1),
+	     "FREEZE_DATAPATH(freeze=1) while context-frozen (compose)");
+	STEP(do_freeze_context(ctx->cmd_fd, 0), "FREEZE_CONTEXT(freeze=0)");
+	STEP(do_freeze_context(ctx->cmd_fd, 0),
+	     "FREEZE_CONTEXT(freeze=0) again (idempotent)");
+#undef STEP
+
+	if (p2.qp)
+		ibv_destroy_qp(p2.qp);
+	if (p2.cq)
+		ibv_destroy_cq(p2.cq);
+	if (p2.pd)
+		ibv_dealloc_pd(p2.pd);
+	return fails;
+}
+
 int main(int argc, char **argv)
 {
 	const char *ibdev = argc > 1 ? argv[1] : "rxe0";
@@ -634,6 +730,7 @@ int main(int argc, char **argv)
 	fails += subtest_query_cq(ctx, &p);
 	fails += subtest_freeze_lifecycle(ctx, &p);
 	fails += subtest_bad_handle(ctx);
+	fails += subtest_freeze_context(ctx, &p);
 
 	if (p.qp)
 		ibv_destroy_qp(p.qp);

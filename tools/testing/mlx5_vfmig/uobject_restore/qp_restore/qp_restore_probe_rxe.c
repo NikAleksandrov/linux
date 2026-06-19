@@ -9,10 +9,10 @@
  *   SOURCE (libibverbs, normal ucontext)
  *     1. alloc PD + CQ, create an RC QP, drive it RESET->INIT->RTR->RTS
  *        as a self-loopback (dest_qp_num = own qpn, AV at our own GID).
- *     2. RXE_IB_METHOD_VFMIG_QUERY_QP snapshots the full wire state into
+ *     2. RXE_IB_METHOD_QUERY_QP snapshots the full wire state into
  *        a struct rxe_restore_qp_req ("the blob"). This is exactly what
  *        a CRIU dump would stash in the image.
- *     3. RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH(freeze=1) quiesces it, then
+ *     3. RXE_IB_METHOD_FREEZE_DATAPATH(freeze=1) quiesces it, then
  *        DESTROY_QP frees the source qpn back to rxe's qp_pool so the
  *        restore can re-install at the same number.
  *
@@ -147,11 +147,11 @@ enum {
 #define UVERBS_ATTR_UHW_OUT			((uint16_t)4097)
 
 /* Mirror of include/uapi/rdma/rxe_user_ioctl_cmds.h (dump-side verbs). */
-#define RXE_IB_OBJECT_VFMIG			(UVERBS_ID_DRIVER_NS + 0u)
-#define RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH	(1u << UVERBS_ID_NS_SHIFT)
-#define RXE_IB_METHOD_VFMIG_QUERY_QP		((1u << UVERBS_ID_NS_SHIFT) + 1u)
-#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE (1u << UVERBS_ID_NS_SHIFT)
-#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE    ((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_OBJECT_MIGRATE			(UVERBS_ID_DRIVER_NS + 0u)
+#define RXE_IB_METHOD_FREEZE_DATAPATH	(1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_METHOD_QUERY_QP		((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE (1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE    ((1u << UVERBS_ID_NS_SHIFT) + 1u)
 #define RXE_IB_ATTR_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
 #define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
@@ -526,8 +526,8 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	uint64_t user_handle = 0;
 	unsigned int n = 0;
 
-	cmd.hdr.object_id	= RXE_IB_OBJECT_VFMIG;
-	cmd.hdr.method_id	= RXE_IB_METHOD_VFMIG_QUERY_QP;
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_QUERY_QP;
 	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
 
 	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_HANDLE;
@@ -564,17 +564,17 @@ static int do_vfmig_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
 	} cmd = {};
 	unsigned int n = 0;
 
-	cmd.hdr.object_id	= RXE_IB_OBJECT_VFMIG;
-	cmd.hdr.method_id	= RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH;
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_FREEZE_DATAPATH;
 	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE;
 	cmd.attrs[n].len	= 0;
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= qp_handle;
 	n++;
 
-	cmd.attrs[n].attr_id	= RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE;
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE;
 	cmd.attrs[n].len	= sizeof(freeze);
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= freeze;
@@ -931,7 +931,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "  FAIL QUERY_QP(source): %s%s\n",
 			strerror(-ret),
 			ret == -EOPNOTSUPP
-			? " (rxe_vfmig_defs not wired into driver_def?)" : "");
+			? " (rxe_migrate_defs not wired into driver_def?)" : "");
 		fails++;
 		goto out_src;
 	}

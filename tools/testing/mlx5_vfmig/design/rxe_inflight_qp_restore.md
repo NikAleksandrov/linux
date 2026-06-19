@@ -24,7 +24,7 @@ SQ (`QUEUE_TYPE_FROM_CLIENT`) has **three** cursors; we capture one:
 - `producer > req.wqe_index`  => posted-but-unsent WQEs
 - `req.wqe_index > consumer`   => sent-but-unacked WQEs (RC retransmit)
 
-Today `QUERY_QP` emits only `req_wqe_index` (`rxe_vfmig.c:159`) and
+Today `QUERY_QP` emits only `req_wqe_index` (`rxe_migrate.c`) and
 `rxe_qp_restore_wire_state()` stamps `qp->req.wqe_index = req_wqe_index`
 (`rxe_qp.c:554`) **without seeding the fresh ring's producer/consumer**
 -- which start at 0. So even a drained-but-nonzero QP comes back

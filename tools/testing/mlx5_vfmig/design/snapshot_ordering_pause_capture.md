@@ -271,34 +271,39 @@ traffic-carrying) VF netdev during the parked window; keep it down.
 
 ## Part B: rxe -- context-level freeze-all variant
 
-`RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH` (rxe_vfmig.c:71) is per-QP: it
+`RXE_IB_METHOD_FREEZE_DATAPATH` (rxe_migrate.c) is per-QP: it
 resolves a QP uobject handle and pauses that QP's tasks. At the early
 `CHECKPOINT_DEVICES` hook CRIU has the *context* fd but has not yet
 resolved/dumped per-QP fds, so a per-QP freeze is awkward.
 
-### B.1 Proposed: a context-scoped freeze method
+### B.1 Implemented: a context-scoped freeze method
 
-Add `RXE_IB_METHOD_VFMIG_FREEZE_CONTEXT` taking a `UVERBS_OBJECT_..`
-context-ish handle (or operate over all QPs owned by the calling
-ufile/ucontext) and `freeze:u8`:
+`RXE_IB_METHOD_FREEZE_CONTEXT` (rxe_migrate.c) is a global (handle-less)
+method on `RXE_IB_OBJECT_MIGRATE` taking only `freeze:u8`. The caller is
+identified by `ib_uverbs_get_ucontext(attrs)`; the QP set is enumerated
+from rxe's own `qp_pool` (a driver cannot reach the core-internal ufile
+object walk):
 
 ```
 freeze=1: for each rxe_qp owned by this ucontext: rxe_qp_pause(qp)
 freeze=0: ... rxe_qp_resume(qp)
 ```
 
-Implementation note: rxe can enumerate a ucontext's QPs via the
-uverbs/uobject list for that ufile, or via the rxe qp pool filtered by
-owning pd->ucontext. The method only needs to be idempotent and to skip
-kernel-mode QPs (`!qp->is_user`), mirroring the per-QP handler's guard.
+Implementation note: the handler walks `qp_pool->xa` under
+`rcu_read_lock()`, takes a `kref_get_unless_zero()` on each live elem,
+drops the RCU lock around the (sleeping) pause/resume, then `rxe_put()`s
+and re-acquires. QPs are filtered to user QPs (`qp->is_user`) owned by
+the calling ucontext (`qp->ibqp.uobject->context == ucontext`); kernel
+QPs are skipped. The method is idempotent and order-independent vs
+`FREEZE_DATAPATH` (both drive the same per-QP `rxe_qp_pause/resume`).
 
 ### B.2 Why this is "convenience, not required"
 
 CRIU *can* freeze per-QP if it enumerates QPs at the early hook (it
 already does a netlink dump there). The context-wide method just removes
 the need to resolve each QP handle before fds are dumped and makes the
-early hook a single call. We'll land the per-QP path first (already
-exists) and add the context variant as an ergonomic follow-up.
+early hook a single call. Both paths now exist: the per-QP
+`FREEZE_DATAPATH` and the context-wide `FREEZE_CONTEXT`.
 
 ### B.3 rxe test asks
 

@@ -194,8 +194,8 @@ uobject_restore/qp_query/qp_query_probe_mlx5_vfmig: \
 # QUERY_QP + FREEZE_DATAPATH rxe dump-side probe (S6a A4,
 # design/uobject_restore.md §5.3.7). Single-process: libibverbs builds a
 # real RC QP self-loopback at RTS, then raw uverbs ioctl drives
-# RXE_IB_METHOD_VFMIG_QUERY_QP (field fidelity vs ibv_query_qp) and the
-# RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH freeze/resume lifecycle. rxe object
+# RXE_IB_METHOD_QUERY_QP (field fidelity vs ibv_query_qp) and the
+# RXE_IB_METHOD_FREEZE_DATAPATH freeze/resume lifecycle. rxe object
 # ids inlined in the source (system rdma-core uapi has no rxe driver
 # namespace). No restore-mode ucontext needed.
 uobject_restore/qp_query/qp_query_probe_rxe: \
