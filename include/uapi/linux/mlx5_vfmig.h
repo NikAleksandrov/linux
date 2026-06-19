@@ -62,12 +62,27 @@
  * MLX5_VFMIG_IOC_MARK_RESTORED:
  *   Mark VF @vf_id as having had its firmware state restored. The next
  *   mlx5_core probe of that VF will skip INIT_HCA.
- *   Returns 0 on success, -EINVAL if vf_id is out of range, -EALREADY if
- *   the flag was already set.
+ *   Returns 0 on success, -EINVAL if vf_id is out of range or @flags has
+ *   unknown bits, -EALREADY if the flag was already set.
+ *
+ *   @flags:
+ *     MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME -- the snapshot-ordering
+ *       restore mirror (design/snapshot_ordering_pause_capture.md Part
+ *       A.4). When set, the next probe runs SUSPEND_VHCA +
+ *       LOAD_VHCA_STATE but SKIPS the trailing RESUME pair, leaving the
+ *       restored VHCA parked. Userspace (CRIU) must later issue
+ *       MLX5_VFMIG_IOC_RESUME_VHCA -- at RESUME_DEVICES_LATE, after all
+ *       MR/ring VMAs have been restored -- to bring the datapath live.
+ *       Without this flag the probe resumes inline as before (legacy
+ *       non-CRIU restore).
  */
+#define MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME	(1u << 0)
+#define MLX5_VFMIG_MARK_RESTORED_FLAG_ALL \
+	(MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME)
+
 struct mlx5_vfmig_mark_restored {
 	__u32 vf_id;
-	__u32 reserved;
+	__u32 flags;	/* in: subset of MLX5_VFMIG_MARK_RESTORED_FLAG_* */
 };
 #define MLX5_VFMIG_IOC_MARK_RESTORED \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x01, struct mlx5_vfmig_mark_restored)
@@ -1453,5 +1468,69 @@ struct mlx5_vfmig_set_vf_uuid {
 };
 #define MLX5_VFMIG_IOC_SET_VF_UUID \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x12, struct mlx5_vfmig_set_vf_uuid)
+
+/*
+ * MLX5_VFMIG_IOC_SUSPEND_VHCA:
+ *   Quiesce VF @vf_id's datapath by issuing SUSPEND_VHCA(INITIATOR)
+ *   followed by SUSPEND_VHCA(RESPONDER) on its vhca_id (PF-issued,
+ *   other_function=1). This is the "pause" half of the stop-and-copy
+ *   snapshot-ordering fix: CRIU calls it at the early CHECKPOINT_DEVICES
+ *   hook, BEFORE the dumpee's memory is copied, so no peer RDMA
+ *   WRITE/SEND (and no VF self-DMA) lands in pinned MR pages mid-
+ *   snapshot. The heavy state capture stays in the late
+ *   MLX5_VFMIG_IOC_SAVE_VHCA_STATE.
+ *
+ *   Latches priv.sriov.vfs_ctx[vf_id].vfmig_suspended. Idempotent:
+ *   returns 0 with no firmware traffic if the VF is already suspended.
+ *   The VF may be bound or unbound (SUSPEND_VHCA is an other_function
+ *   command issued by the PF). Requires the migratable cap, same gate
+ *   as SAVE.
+ *
+ *   Relationship to SAVE_VHCA_STATE: if the VF is already suspended via
+ *   this ioctl, a subsequent SAVE skips its in-SAVE SUSPEND pair and
+ *   does NOT auto-resume on save_fd close -- the caller owns the resume
+ *   via MLX5_VFMIG_IOC_RESUME_VHCA. If SAVE is used standalone (no prior
+ *   SUSPEND), it self-suspends and resumes on close as before.
+ *
+ *   Returns 0 on success; -EINVAL if @vf_id is out of range or @flags
+ *   is non-zero; -EOPNOTSUPP if the VF is not migration-enabled;
+ *   -ENODEV if the PF is gone; any negative firmware-error code if a
+ *   SUSPEND step fails (a failed INITIATOR suspend is not "undone").
+ */
+struct mlx5_vfmig_suspend_vhca {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: must be 0 */
+	__u32 reserved[2];
+};
+#define MLX5_VFMIG_IOC_SUSPEND_VHCA \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x13, struct mlx5_vfmig_suspend_vhca)
+
+/*
+ * MLX5_VFMIG_IOC_RESUME_VHCA:
+ *   Un-quiesce VF @vf_id's datapath by issuing RESUME_VHCA(RESPONDER)
+ *   followed by RESUME_VHCA(INITIATOR) (reverse order of suspend). This
+ *   is the "resume" half of the snapshot-ordering fix:
+ *     - on the source after an aborted/rolled-back dump, to bring the
+ *       VF back to runnable;
+ *     - on the destination at RESUME_DEVICES_LATE, after a
+ *       MARK_RESTORED { DEFER_RESUME } + bind has applied
+ *       LOAD_VHCA_STATE and left the VHCA parked, once all MR/ring VMAs
+ *       are restored.
+ *
+ *   Clears priv.sriov.vfs_ctx[vf_id].vfmig_suspended and
+ *   @vfmig_defer_resume. Idempotent: returns 0 with no firmware traffic
+ *   if the VF is not currently suspended.
+ *
+ *   Returns 0 on success; -EINVAL if @vf_id is out of range or @flags
+ *   is non-zero; -ENODEV if the PF is gone; any negative firmware-error
+ *   code if a RESUME step fails.
+ */
+struct mlx5_vfmig_resume_vhca {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: must be 0 */
+	__u32 reserved[2];
+};
+#define MLX5_VFMIG_IOC_RESUME_VHCA \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
 
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

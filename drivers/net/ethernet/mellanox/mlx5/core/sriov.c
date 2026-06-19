@@ -141,6 +141,16 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	mlx5_vfmig_pf_drop_pending_loads(dev);
 
 	/*
+	 * Force-resume + clear any persistent datapath-suspend state
+	 * (MLX5_VFMIG_IOC_SUSPEND_VHCA / DEFER_RESUME) before the VFs are
+	 * disabled, so an aborted dumper can't strand a VF parked into the
+	 * next sriov_numvfs cycle. PF mdev is still alive here so the
+	 * best-effort RESUME_VHCA commands can run. See
+	 * tools/testing/mlx5_vfmig/design/snapshot_ordering_pause_capture.md.
+	 */
+	mlx5_vfmig_pf_drop_suspends(dev);
+
+	/*
 	 * Clear orchestrator-stamped per-VF UUIDs so the
 	 * MLX5_VFMIG_IOC_SET_VF_UUID lifecycle ("all-zeros after
 	 * sriov_numvfs=0") holds even though vfs_ctx[] itself

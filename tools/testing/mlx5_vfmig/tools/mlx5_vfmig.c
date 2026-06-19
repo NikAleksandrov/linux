@@ -8,12 +8,14 @@
  *   make -C tools/testing/mlx5_vfmig tools/mlx5_vfmig
  *
  * Use:
- *   mlx5_vfmig <pf-bdf> mark_restored    <vf_id>
+ *   mlx5_vfmig <pf-bdf> mark_restored    <vf_id> [defer_resume]
  *   mlx5_vfmig <pf-bdf> get_vhca_id      <vf_id>
  *   mlx5_vfmig <pf-bdf> query_vf         <vf_id>
  *   mlx5_vfmig <pf-bdf> list
  *   mlx5_vfmig <pf-bdf> load_vhca_state  <vf_id> <blob_path>
  *   mlx5_vfmig <pf-bdf> save_vhca_state  <vf_id> <blob_path> [keep_suspended]
+ *   mlx5_vfmig <pf-bdf> suspend_vhca     <vf_id>
+ *   mlx5_vfmig <pf-bdf> resume_vhca      <vf_id>
  *   mlx5_vfmig <pf-bdf> enable_migratable <vf_id>
  *   mlx5_vfmig <pf-bdf> set_vf_uuid       <vf_id> <uuid-string>
  *   mlx5_vfmig <pf-bdf> query_qp          <vf_id> <qpn>
@@ -827,9 +829,13 @@ static int do_set_vf_uuid(int fd, unsigned int vf_id, const char *uuid_str)
 	return 0;
 }
 
-static int do_mark(int fd, unsigned int vf_id)
+static int do_mark(int fd, unsigned int vf_id, unsigned int defer_resume)
 {
-	struct mlx5_vfmig_mark_restored arg = { .vf_id = vf_id };
+	struct mlx5_vfmig_mark_restored arg = {
+		.vf_id = vf_id,
+		.flags = defer_resume ?
+			 MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME : 0,
+	};
 
 	if (ioctl(fd, MLX5_VFMIG_IOC_MARK_RESTORED, &arg) < 0) {
 		if (errno == EALREADY)
@@ -843,7 +849,60 @@ static int do_mark(int fd, unsigned int vf_id)
 			perror("MARK_RESTORED");
 		return 1;
 	}
-	printf("marked vf %u as restored\n", vf_id);
+	printf("marked vf %u as restored%s\n", vf_id,
+	       defer_resume ? " (resume deferred to RESUME_VHCA)" : "");
+	return 0;
+}
+
+/*
+ * MLX5_VFMIG_IOC_SUSPEND_VHCA wrapper. Parks the VF's RDMA datapath
+ * (SUSPEND_VHCA initiator+responder) ahead of a memory snapshot -- the
+ * "pause" half of the stop-and-copy ordering fix. CRIU calls this at
+ * the early CHECKPOINT_DEVICES hook, before the dumpee's memory is
+ * copied. Idempotent. See
+ * tools/testing/mlx5_vfmig/design/snapshot_ordering_pause_capture.md.
+ */
+static int do_suspend(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_suspend_vhca arg = { .vf_id = vf_id };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_SUSPEND_VHCA, &arg) < 0) {
+		if (errno == EOPNOTSUPP)
+			fprintf(stderr,
+				"vf %u: not migration-enabled (run enable_migratable first)\n",
+				vf_id);
+		else if (errno == EINVAL)
+			fprintf(stderr,
+				"vf_id %u out of range (have you set sriov_numvfs?)\n",
+				vf_id);
+		else
+			perror("SUSPEND_VHCA");
+		return 1;
+	}
+	printf("suspended vf %u datapath\n", vf_id);
+	return 0;
+}
+
+/*
+ * MLX5_VFMIG_IOC_RESUME_VHCA wrapper. Un-parks a VF previously
+ * suspended via suspend_vhca (or left parked by a defer-resume
+ * restore). On the destination, CRIU calls this at RESUME_DEVICES_LATE
+ * after all MR/ring VMAs have been restored. Idempotent.
+ */
+static int do_resume(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_resume_vhca arg = { .vf_id = vf_id };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_RESUME_VHCA, &arg) < 0) {
+		if (errno == EINVAL)
+			fprintf(stderr,
+				"vf_id %u out of range (have you set sriov_numvfs?)\n",
+				vf_id);
+		else
+			perror("RESUME_VHCA");
+		return 1;
+	}
+	printf("resumed vf %u datapath\n", vf_id);
 	return 0;
 }
 
@@ -1149,12 +1208,20 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s <pf-bdf> <verb> [args]\n"
-		"  mark_restored    <vf_id>\n"
+		"  mark_restored    <vf_id> [defer_resume]\n"
+		"                   defer_resume: leave VHCA parked after LOAD\n"
+		"                   for a later resume_vhca (CRIU restore mirror)\n"
 		"  get_vhca_id      <vf_id>\n"
 		"  query_vf         <vf_id>\n"
 		"  list\n"
 		"  load_vhca_state  <vf_id> <blob_path>\n"
 		"  save_vhca_state  <vf_id> <blob_path> [keep_suspended]\n"
+		"  suspend_vhca     <vf_id>\n"
+		"                   pause RDMA datapath before memory snapshot\n"
+		"                   (stop-and-copy ordering; CHECKPOINT_DEVICES)\n"
+		"  resume_vhca      <vf_id>\n"
+		"                   un-park a suspended/defer-resumed VF\n"
+		"                   (RESUME_DEVICES_LATE)\n"
 		"  enable_migratable <vf_id>\n"
 		"  set_tracked       <vf_id> <0|1>\n"
 		"  set_vf_uuid       <vf_id> <uuid-string>\n"
@@ -1210,9 +1277,28 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_list(fd);
 	} else if (verb_eq(verb, "mark_restored")) {
+		unsigned int defer_resume = 0;
+
+		if (argc != 4 && argc != 5)
+			goto badargs;
+		if (argc == 5) {
+			if (!strcmp(argv[4], "defer_resume") ||
+			    !strcmp(argv[4], "defer-resume"))
+				defer_resume = 1;
+			else
+				goto badargs;
+		}
+		ret = do_mark(fd, strtoul(argv[3], NULL, 0), defer_resume);
+	} else if (verb_eq(verb, "suspend_vhca") ||
+		   verb_eq(verb, "suspend")) {
 		if (argc != 4)
 			goto badargs;
-		ret = do_mark(fd, strtoul(argv[3], NULL, 0));
+		ret = do_suspend(fd, strtoul(argv[3], NULL, 0));
+	} else if (verb_eq(verb, "resume_vhca") ||
+		   verb_eq(verb, "resume")) {
+		if (argc != 4)
+			goto badargs;
+		ret = do_resume(fd, strtoul(argv[3], NULL, 0));
 	} else if (verb_eq(verb, "get_vhca_id")) {
 		if (argc != 4)
 			goto badargs;

@@ -2421,18 +2421,28 @@ static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 {
 	struct mlx5_vfmig_mark_restored arg;
 	struct mlx5_core_sriov *sriov;
+	bool defer_resume;
 	u16 vhca_id;
 	int err;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.reserved)
+	if (arg.flags & ~MLX5_VFMIG_MARK_RESTORED_FLAG_ALL)
 		return -EINVAL;
 
 	sriov = &vfmig->pf_mdev->priv.sriov;
 
 	if (arg.vf_id >= sriov->num_vfs)
 		return -EINVAL;
+
+	/*
+	 * Defer-resume request (snapshot-ordering restore mirror): the
+	 * next probe applies LOAD_VHCA_STATE but leaves the VHCA parked
+	 * for a later RESUME_VHCA. Stamp it independently of @restored so
+	 * the no-op-if-already-restored path below still honors it.
+	 */
+	defer_resume = arg.flags & MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME;
+	sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume = defer_resume ? 1 : 0;
 
 	/*
 	 * The LOAD ioctl's close() now auto-installs restored=1 (and a
@@ -4139,6 +4149,15 @@ struct mlx5_vfmig_save_ctx {
 	/* Suspend bookkeeping for the resume-on-close policy. */
 	bool suspended_initiator;
 	bool suspended_responder;
+	/*
+	 * True when THIS save session issued the SUSPEND pair (legacy
+	 * self-suspend). False when the VF was already parked by an
+	 * explicit MLX5_VFMIG_IOC_SUSPEND_VHCA before SAVE -- in that case
+	 * the caller owns the resume (via RESUME_VHCA) and release() must
+	 * NOT auto-resume. See design/snapshot_ordering_pause_capture.md
+	 * Part A.3.
+	 */
+	bool owns_suspend;
 
 	/*
 	 * Wire-format payload size (bytes the firmware actually wrote
@@ -4696,7 +4715,14 @@ static void vfmig_save_release_resources(struct mlx5_vfmig_save_ctx *ctx)
 	 * dump-then-destroy callers don't care. The bookkeeping bools mean
 	 * we won't issue a stray RESUME if the corresponding SUSPEND
 	 * never succeeded.
+	 *
+	 * Only auto-resume if this session owns the suspend (legacy self-
+	 * suspend). When the VF was parked by an explicit SUSPEND_VHCA
+	 * before SAVE, the caller owns the resume via RESUME_VHCA -- and
+	 * the persistent vfmig_suspended bit stays set across this close.
 	 */
+	if (!ctx->owns_suspend)
+		return;
 	if (ctx->flags & MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED)
 		return;
 
@@ -4746,6 +4772,148 @@ static const struct file_operations mlx5_vfmig_save_fops = {
 	.read		= vfmig_save_read,
 	.release	= vfmig_save_release,
 };
+
+/*
+ * MLX5_VFMIG_IOC_SUSPEND_VHCA: park the VF's datapath ahead of a memory
+ * snapshot (the "pause" half of the stop-and-copy ordering fix). Issues
+ * SUSPEND_VHCA(INITIATOR) then SUSPEND_VHCA(RESPONDER) and latches the
+ * persistent vfmig_suspended bit so a later SAVE skips its self-suspend
+ * and leaves the resume to the caller. Idempotent. Caller holds
+ * vfmig->lock for read. See design/snapshot_ordering_pause_capture.md.
+ */
+static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
+				   void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_suspend_vhca arg;
+	struct mlx5_core_sriov *sriov;
+	bool migratable = false;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.flags || arg.reserved[0] || arg.reserved[1])
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	/* Idempotent: already parked, no firmware traffic. */
+	if (sriov->vfs_ctx[arg.vf_id].vfmig_suspended)
+		return 0;
+
+	err = vfmig_check_pf_migration_caps(pf_mdev);
+	if (err)
+		return err;
+
+	err = vfmig_query_vf_migratable(pf_mdev, arg.vf_id, &migratable);
+	if (err)
+		return err;
+	if (!migratable) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u is not migration-enabled (issue MLX5_VFMIG_IOC_ENABLE_MIGRATABLE pre-bind)\n",
+			       arg.vf_id);
+		return -EOPNOTSUPP;
+	}
+
+	err = vfmig_query_vhca_id(pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	/* Quiesce: initiator (egress) first, then responder (ingress). */
+	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
+		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SUSPEND_VHCA(INITIATOR) vf %u (vhca_id 0x%04x) failed: %d\n",
+			       arg.vf_id, vhca_id, err);
+		return err;
+	}
+
+	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
+		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SUSPEND_VHCA(RESPONDER) vf %u (vhca_id 0x%04x) failed: %d\n",
+			       arg.vf_id, vhca_id, err);
+		/* Roll back the initiator suspend so we don't half-park. */
+		(void)vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
+			MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR);
+		return err;
+	}
+
+	sriov->vfs_ctx[arg.vf_id].vfmig_suspended = 1;
+	mlx5_core_info(pf_mdev,
+		       "vfmig: suspended VF %u (vhca_id 0x%04x) datapath (snapshot-ordering pause)\n",
+		       arg.vf_id, vhca_id);
+	return 0;
+}
+
+/*
+ * MLX5_VFMIG_IOC_RESUME_VHCA: un-park a VF previously suspended via
+ * SUSPEND_VHCA (or left parked by a DEFER_RESUME restore). Issues
+ * RESUME_VHCA(RESPONDER) then RESUME_VHCA(INITIATOR) and clears the
+ * persistent vfmig_suspended / vfmig_defer_resume bits. Idempotent.
+ * Best-effort like vfmig_save_release_resources: a failed RESUME is
+ * logged and surfaced but the parked bits are cleared regardless (an
+ * FW resume failure is not fixable by retrying the bit, and leaving
+ * vfmig_suspended set would wrongly suppress a future SAVE's self-
+ * suspend). Caller holds vfmig->lock for read.
+ */
+static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_resume_vhca arg;
+	struct mlx5_core_sriov *sriov;
+	u16 vhca_id;
+	int err, err2;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.flags || arg.reserved[0] || arg.reserved[1])
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	/* Idempotent: nothing parked. Clear any stale defer-resume hint. */
+	if (!sriov->vfs_ctx[arg.vf_id].vfmig_suspended) {
+		sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume = 0;
+		return 0;
+	}
+
+	err = vfmig_query_vhca_id(pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	/* Resume in the inverse order of suspend: responder, then initiator. */
+	err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
+		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER);
+	if (err)
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RESUME_VHCA(RESPONDER) vf %u (vhca_id 0x%04x) failed: %d\n",
+			       arg.vf_id, vhca_id, err);
+
+	err2 = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
+		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR);
+	if (err2)
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RESUME_VHCA(INITIATOR) vf %u (vhca_id 0x%04x) failed: %d\n",
+			       arg.vf_id, vhca_id, err2);
+
+	sriov->vfs_ctx[arg.vf_id].vfmig_suspended = 0;
+	sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume = 0;
+
+	if (!err && !err2)
+		mlx5_core_info(pf_mdev,
+			       "vfmig: resumed VF %u (vhca_id 0x%04x) datapath\n",
+			       arg.vf_id, vhca_id);
+	return err ? err : err2;
+}
 
 /*
  * Set up the SAVE session: query vhca_id, suspend the VHCA, ask the FW
@@ -4823,26 +4991,39 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 		goto err_pd;
 	ctx->pd_allocated = true;
 
-	/* Quiesce: initiator (egress) first, then responder (ingress). */
-	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
-		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR);
-	if (err) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: SUSPEND_VHCA(INITIATOR) vf %u (vhca_id 0x%04x) failed: %d\n",
-			       arg.vf_id, vhca_id, err);
-		goto err_suspend;
-	}
-	ctx->suspended_initiator = true;
+	/*
+	 * Quiesce. If the VF was already parked by an explicit
+	 * SUSPEND_VHCA (the snapshot-ordering early hook), skip the
+	 * in-SAVE suspend and leave the resume to the caller's
+	 * RESUME_VHCA. Otherwise self-suspend (initiator/egress first,
+	 * then responder/ingress) and resume on close per the legacy
+	 * policy. See design/snapshot_ordering_pause_capture.md Part A.3.
+	 */
+	if (sriov->vfs_ctx[arg.vf_id].vfmig_suspended) {
+		ctx->owns_suspend = false;
+	} else {
+		ctx->owns_suspend = true;
 
-	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
-		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER);
-	if (err) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: SUSPEND_VHCA(RESPONDER) vf %u (vhca_id 0x%04x) failed: %d\n",
-			       arg.vf_id, vhca_id, err);
-		goto err_suspend;
+		err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
+			MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SUSPEND_VHCA(INITIATOR) vf %u (vhca_id 0x%04x) failed: %d\n",
+				       arg.vf_id, vhca_id, err);
+			goto err_suspend;
+		}
+		ctx->suspended_initiator = true;
+
+		err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
+			MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SUSPEND_VHCA(RESPONDER) vf %u (vhca_id 0x%04x) failed: %d\n",
+				       arg.vf_id, vhca_id, err);
+			goto err_suspend;
+		}
+		ctx->suspended_responder = true;
 	}
-	ctx->suspended_responder = true;
 
 	err = vfmig_cmd_query_vhca_migration_state(pf_mdev, vhca_id,
 						   &query_size);
@@ -5079,6 +5260,12 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_SET_VF_UUID:
 		ret = vfmig_ioc_set_vf_uuid(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_SUSPEND_VHCA:
+		ret = vfmig_ioc_suspend_vhca(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_RESUME_VHCA:
+		ret = vfmig_ioc_resume_vhca(vfmig, uarg);
 		break;
 	case MLX5_VFMIG_IOC_PROBE_UID:
 		ret = vfmig_ioc_probe_uid(vfmig, uarg);
@@ -5825,6 +6012,7 @@ int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 	struct mlx5_core_dev *pf_mdev;
 	struct mlx5_vfmig_pf *vfmig;
 	struct mlx5_vfmig_vf_load *load;
+	bool defer_resume;
 	int vf_id;
 	int err = 0;
 	int err_resume;
@@ -5871,6 +6059,8 @@ int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 		return 0;
 	}
 
+	defer_resume = pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_defer_resume;
+
 	/*
 	 * The destination VHCA has just been ENABLE_HCA'd and from the
 	 * firmware's point of view is in the RUNNING state. LOAD_VHCA_STATE
@@ -5913,6 +6103,25 @@ int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 			       "vfmig: LOAD_VHCA_STATE vf %u (vhca_id 0x%04x) size %llu failed: %d\n",
 			       load->vf_id, load->vhca_id,
 			       (unsigned long long)load->record_size, err);
+		goto out_destroy;
+	}
+
+	/*
+	 * Snapshot-ordering restore mirror: if userspace asked to defer
+	 * the resume (MARK_RESTORED { DEFER_RESUME }), leave the VHCA in
+	 * the "loaded but stopped" state and latch vfmig_suspended so the
+	 * later MLX5_VFMIG_IOC_RESUME_VHCA -- issued at RESUME_DEVICES_LATE
+	 * once all MR/ring VMAs are restored -- brings the datapath live.
+	 * The defer hint is consumed here. See
+	 * design/snapshot_ordering_pause_capture.md Part A.4.
+	 */
+	if (defer_resume) {
+		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_suspended = 1;
+		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_defer_resume = 0;
+		mlx5_core_info(pf_mdev,
+			       "vfmig: applied %llu bytes of LOAD state to vf %u (vhca_id 0x%04x); resume deferred (parked for RESUME_DEVICES_LATE)\n",
+			       (unsigned long long)load->record_size,
+			       load->vf_id, load->vhca_id);
 		goto out_destroy;
 	}
 
@@ -6170,6 +6379,85 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
 	down_read(&vfmig->lock);
 	if (!vfmig->dead)
 		vfmig_pf_drop_pending_loads_locked(vfmig);
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+}
+
+/*
+ * Force-resume + clear the persistent datapath-suspend state on every
+ * vfs_ctx[] slot. See the doc-comment on mlx5_vfmig_pf_drop_suspends().
+ * Caller holds vfmig->lock for read; we take ctxs_lock per slot only to
+ * read+clear the persistent bits, and issue the (sleepable) RESUME
+ * firmware commands with ctxs_lock dropped.
+ */
+static void vfmig_pf_drop_suspends_locked(struct mlx5_vfmig_pf *vfmig)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov;
+	int total_vfs;
+	int i;
+
+	if (!pf_mdev)
+		return;
+	sriov = &pf_mdev->priv.sriov;
+	if (!sriov->vfs_ctx)
+		return;
+
+	total_vfs = sriov->num_vfs;
+	mutex_lock(&vfmig->ctxs_lock);
+	for (i = 0; i < total_vfs; i++) {
+		u16 vhca_id;
+		int err;
+
+		if (!sriov->vfs_ctx[i].vfmig_suspended) {
+			sriov->vfs_ctx[i].vfmig_defer_resume = 0;
+			continue;
+		}
+		sriov->vfs_ctx[i].vfmig_suspended = 0;
+		sriov->vfs_ctx[i].vfmig_defer_resume = 0;
+		mutex_unlock(&vfmig->ctxs_lock);
+
+		mlx5_core_info(pf_mdev,
+			       "vfmig: force-resuming parked vf %d at sriov teardown\n",
+			       i);
+		err = vfmig_query_vhca_id(pf_mdev, i + 1, &vhca_id);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: teardown resume: QUERY vhca_id vf %d failed: %d\n",
+				       i, err);
+		} else {
+			err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
+				MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER);
+			if (err)
+				mlx5_core_warn(pf_mdev,
+					       "vfmig: teardown RESUME_VHCA(RESPONDER) vf %d (vhca_id 0x%04x) failed: %d\n",
+					       i, vhca_id, err);
+			err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
+				MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR);
+			if (err)
+				mlx5_core_warn(pf_mdev,
+					       "vfmig: teardown RESUME_VHCA(INITIATOR) vf %d (vhca_id 0x%04x) failed: %d\n",
+					       i, vhca_id, err);
+		}
+		mutex_lock(&vfmig->ctxs_lock);
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
+}
+
+void mlx5_vfmig_pf_drop_suspends(struct mlx5_core_dev *pf_mdev)
+{
+	struct mlx5_vfmig_pf *vfmig;
+
+	if (!pf_mdev || !mlx5_core_is_pf(pf_mdev))
+		return;
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig)
+		return;
+
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_pf_drop_suspends_locked(vfmig);
 	up_read(&vfmig->lock);
 	vfmig_pf_put(vfmig);
 }

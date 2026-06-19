@@ -96,6 +96,25 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * Force-resume and clear the persistent datapath-suspend state on every
+ * vfs_ctx[] slot of @pf_mdev. Called from mlx5_device_disable_sriov()
+ * alongside mlx5_vfmig_pf_drop_pending_loads(), before the VFs are
+ * disabled, so that:
+ *   - a crashed/aborted dumper that latched MLX5_VFMIG_IOC_SUSPEND_VHCA
+ *     without a matching RESUME can't strand vfmig_suspended set into
+ *     the next sriov_numvfs cycle (which would wrongly suppress the
+ *     next SAVE's self-suspend), and
+ *   - the firmware is left in a clean (resumed) state for any VF that
+ *     happens to outlive the teardown.
+ * Best-effort: a failed RESUME_VHCA is logged but never blocks
+ * teardown, and the persistent bits are cleared regardless.
+ *
+ * Caller must guarantee @pf_mdev is alive (FW commands still work).
+ * Safe to call when there is no vfmig PF context yet (no-op).
+ */
+void mlx5_vfmig_pf_drop_suspends(struct mlx5_core_dev *pf_mdev);
+
+/*
  * Drop any per-VF deterministic IOVA domains staged on @pf_mdev's
  * sriov->vfs_ctx[]. Called from mlx5_sriov_disable() *before*
  * pci_disable_sriov() runs: the IOVA domain is attached to the VF's
@@ -337,6 +356,7 @@ void mlx5_vfmig_module_exit(void);
 static inline int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev) { return 0; }
 static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev) { }
+static inline void mlx5_vfmig_pf_drop_suspends(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev) { }
 static inline void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev) { }
