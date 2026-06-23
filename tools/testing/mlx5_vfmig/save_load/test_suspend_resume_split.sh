@@ -213,10 +213,10 @@ sudo dmesg -C
 echo 1 | sudo tee "$(vf_path $PF)/sriov_drivers_autoprobe" >/dev/null 2>&1 || true
 echo 0 | sudo tee "$(vf_path $PF)/sriov_numvfs"            >/dev/null
 sleep 1
-if sudo dmesg | grep -q "vfmig: force-resuming parked vf 0"; then
-    pass "teardown logged force-resume of parked vf 0"
+if sudo dmesg | grep -q "vfmig: tearing down vf 0 while datapath-suspended"; then
+    pass "teardown warned + force-resumed parked vf 0"
 else
-    fail "teardown did not log 'force-resuming parked vf 0'"
+    fail "teardown did not warn 'tearing down vf 0 while datapath-suspended'"
 fi
 
 # --- summary -----------------------------------------------------------
