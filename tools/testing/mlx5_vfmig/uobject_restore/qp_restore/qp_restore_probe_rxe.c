@@ -155,6 +155,9 @@ enum {
 #define RXE_IB_ATTR_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
 #define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
+#define RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE ((1u << UVERBS_ID_NS_SHIFT) + 3u)
+#define RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE ((1u << UVERBS_ID_NS_SHIFT) + 4u)
+#define RXE_IB_ATTR_QUERY_QP_RESP_RES	((1u << UVERBS_ID_NS_SHIFT) + 5u)
 
 /* ib_qp_type / ib_qp_state values used by the RESTORE_QP method args. */
 #define IB_QPT_RC_LOCAL				2
@@ -243,8 +246,20 @@ struct rxe_restore_qp_req_local {
 	uint8_t			timeout;
 	uint8_t			port_num;
 	uint8_t			sq_sig_all;
-	uint8_t			reserved;
-	uint16_t		reserved1;
+	uint8_t			resp_aeth_syndrome;
+	uint16_t		reserved;
+	uint32_t		sq_producer;
+	uint32_t		sq_consumer;
+	uint32_t		rq_producer;
+	uint32_t		rq_consumer;
+	uint32_t		resp_ack_psn;
+	int32_t			resp_opcode;
+	uint32_t		resp_status;
+	uint32_t		res_head;
+	uint32_t		res_tail;
+	uint32_t		sq_image_bytes;
+	uint32_t		rq_image_bytes;
+	uint32_t		res_image_bytes;
 	uint64_t		reserved2;
 };
 
@@ -255,6 +270,18 @@ struct ib_uverbs_qp_cap_local {
 	uint32_t max_send_sge;
 	uint32_t max_recv_sge;
 	uint32_t max_inline_data;
+};
+
+/*
+ * Per-image output buffers for the B1 in-flight QUERY_QP attrs. NULL
+ * buffer => that image attr is omitted (the kernel then skips it). The
+ * authoritative byte length lands in blob->{sq,rq,res}_image_bytes.
+ */
+struct qp_images {
+	void		*sq;
+	void		*rq;
+	void		*res;
+	uint32_t	cap;	/* capacity of each buffer */
 };
 
 #define PD_TARGET_HANDLE			0x4242u
@@ -425,6 +452,7 @@ static int do_restore_qp(int fd, uint32_t target_handle, uint32_t pd_handle,
 			 uint64_t user_handle,
 			 const struct ib_uverbs_qp_cap_local *cap,
 			 const struct rxe_restore_qp_req_local *uhw,
+			 const struct qp_images *imgs,
 			 uint32_t *resp_qpn_out,
 			 struct rxe_create_qp_resp_local *resp_out)
 {
@@ -433,7 +461,39 @@ static int do_restore_qp(int fd, uint32_t target_handle, uint32_t pd_handle,
 		struct ib_uverbs_ioctl_hdr	hdr;
 		struct ib_uverbs_attr		attrs[12];
 	} cmd = {};
+	uint8_t *uhw_in = NULL;
+	size_t uhw_in_len = sizeof(*uhw);
+	const void *uhw_in_ptr = uhw;
 	unsigned int n = 0;
+	int rc;
+
+	/*
+	 * B1: concatenate the captured ring/responder images after the
+	 * fixed header, in the kernel's slice order (SQ, RQ, RES). A
+	 * drained restore passes imgs==NULL and the header alone.
+	 */
+	if (imgs) {
+		size_t off, tail = (size_t)uhw->sq_image_bytes +
+				   uhw->rq_image_bytes + uhw->res_image_bytes;
+
+		uhw_in_len = sizeof(*uhw) + tail;
+		uhw_in = malloc(uhw_in_len);
+		if (!uhw_in)
+			return -ENOMEM;
+		memcpy(uhw_in, uhw, sizeof(*uhw));
+		off = sizeof(*uhw);
+		if (uhw->sq_image_bytes) {
+			memcpy(uhw_in + off, imgs->sq, uhw->sq_image_bytes);
+			off += uhw->sq_image_bytes;
+		}
+		if (uhw->rq_image_bytes) {
+			memcpy(uhw_in + off, imgs->rq, uhw->rq_image_bytes);
+			off += uhw->rq_image_bytes;
+		}
+		if (uhw->res_image_bytes)
+			memcpy(uhw_in + off, imgs->res, uhw->res_image_bytes);
+		uhw_in_ptr = uhw_in;
+	}
 
 	cmd.hdr.object_id	= UVERBS_OBJECT_RESTORE;
 	cmd.hdr.method_id	= UVERBS_METHOD_RESTORE_QP;
@@ -494,9 +554,9 @@ static int do_restore_qp(int fd, uint32_t target_handle, uint32_t pd_handle,
 	n++;
 
 	cmd.attrs[n].attr_id	= UVERBS_ATTR_UHW_IN;
-	cmd.attrs[n].len	= sizeof(*uhw);
+	cmd.attrs[n].len	= uhw_in_len;
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data	= (uintptr_t)uhw;
+	cmd.attrs[n].data	= (uintptr_t)uhw_in_ptr;
 	n++;
 
 	cmd.attrs[n].attr_id	= UVERBS_ATTR_UHW_OUT;
@@ -508,19 +568,22 @@ static int do_restore_qp(int fd, uint32_t target_handle, uint32_t pd_handle,
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
 
-	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
-		return -errno;
+	rc = ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0 ? -errno : 0;
+	free(uhw_in);
+	if (rc)
+		return rc;
 	if (resp_out)
 		*resp_out = uhw_out;
 	return 0;
 }
 
 static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
-			     struct rxe_restore_qp_req_local *blob_out)
+			     struct rxe_restore_qp_req_local *blob_out,
+			     const struct qp_images *imgs)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[3];
+		struct ib_uverbs_attr		attrs[6];
 	} cmd = {};
 	/* RESP_USER_HANDLE is mandatory but unused by the restore probe. */
 	uint64_t user_handle = 0;
@@ -547,6 +610,28 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data	= (uintptr_t)&user_handle;
 	n++;
+
+	if (imgs && imgs->sq) {
+		cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE;
+		cmd.attrs[n].len	= imgs->cap;
+		cmd.attrs[n].flags	= 0;
+		cmd.attrs[n].data	= (uintptr_t)imgs->sq;
+		n++;
+	}
+	if (imgs && imgs->rq) {
+		cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE;
+		cmd.attrs[n].len	= imgs->cap;
+		cmd.attrs[n].flags	= 0;
+		cmd.attrs[n].data	= (uintptr_t)imgs->rq;
+		n++;
+	}
+	if (imgs && imgs->res) {
+		cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_QP_RESP_RES;
+		cmd.attrs[n].len	= imgs->cap;
+		cmd.attrs[n].flags	= 0;
+		cmd.attrs[n].data	= (uintptr_t)imgs->res;
+		n++;
+	}
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
@@ -811,6 +896,20 @@ static int blob_compare(const struct rxe_restore_qp_req_local *src,
 	CMP(timeout, "%u");
 	CMP(port_num, "%u");
 	CMP(sq_sig_all, "%u");
+	/* B1 in-flight cursors + responder scalars + image geometry */
+	CMP(sq_producer, "%u");
+	CMP(sq_consumer, "%u");
+	CMP(rq_producer, "%u");
+	CMP(rq_consumer, "%u");
+	CMP(resp_ack_psn, "0x%x");
+	CMP(resp_opcode, "%d");
+	CMP(resp_status, "%u");
+	CMP(resp_aeth_syndrome, "%u");
+	CMP(res_head, "%u");
+	CMP(res_tail, "%u");
+	CMP(sq_image_bytes, "%u");
+	CMP(rq_image_bytes, "%u");
+	CMP(res_image_bytes, "%u");
 #undef CMP
 
 	if (src->sq_vm_pgoff != got->sq_vm_pgoff) {
@@ -881,6 +980,19 @@ int main(int argc, char **argv)
 	uint32_t list_handles[32] = {};
 	uint32_t total = 0;
 	int n, i, fd_restore = -1, ret, fails = 0;
+	/*
+	 * B1 in-flight image buffers (SQ/RQ/RES). Capacity is bounded by the
+	 * uverbs ioctl attr length field (struct ib_uverbs_attr::len is u16),
+	 * so a single image attr cannot exceed 65535 bytes. That comfortably
+	 * holds these small-cap rings; large rings would need chunking, a v1
+	 * concern.
+	 */
+	const uint32_t img_cap = 65535u;
+	struct ibv_mr *rq_mr = NULL;
+	static char rq_recv_buf[4096];
+	uint8_t *snap_sq = NULL, *snap_rq = NULL, *snap_res = NULL;
+	uint8_t *re_sq = NULL, *re_rq = NULL, *re_res = NULL;
+	struct qp_images snap_imgs = {}, re_imgs = {};
 
 	if (resolve_cdev_path(ibdev, cdev_path, sizeof(cdev_path)) != 0)
 		return 2;
@@ -911,6 +1023,56 @@ int main(int argc, char **argv)
 	src_qpn = src.qp->qp_num;
 	printf("  source: RC QP 0x%x at RTS (self-loopback)\n", src_qpn);
 
+	/*
+	 * B1 setup: pre-post recv WQEs so the RQ ring is genuinely
+	 * non-empty (rq_producer advances, slot data populated). This is
+	 * the in-flight state a frozen-not-drained snapshot must carry; the
+	 * SQ stays empty (no peer to ack a send in self-loopback) but its
+	 * slot region still round-trips. The buffers are oversized; the
+	 * kernel reports the true image lengths in the blob.
+	 */
+	snap_sq = malloc(img_cap); snap_rq = malloc(img_cap);
+	snap_res = malloc(img_cap);
+	re_sq = malloc(img_cap); re_rq = malloc(img_cap); re_res = malloc(img_cap);
+	if (!snap_sq || !snap_rq || !snap_res || !re_sq || !re_rq || !re_res) {
+		fprintf(stderr, "qpr: image buffer alloc failed\n");
+		fails++;
+		goto out_src;
+	}
+	snap_imgs.sq = snap_sq; snap_imgs.rq = snap_rq;
+	snap_imgs.res = snap_res; snap_imgs.cap = img_cap;
+	re_imgs.sq = re_sq; re_imgs.rq = re_rq;
+	re_imgs.res = re_res; re_imgs.cap = img_cap;
+
+	rq_mr = ibv_reg_mr(src.pd, rq_recv_buf, sizeof(rq_recv_buf),
+			   IBV_ACCESS_LOCAL_WRITE);
+	if (!rq_mr) {
+		fprintf(stderr, "qpr: ibv_reg_mr(rq): %s\n", strerror(errno));
+		fails++;
+		goto out_src;
+	}
+	for (i = 0; i < 3; i++) {
+		struct ibv_sge sge = {
+			.addr	= (uintptr_t)rq_recv_buf,
+			.length	= 64,
+			.lkey	= rq_mr->lkey,
+		};
+		struct ibv_recv_wr wr = {
+			.wr_id		= 0x1100u + i,
+			.sg_list	= &sge,
+			.num_sge	= 1,
+		};
+		struct ibv_recv_wr *bad = NULL;
+
+		if (ibv_post_recv(src.qp, &wr, &bad)) {
+			fprintf(stderr, "qpr: ibv_post_recv[%d]: %s\n", i,
+				strerror(errno));
+			fails++;
+			goto out_src;
+		}
+	}
+	printf("  source: pre-posted 3 recv WQEs (RQ non-empty for B1)\n");
+
 	/* Capture the create-time cap for the RESTORE_QP CAP attr. */
 	if (ibv_query_qp(src.qp, &qattr, IBV_QP_CAP, &qiattr)) {
 		fprintf(stderr, "qpr: ibv_query_qp(CAP): %s\n",
@@ -925,8 +1087,9 @@ int main(int argc, char **argv)
 	cap.max_inline_data	= qiattr.cap.max_inline_data;
 
 	/* [1] snapshot the source wire state (the "dump"). */
-	printf("[1] QUERY_QP snapshot of source QP 0x%x\n", src_qpn);
-	ret = do_vfmig_query_qp(ctx->cmd_fd, src.qp->handle, &snap);
+	printf("[1] QUERY_QP snapshot of source QP 0x%x (+ ring images)\n",
+	       src_qpn);
+	ret = do_vfmig_query_qp(ctx->cmd_fd, src.qp->handle, &snap, &snap_imgs);
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_QP(source): %s%s\n",
 			strerror(-ret),
@@ -944,6 +1107,15 @@ int main(int argc, char **argv)
 	printf("  PASS snapshot captured (qpn=0x%x mtu=%u sq_psn=0x%x "
 	       "rq_psn=0x%x)\n", snap.qpn, snap.path_mtu, snap.sq_psn,
 	       snap.rq_psn);
+	printf("      images: sq=%uB rq=%uB res=%uB; rq_prod=%u rq_cons=%u\n",
+	       snap.sq_image_bytes, snap.rq_image_bytes, snap.res_image_bytes,
+	       snap.rq_producer, snap.rq_consumer);
+	if (snap.rq_image_bytes == 0 || snap.rq_producer == 0) {
+		fprintf(stderr,
+			"  FAIL expected non-empty RQ image after pre-post\n");
+		fails++;
+		goto out_src;
+	}
 
 	/* [2] freeze + destroy the source to free the qpn. */
 	printf("[2] FREEZE_DATAPATH(source) + DESTROY_QP to free qpn 0x%x\n",
@@ -1006,7 +1178,8 @@ int main(int argc, char **argv)
 	ret = do_restore_qp(fd_restore, QP_TARGET_HANDLE, PD_TARGET_HANDLE,
 			    CQ_TARGET_HANDLE, CQ_TARGET_HANDLE,
 			    IB_QPT_RC_LOCAL, IB_QPS_RTS_LOCAL,
-			    USER_HANDLE_TAG, &cap, &snap, &resp_qpn, &qp_resp);
+			    USER_HANDLE_TAG, &cap, &snap, &snap_imgs,
+			    &resp_qpn, &qp_resp);
 	if (ret) {
 		fprintf(stderr, "  FAIL RESTORE_QP: %s%s\n", strerror(-ret),
 			ret == -EOPNOTSUPP
@@ -1053,7 +1226,7 @@ int main(int argc, char **argv)
 
 	/* [6] re-query the restored QP; must be byte-equal to snapshot. */
 	printf("[6] QUERY_QP(restored) must match the source snapshot\n");
-	ret = do_vfmig_query_qp(fd_restore, QP_TARGET_HANDLE, &re);
+	ret = do_vfmig_query_qp(fd_restore, QP_TARGET_HANDLE, &re, &re_imgs);
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_QP(restored): %s\n",
 			strerror(-ret));
@@ -1069,6 +1242,30 @@ int main(int argc, char **argv)
 	} else {
 		printf("  PASS restored QP wire state byte-identical to source\n");
 	}
+
+	/*
+	 * B1: the ring slot images and responder resources must round-trip
+	 * byte-for-byte through capture -> UHW_IN tail -> blit -> re-query.
+	 * The pre-posted RQ WQEs make this a real (non-empty) comparison.
+	 */
+	if (re.sq_image_bytes == snap.sq_image_bytes &&
+	    memcmp(snap_sq, re_sq, snap.sq_image_bytes) != 0) {
+		fprintf(stderr, "  FAIL SQ ring image differs after restore\n");
+		fails++;
+	}
+	if (snap.rq_image_bytes && re.rq_image_bytes == snap.rq_image_bytes &&
+	    memcmp(snap_rq, re_rq, snap.rq_image_bytes) != 0) {
+		fprintf(stderr, "  FAIL RQ ring image differs after restore\n");
+		fails++;
+	}
+	if (snap.res_image_bytes && re.res_image_bytes == snap.res_image_bytes &&
+	    memcmp(snap_res, re_res, snap.res_image_bytes) != 0) {
+		fprintf(stderr,
+			"  FAIL responder-resources image differs after restore\n");
+		fails++;
+	}
+	if (!fails)
+		printf("  PASS SQ/RQ/RES images round-tripped byte-identical\n");
 
 	/*
 	 * [7] Actually mmap the three forced-offset rings (CQ + SQ + RQ)
@@ -1150,6 +1347,8 @@ out_restore:
 	if (fd_restore >= 0)
 		close(fd_restore);
 out_src:
+	if (rq_mr)
+		ibv_dereg_mr(rq_mr);
 	if (src.qp)
 		ibv_destroy_qp(src.qp);
 	if (src.cq)
@@ -1157,6 +1356,8 @@ out_src:
 	if (src.pd)
 		ibv_dealloc_pd(src.pd);
 	ibv_close_device(ctx);
+	free(snap_sq); free(snap_rq); free(snap_res);
+	free(re_sq); free(re_rq); free(re_res);
 
 	if (fails) {
 		fprintf(stderr,

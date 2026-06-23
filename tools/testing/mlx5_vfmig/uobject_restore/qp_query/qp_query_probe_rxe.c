@@ -103,6 +103,9 @@ struct ib_uverbs_ioctl_hdr {
 #define RXE_IB_ATTR_QUERY_QP_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_QUERY_QP_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
 #define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
+#define RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE ((1u << UVERBS_ID_NS_SHIFT) + 3u)
+#define RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE ((1u << UVERBS_ID_NS_SHIFT) + 4u)
+#define RXE_IB_ATTR_QUERY_QP_RESP_RES	((1u << UVERBS_ID_NS_SHIFT) + 5u)
 
 #define RXE_IB_ATTR_QUERY_CQ_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_QUERY_CQ_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
@@ -175,8 +178,20 @@ struct rxe_restore_qp_req_local {
 	uint8_t			timeout;
 	uint8_t			port_num;
 	uint8_t			sq_sig_all;
-	uint8_t			reserved;
-	uint16_t		reserved1;
+	uint8_t			resp_aeth_syndrome;
+	uint16_t		reserved;
+	uint32_t		sq_producer;
+	uint32_t		sq_consumer;
+	uint32_t		rq_producer;
+	uint32_t		rq_consumer;
+	uint32_t		resp_ack_psn;
+	int32_t			resp_opcode;
+	uint32_t		resp_status;
+	uint32_t		res_head;
+	uint32_t		res_tail;
+	uint32_t		sq_image_bytes;
+	uint32_t		rq_image_bytes;
+	uint32_t		res_image_bytes;
 	uint64_t		reserved2;
 };
 

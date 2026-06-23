@@ -6,6 +6,15 @@
 #            design/snapshot_ordering_pause_capture.md (consistency point)
 # Goal: restore a non-quiesced (in-flight) rxe RC/UC/UD QP without
 #       forcing the application to drain at checkpoint.
+#
+# STATUS: kernel side IMPLEMENTED (this tree). QUERY_QP capture +
+#         RESTORE_QP UHW-tail apply + rxe_qp_seed_ring/rxe_qp_restore_inflight
+#         land in rxe_migrate.c / rxe_verbs.c / rxe_qp.c; validated live by
+#         uobject_restore/qp_restore/qp_restore_probe_rxe (non-empty RQ
+#         pre-post + byte-identical SQ/RQ/RES round-trip). The full
+#         non-drained peer-traffic harness modes (§6) remain CRIU-side TODO.
+#         Sections below note "as built" where the implementation refined
+#         the original plan.
 
 ## 1. The problem (recap, grounded in this tree)
 
@@ -97,22 +106,41 @@ The fixed `struct rxe_restore_qp_req` (184 B, ~8 B reserved) cannot hold
 the variable-length payload. Plan:
 
 1. **Grow the fixed blob** (dev-only ABI; allowed) to carry all cursors
-   and the responder scalars + array length:
+   and the responder scalars + array lengths (consumes the old
+   `reserved1`):
    - add `sq_producer`, `sq_consumer`, `rq_producer`, `rq_consumer`
      (`req_wqe_index` already present),
    - add `resp_ack_psn`, `resp_opcode`, `resp_status`,
-     `resp_aeth_syndrome`, `res_head`, `res_tail`, `max_dest_rd_atomic`,
-   - add `sq_image_bytes`, `rq_image_bytes`, `res_image_bytes`
-     (informational; CRIU also derives sizes from the VMA / caps).
-2. **Three new UVERBS attrs**, present on both `QUERY_QP` (OUT) and
-   `RESTORE_QP` (IN tail):
-   - `..._SQ_IMAGE`  -- raw SQ slot region
-   - `..._RQ_IMAGE`  -- raw RQ slot region
-   - `..._RESP_RES`  -- raw responder-resources array
-   Marked optional/zero-length for drained/idle QPs and for UD/UC where
-   the responder array is absent.
+     `resp_aeth_syndrome`, `res_head`, `res_tail` (`max_dest_rd_atomic`
+     was already in the blob),
+   - add `sq_image_bytes`, `rq_image_bytes`, `res_image_bytes` (the
+     authoritative per-image byte lengths; also used to slice the
+     RESTORE_QP tail -- see below).
+2. **Carry the variable images** -- *as built*, the transport is
+   asymmetric because the dump and restore verbs differ in kind:
+   - `QUERY_QP` is an rxe-private method, so it gains **three new
+     optional `PTR_OUT` attrs**: `RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE`,
+     `..._RQ_IMAGE`, `..._RES` (raw SQ slot region, RQ slot region,
+     responder-resources array). Omitted/zero-length for a drained QP,
+     for SRQ-backed RQs, and for UD/UC where the responder array is
+     absent.
+   - `RESTORE_QP` is the **core** `UVERBS_METHOD_RESTORE_QP` (dispatched
+     via `ib_device_ops.restore_qp`); a driver cannot add attrs to it.
+     The only driver channel is its single `UVERBS_ATTR_UHW()` blob, so
+     the images ride **concatenated in the `UHW_IN` tail** after the
+     fixed `struct rxe_restore_qp_req`, in slice order SQ, RQ, RES,
+     located by the header's `{sq,rq,res}_image_bytes`. A drained
+     restore sends the header alone (no tail) and keeps the cursor-only
+     fast path.
+   - **Size limit (as built)**: `struct ib_uverbs_attr::len` is `u16`,
+     so any single image attr -- and the whole `UHW_IN` blob -- caps at
+     65535 bytes. That holds normal QPs comfortably; rings larger than
+     ~64 KB (deep SQ/RQ or wide SGE) need chunking across multiple
+     attrs/calls, a v1 concern (noted in §7).
 3. CRIU mirror struct + `_Static_assert`s move in lockstep (the plugin
-   treats the blob + attrs as opaque bytes).
+   treats the blob + images as opaque bytes; the dumper reads the three
+   QUERY_QP image attrs and re-concatenates them into the RESTORE_QP
+   UHW tail).
 
 ## 5. Restore application (rxe_qp.c)
 
@@ -150,25 +178,57 @@ regions correctly, given the restored PSNs.
 with the rewound replay so the completer retires the right WQEs as ACKs
 arrive. Add an assert/harness check.)
 
-### 5.2 `rxe_qp_seed_ring()` helper
-
-Introduce (the handoff referenced it; it is NOT in this tree yet):
+### 5.2 `rxe_qp_seed_ring()` helper (as built, `rxe_qp.c`)
 
 ```c
-static void rxe_qp_seed_ring(struct rxe_queue *q, u32 prod, u32 cons)
+static void rxe_qp_seed_ring(struct rxe_queue *q, u32 producer, u32 consumer)
 {
-    if (!q) return;
-    q->index = cons & q->index_mask;             /* rxe-owned consumer */
-    WRITE_ONCE(q->buf->producer_index, prod & q->index_mask);
-    WRITE_ONCE(q->buf->consumer_index, cons & q->index_mask);
+    producer &= q->index_mask;
+    consumer &= q->index_mask;
+    q->buf->producer_index = producer;
+    q->buf->consumer_index = consumer;
+    q->index = consumer;            /* rxe-owned consumer copy (FROM_CLIENT) */
 }
 ```
 
-Rings are quiescent at restore, so plain `WRITE_ONCE` is sufficient
-(no `smp_store_release` needed; revisit only if restore ever races a
-live task).
+Rings are quiescent at restore (the QP is freshly created and not yet
+finalized), so plain stores suffice -- no `smp_store_release`/`WRITE_ONCE`.
+The caller (`rxe_qp_restore_inflight()`) only invokes this after
+validating the image length equals the just-created ring's
+`queue_data_size()`, so `q` is always non-NULL here.
 
-## 6. Test harness (CRIU side, already scaffolded)
+### 5.3 Where the apply lives (as built)
+
+- `rxe_restore_qp()` (`rxe_verbs.c`): if `udata->inlen > sizeof(req)`,
+  calls `rxe_restore_qp_inflight()`, which copies the whole `UHW_IN`,
+  slices the SQ/RQ/RES tail by the header byte-counts, and hands the
+  opaque images to:
+- `rxe_qp_restore_inflight()` (`rxe_qp.c`): blits each image (rejecting
+  any geometry mismatch with `-EINVAL`), seeds cursors via
+  `rxe_qp_seed_ring()`, rewinds `qp->req.wqe_index = sq_consumer`,
+  restores `qp->resp.resources` + `res_head`/`res_tail`, and stamps the
+  responder scalars. Runs after `rxe_qp_restore_wire_state()` (which
+  already stamped PSNs/AV/attrs) and before `rxe_finalize()`.
+
+## 6. Test harness
+
+### 6.1 In-tree plumbing probe (as built, DONE)
+
+`uobject_restore/qp_restore/qp_restore_probe_rxe` now exercises the B1
+kernel path end-to-end in a single process: it **pre-posts recv WQEs**
+on the source RC QP (so `rq_producer != rq_consumer` and the RQ slot
+region is genuinely populated), captures the SQ/RQ/RES images via the
+new `QUERY_QP` attrs, destroys the source, replays them in the
+`RESTORE_QP` UHW tail, then re-queries the restored QP and asserts the
+wire state **and** all three images are byte-identical. This validates
+capture -> tail-concat -> blit -> seed -> re-capture for a non-empty
+ring. (`qp_query_probe_rxe` covers QUERY_QP/FREEZE field fidelity.)
+
+What it does *not* cover: semantic replay against a live peer (actual
+unsent-SQ transmit, pre-posted-RQ receive, in-flight RC-READ reply) --
+that needs two endpoints and belongs in the CRIU-side harness below.
+
+### 6.2 CRIU side (scaffolded; peer-traffic modes still TODO)
 
 - `qp_pair` pass (`UVERBS_CR_RUN_QP_PAIR=1`) currently passes only
   because the holder drains pre-dump.
