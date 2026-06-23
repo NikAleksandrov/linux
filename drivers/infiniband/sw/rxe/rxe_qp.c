@@ -795,11 +795,38 @@ void rxe_qp_pause(struct rxe_qp *qp)
 	rxe_disable_task(&qp->recv_task);
 }
 
-/* CRIU dump (S6a A3): undo rxe_qp_pause; re-arm the datapath tasks. */
+/*
+ * CRIU (S6a): undo rxe_qp_pause; re-arm the datapath tasks, then
+ * thaw-and-replay (design/rxe_inflight_qp_restore.md §5.4).
+ *
+ * A restored, non-drained QP has its in-flight SQ work already blitted
+ * into the ring with the cursors seeded (rxe_qp_restore_inflight), but
+ * nothing reschedules the requester: there is no fresh post_send and no
+ * inbound packet yet, so the [sq_consumer, sq_producer) WQEs would idle
+ * forever. Kick send_task when the QP is RTS with outstanding SQ work;
+ * rxe rewound req.wqe_index to sq_consumer so this replays the in-flight
+ * window from scratch (the peer drops duplicate PSNs -- see §5.1).
+ *
+ * Also drain the responder: an inbound packet that arrived while the QP
+ * was frozen (e.g. a peer thawed first) is queued on qp->req_pkts with
+ * recv_task parked, and rxe_enable_task alone does not re-run it.
+ *
+ * Both kicks are no-ops for a source QP resumed after a dump-freeze with
+ * an empty ring / inbound queue, so one path serves both the dump-resume
+ * and the restore-thaw callers.
+ */
 void rxe_qp_resume(struct rxe_qp *qp)
 {
 	rxe_enable_task(&qp->send_task);
 	rxe_enable_task(&qp->recv_task);
+
+	if (qp->sq.queue && qp_state(qp) == IB_QPS_RTS &&
+	    queue_get_producer(qp->sq.queue, qp->sq.queue->type) !=
+	    queue_get_consumer(qp->sq.queue, qp->sq.queue->type))
+		rxe_sched_task(&qp->send_task);
+
+	if (!skb_queue_empty(&qp->req_pkts))
+		rxe_sched_task(&qp->recv_task);
 }
 
 /* move the qp to the error state */

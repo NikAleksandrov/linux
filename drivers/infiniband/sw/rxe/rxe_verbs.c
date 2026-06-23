@@ -858,6 +858,26 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		}
 	}
 
+	/*
+	 * Born-frozen (design/rxe_inflight_qp_restore.md §5.4). Park the
+	 * datapath BEFORE rxe_finalize() makes the QP reachable, so neither
+	 * the requester nor the responder runs until the orchestrator thaws
+	 * the whole ucontext with FREEZE_CONTEXT(freeze=0).
+	 *
+	 * NOTE: do NOT rxe_sched_task(&qp->send_task) here to drive the
+	 * restored in-flight SQ. At this point the restore tree is still
+	 * being rebuilt: peer QPs (cross-QP / cross-process) may not exist
+	 * yet, and SGE-referenced MR pages are not populated until CRIU's
+	 * post-VMA Phase B. Transmitting now races those in -- producing
+	 * sends to a nonexistent peer (retry burst -> RETRY_EXC) and/or
+	 * stale bytes on the wire. The requester replay is deferred to the
+	 * thaw (rxe_qp_resume), which the orchestrator issues only after the
+	 * tree is globally consistent. Freezing also blocks the responder
+	 * from acting on an early inbound packet (from a peer that thawed
+	 * first) before our MR buffers are in place.
+	 */
+	rxe_qp_pause(qp);
+
 	rxe_finalize(qp);
 	return 0;
 
