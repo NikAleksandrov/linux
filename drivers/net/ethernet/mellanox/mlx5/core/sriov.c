@@ -142,10 +142,15 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 
 	/*
 	 * Force-resume + clear any persistent datapath-suspend state
-	 * (MLX5_VFMIG_IOC_SUSPEND_VHCA / DEFER_RESUME) before the VFs are
-	 * disabled, so an aborted dumper can't strand a VF parked into the
-	 * next sriov_numvfs cycle. PF mdev is still alive here so the
-	 * best-effort RESUME_VHCA commands can run. See
+	 * (MLX5_VFMIG_IOC_SUSPEND_VHCA / DEFER_RESUME) so an aborted dumper
+	 * can't strand a VF parked into the next sriov_numvfs cycle. PF mdev
+	 * is still alive here so the best-effort RESUME_VHCA commands can
+	 * run. For the sriov_numvfs=0 teardown this is a backstop:
+	 * mlx5_sriov_disable() already force-resumes before
+	 * pci_disable_sriov() so the per-VF DESTROY teardown doesn't stall
+	 * on a dead VF command ring (idempotent no-op the second time). The
+	 * detach (mlx5_sriov_detach) and enable-error paths reach teardown
+	 * only through here, so the call must stay. See
 	 * tools/testing/mlx5_vfmig/design/snapshot_ordering_pause_capture.md.
 	 */
 	mlx5_vfmig_pf_drop_suspends(dev);
@@ -233,6 +238,23 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
 	struct devlink *devlink = priv_to_devlink(dev);
 	int num_vfs = pci_num_vf(dev->pdev);
+
+	/*
+	 * Force-resume any VF parked by MLX5_VFMIG_IOC_SUSPEND_VHCA /
+	 * DEFER_RESUME *before* pci_disable_sriov() runs the per-VF
+	 * teardown below. pci_disable_sriov() drives each bound VF through
+	 * remove_one -> mlx5_ib_remove, issuing DESTROY_QP/CQ/MKEY,
+	 * DEALLOC_PD/UAR, DESTROY_UCTX, ... on the *VF's own* command ring.
+	 * A VF left in the vfmig STOP state has a dead command ring (it
+	 * needs >= RUNNING_P2P), so each of those ~15-20 commands blocks a
+	 * full MLX5_CMD_TIMEOUT before failing -- minutes per parked VF.
+	 * Resuming on the (live) PF ring first makes each VF ring live so
+	 * teardown runs at normal speed. mlx5_device_disable_sriov() below
+	 * still calls this as a backstop for the detach / enable-error
+	 * paths that don't pass through here; once the bits are cleared the
+	 * second pass is an idempotent no-op.
+	 */
+	mlx5_vfmig_pf_drop_suspends(dev);
 
 	/*
 	 * pci_disable_sriov() runs the FULL teardown for every VF

@@ -6417,8 +6417,17 @@ static void vfmig_pf_drop_suspends_locked(struct mlx5_vfmig_pf *vfmig)
 		sriov->vfs_ctx[i].vfmig_defer_resume = 0;
 		mutex_unlock(&vfmig->ctxs_lock);
 
-		mlx5_core_info(pf_mdev,
-			       "vfmig: force-resuming parked vf %d at sriov teardown\n",
+		/*
+		 * A VF reaching teardown still datapath-suspended is
+		 * abnormal: the orchestrator should RESUME_VHCA before
+		 * destroy. Its command ring is dead (STOP needs >=
+		 * RUNNING_P2P), so without this resume the per-VF DESTROY
+		 * teardown stalls a full MLX5_CMD_TIMEOUT per command.
+		 * Warn (not info) so the condition is visible rather than
+		 * surfacing as a mysterious multi-minute hang.
+		 */
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: tearing down vf %d while datapath-suspended; resuming first\n",
 			       i);
 		err = vfmig_query_vhca_id(pf_mdev, i + 1, &vhca_id);
 		if (err) {
