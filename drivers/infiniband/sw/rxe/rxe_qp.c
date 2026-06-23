@@ -562,6 +562,81 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	return 0;
 }
 
+/*
+ * Seed a freshly-created ring's cursors to the source-side indices. For
+ * the SQ/RQ (QUEUE_TYPE_FROM_CLIENT) the client owns @producer and rxe
+ * owns @consumer (mirrored into the shared page and rxe's private copy).
+ * Indices are masked to slot width to match the wire bookkeeping.
+ */
+static void rxe_qp_seed_ring(struct rxe_queue *q, u32 producer, u32 consumer)
+{
+	producer &= q->index_mask;
+	consumer &= q->index_mask;
+
+	q->buf->producer_index = producer;
+	q->buf->consumer_index = consumer;
+	q->index = consumer;
+}
+
+/*
+ * CRIU in-flight restore (S6a B1): seed a non-drained QP's ring contents,
+ * cursors and RC responder replay state from the captured images. Called
+ * after rxe_qp_restore_wire_state, only when the RESTORE_QP UHW carried an
+ * image tail (a drained QP restores via the cursor-only path and never
+ * reaches here). The images are opaque byte blits whose geometry must
+ * match the ring/array this restore just created -- mismatches are
+ * rejected rather than silently corrupting the QP.
+ *
+ * See design/rxe_inflight_qp_restore.md. The requester is rewound to the
+ * SQ consumer so it replays [sq_consumer, sq_producer); comp.psn / req.psn
+ * (stamped by rxe_qp_restore_wire_state) already bracket that window.
+ */
+int rxe_qp_restore_inflight(struct rxe_qp *qp,
+			    const struct rxe_restore_qp_req *req,
+			    const void *sq_image, const void *rq_image,
+			    const void *res_image)
+{
+	if (sq_image) {
+		if (!qp->sq.queue ||
+		    queue_data_size(qp->sq.queue) != req->sq_image_bytes)
+			return -EINVAL;
+		memcpy(qp->sq.queue->buf->data, sq_image, req->sq_image_bytes);
+		rxe_qp_seed_ring(qp->sq.queue, req->sq_producer,
+				 req->sq_consumer);
+		/* rewind requester to the unacked tail for replay */
+		qp->req.wqe_index = req->sq_consumer & qp->sq.queue->index_mask;
+	}
+
+	if (rq_image) {
+		if (!qp->rq.queue || qp->srq ||
+		    queue_data_size(qp->rq.queue) != req->rq_image_bytes)
+			return -EINVAL;
+		memcpy(qp->rq.queue->buf->data, rq_image, req->rq_image_bytes);
+		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
+				 req->rq_consumer);
+	}
+
+	if (res_image) {
+		size_t want = (size_t)qp->attr.max_dest_rd_atomic *
+			      sizeof(struct resp_res);
+
+		if (!qp->resp.resources || want == 0 ||
+		    want != req->res_image_bytes)
+			return -EINVAL;
+		memcpy(qp->resp.resources, res_image, want);
+		qp->resp.res_head = req->res_head;
+		qp->resp.res_tail = req->res_tail;
+	}
+
+	/* responder scalars not covered by rxe_qp_restore_wire_state */
+	qp->resp.ack_psn	= req->resp_ack_psn & BTH_PSN_MASK;
+	qp->resp.opcode		= req->resp_opcode;
+	qp->resp.status		= req->resp_status;
+	qp->resp.aeth_syndrome	= req->resp_aeth_syndrome;
+
+	return 0;
+}
+
 /* called by the query qp verb */
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init)
 {

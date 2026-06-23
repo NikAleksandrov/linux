@@ -81,6 +81,15 @@ enum rxe_ib_query_qp_attrs {
 	RXE_IB_ATTR_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 	RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
+	/*
+	 * B1 in-flight images (optional): variable-length raw byte regions
+	 * the dumper round-trips opaquely into the RESTORE_QP UHW_IN tail.
+	 * Lengths are reported in rxe_restore_qp_req::{sq,rq,res}_image_bytes.
+	 * Absent/zero-length for a drained QP.
+	 */
+	RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+	RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+	RXE_IB_ATTR_QUERY_QP_RESP_RES,
 };
 
 enum rxe_ib_query_cq_attrs {

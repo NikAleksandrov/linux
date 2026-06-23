@@ -61,6 +61,30 @@
 #define UVERBS_MODULE_NAME rdma_rxe
 #include <rdma/uverbs_named_ioctl.h>
 
+/*
+ * Emit one optional variable-length image attr on QUERY_QP. The dumper
+ * provides the output buffer; it learns the authoritative byte length
+ * from the rxe_restore_qp_req blob and round-trips the bytes opaquely.
+ * Absent attr (dumper didn't ask) or zero-length image is a no-op; a
+ * provided-but-too-small buffer is a hard error (no silent truncation).
+ */
+static int rxe_query_qp_emit_image(struct uverbs_attr_bundle *attrs,
+				   u16 attr_id, const void *data, u32 len)
+{
+	int user_len;
+
+	if (!uverbs_attr_is_valid(attrs, attr_id) || len == 0)
+		return 0;
+
+	user_len = uverbs_attr_get_len(attrs, attr_id);
+	if (user_len < 0)
+		return 0;
+	if ((u32)user_len < len)
+		return -ENOSPC;
+
+	return uverbs_copy_to(attrs, attr_id, data, len);
+}
+
 /* v0 QP type gate: the IBTA types rxe_restore_qp accepts. */
 static int rxe_migrate_chk_qp_type(const struct ib_qp *ibqp)
 {
@@ -231,6 +255,35 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	blob.ssn		= atomic_read(&qp->ssn);
 
 	/*
+	 * B1 in-flight state (design/rxe_inflight_qp_restore.md). The QP is
+	 * frozen (rxe_qp_pause) before this verb, so the rings and responder
+	 * resources are quiescent; we read the shared-page cursors and report
+	 * the slot-region / resource-array byte lengths, then emit the raw
+	 * images below. The dumper hands these straight back on RESTORE_QP.
+	 */
+	blob.sq_producer = queue_get_producer(qp->sq.queue, qp->sq.queue->type);
+	blob.sq_consumer = queue_get_consumer(qp->sq.queue, qp->sq.queue->type);
+	blob.sq_image_bytes = queue_data_size(qp->sq.queue);
+
+	if (qp->rq.queue && !qp->srq) {
+		blob.rq_producer = queue_get_producer(qp->rq.queue,
+						      qp->rq.queue->type);
+		blob.rq_consumer = queue_get_consumer(qp->rq.queue,
+						      qp->rq.queue->type);
+		blob.rq_image_bytes = queue_data_size(qp->rq.queue);
+	}
+
+	blob.resp_ack_psn	= qp->resp.ack_psn;
+	blob.resp_opcode	= qp->resp.opcode;
+	blob.resp_status	= qp->resp.status;
+	blob.resp_aeth_syndrome	= qp->resp.aeth_syndrome;
+	blob.res_head		= qp->resp.res_head;
+	blob.res_tail		= qp->resp.res_tail;
+	if (qp->resp.resources && qp->attr.max_dest_rd_atomic)
+		blob.res_image_bytes = qp->attr.max_dest_rd_atomic *
+				       sizeof(struct resp_res);
+
+	/*
 	 * The async-event cookie the source's ibv_create_qp recorded on
 	 * the QP uobject. Not standard-queryable, so CRIU must preserve
 	 * it through the kernel-sourced dump (mirrors the mlx5 verb).
@@ -242,8 +295,36 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	if (err)
 		return err;
 
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
-			      &user_handle, sizeof(user_handle));
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
+			     &user_handle, sizeof(user_handle));
+	if (err)
+		return err;
+
+	err = rxe_query_qp_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+				      qp->sq.queue->buf->data,
+				      blob.sq_image_bytes);
+	if (err)
+		return err;
+
+	if (blob.rq_image_bytes) {
+		err = rxe_query_qp_emit_image(attrs,
+					      RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+					      qp->rq.queue->buf->data,
+					      blob.rq_image_bytes);
+		if (err)
+			return err;
+	}
+
+	if (blob.res_image_bytes) {
+		err = rxe_query_qp_emit_image(attrs,
+					      RXE_IB_ATTR_QUERY_QP_RESP_RES,
+					      qp->resp.resources,
+					      blob.res_image_bytes);
+		if (err)
+			return err;
+	}
+
+	return 0;
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
@@ -297,7 +378,16 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 			    UVERBS_ATTR_TYPE(u64),
-			    UA_MANDATORY));
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_RES,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL));
 
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_CQ,

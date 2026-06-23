@@ -675,6 +675,57 @@ err_out:
  * directly at its captured final state via rxe_qp_restore_wire_state
  * with no ib_modify_qp chain.
  */
+/*
+ * B1 in-flight restore: the SQ/RQ ring images and RC responder-resources
+ * array ride concatenated in the RESTORE_QP UHW_IN tail, after the fixed
+ * struct rxe_restore_qp_req header, located by its *_image_bytes counts
+ * (the byte-exact lengths QUERY_QP emitted). Copy the whole UHW in once,
+ * slice the tail, and hand the opaque images to rxe_qp_restore_inflight,
+ * which validates each against the just-created ring/array geometry.
+ */
+static int rxe_restore_qp_inflight(struct rxe_qp *qp,
+				   const struct rxe_restore_qp_req *req,
+				   struct ib_udata *udata)
+{
+	const void *sq_image = NULL, *rq_image = NULL, *res_image = NULL;
+	const size_t hdr = sizeof(*req);
+	size_t tail, off;
+	void *buf;
+	int err;
+
+	tail = (size_t)req->sq_image_bytes + req->rq_image_bytes +
+	       req->res_image_bytes;
+	if (tail == 0)			/* tail present but no images declared */
+		return -EINVAL;
+	if (udata->inlen != hdr + tail)
+		return -EINVAL;
+
+	buf = kvmalloc(udata->inlen, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	err = ib_copy_from_udata(buf, udata, udata->inlen);
+	if (err)
+		goto out;
+
+	off = hdr;
+	if (req->sq_image_bytes) {
+		sq_image = buf + off;
+		off += req->sq_image_bytes;
+	}
+	if (req->rq_image_bytes) {
+		rq_image = buf + off;
+		off += req->rq_image_bytes;
+	}
+	if (req->res_image_bytes)
+		res_image = buf + off;
+
+	err = rxe_qp_restore_inflight(qp, req, sq_image, rq_image, res_image);
+out:
+	kvfree(buf);
+	return err;
+}
+
 static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 			  const struct ib_qp_cap *cap,
 			  enum ib_qp_state qp_state, u32 create_flags,
@@ -730,7 +781,7 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		rxe_dbg_dev(rxe, "bad restore qp req, err = %d\n", err);
 		goto err_out;
 	}
-	if (req.reserved || req.reserved1 || req.reserved2) {
+	if (req.reserved || req.reserved2) {
 		err = -EINVAL;
 		rxe_dbg_dev(rxe, "restore qp req reserved must be 0\n");
 		goto err_out;
@@ -790,6 +841,21 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	if (err) {
 		rxe_dbg_qp(qp, "restore qp wire state failed, err = %d\n", err);
 		goto err_cleanup;
+	}
+
+	/*
+	 * B1: a non-drained source appends its SQ/RQ ring images + RC
+	 * responder resources to the UHW_IN tail. A drained restore has no
+	 * tail (inlen == header) and keeps the cursor-only fast path.
+	 */
+	if (udata->inlen > sizeof(req)) {
+		err = rxe_restore_qp_inflight(qp, &req, udata);
+		if (err) {
+			rxe_dbg_qp(qp,
+				   "restore qp in-flight state failed, err = %d\n",
+				   err);
+			goto err_cleanup;
+		}
 	}
 
 	rxe_finalize(qp);

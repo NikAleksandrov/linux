@@ -336,6 +336,27 @@ struct rxe_create_qp_resp {
  *   @req_wqe_index  requester's SQ consumer cursor (qp->req.wqe_index).
  *   @ssn  send sequence number (qp->ssn).
  *
+ * In-flight (non-drained) datapath state (B1 -- see
+ * design/rxe_inflight_qp_restore.md). A QP frozen (not drained) at the
+ * snapshot point may have posted-but-unsent / sent-but-unacked SQ work,
+ * pre-posted RQ buffers, and RC responder replay resources. The fixed
+ * header carries the cursors + responder scalars; the variable-length
+ * ring/resource byte images travel out-of-band (QUERY_QP image attrs;
+ * RESTORE_QP UHW_IN tail) and are located by the @*_image_bytes counts:
+ *   @sq_producer / @sq_consumer  SQ ring shared-page indices. Together
+ *       with @req_wqe_index they bracket the three SQ regions
+ *       (unsent / unacked / retired); restore rewinds the requester to
+ *       @sq_consumer and replays [@sq_consumer, @sq_producer).
+ *   @rq_producer / @rq_consumer  RQ ring indices (pre-posted recv WQEs).
+ *   @resp_ack_psn / @resp_opcode / @resp_status / @resp_aeth_syndrome
+ *       responder scalars not already covered by @resp_psn / @resp_msn.
+ *   @res_head / @res_tail  RC responder-resources ring cursors.
+ *   @sq_image_bytes / @rq_image_bytes / @res_image_bytes  byte lengths of
+ *       the SQ slot region, RQ slot region, and responder-resources array
+ *       images. Zero => that image is absent (drained ring / UD-UC with no
+ *       responder array / SRQ-backed RQ, out of scope). The destination
+ *       validates each against the freshly-created ring/array geometry.
+ *
  * Size note: well over the 8-byte inline-attr threshold (see
  * rxe_restore_cq_req), so the uverbs dispatcher always takes the
  * copy_from_user pointer path. @reserved* must be 0 and back
@@ -367,8 +388,29 @@ struct rxe_restore_qp_req {
 	__u8		timeout;
 	__u8		port_num;
 	__u8		sq_sig_all;
-	__u8		reserved;
-	__u16		reserved1;
+	/*
+	 * B1 in-flight datapath state (in addition to req_wqe_index above).
+	 * Ring slot images themselves are NOT in this fixed header -- they
+	 * ride as separate variable-length attrs on QUERY_QP (SQ_IMAGE /
+	 * RQ_IMAGE / RESP_RES) and concatenated in the RESTORE_QP UHW_IN
+	 * tail, located by the @*_image_bytes counts below. All-zero here
+	 * (and zero-length images) means a drained/idle QP -- the legacy
+	 * cursor-only restore path.
+	 */
+	__u8		resp_aeth_syndrome;	/* qp->resp.aeth_syndrome */
+	__u16		reserved;
+	__u32		sq_producer;		/* SQ buf->producer_index */
+	__u32		sq_consumer;		/* SQ buf->consumer_index */
+	__u32		rq_producer;		/* RQ buf->producer_index */
+	__u32		rq_consumer;		/* RQ buf->consumer_index */
+	__u32		resp_ack_psn;		/* qp->resp.ack_psn */
+	__s32		resp_opcode;		/* qp->resp.opcode (-1 idle) */
+	__u32		resp_status;		/* qp->resp.status (ib_wc_status) */
+	__u32		res_head;		/* qp->resp.res_head */
+	__u32		res_tail;		/* qp->resp.res_tail */
+	__u32		sq_image_bytes;		/* SQ slot region byte count */
+	__u32		rq_image_bytes;		/* RQ slot region byte count */
+	__u32		res_image_bytes;	/* responder-resources byte count */
 	__aligned_u64	reserved2;
 };
 

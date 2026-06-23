@@ -98,6 +98,15 @@ static inline u32 queue_next_index(struct rxe_queue *q, int index)
 	return (index + 1) & q->index_mask;
 }
 
+/*
+ * Byte size of the slot data region (num_slots * elem_size). Used by the
+ * CRIU in-flight QP save/restore path to blit a ring's contents verbatim.
+ */
+static inline size_t queue_data_size(const struct rxe_queue *q)
+{
+	return (size_t)(q->index_mask + 1) << q->log2_elem_size;
+}
+
 static inline u32 queue_get_producer(const struct rxe_queue *q,
 				     enum queue_type type)
 {
