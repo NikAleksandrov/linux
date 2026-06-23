@@ -210,6 +210,60 @@ validating the image length equals the just-created ring's
   responder scalars. Runs after `rxe_qp_restore_wire_state()` (which
   already stamped PSNs/AV/attrs) and before `rxe_finalize()`.
 
+### 5.4 Born-frozen + thaw-and-replay (as built)
+
+Seeding the ring is necessary but not sufficient: a restored, non-drained
+SQ has its WQEs in `[sq_consumer, sq_producer)` with cursors seeded, but
+nothing reschedules the requester. `send_task` only advances when
+scheduled, and on a fresh destination QP there is no triggering event --
+no fresh `post_send` (the WQEs are already in the blitted ring) and no
+inbound packet yet -- so the in-flight window idles forever.
+
+**Do NOT kick the requester inside `rxe_restore_qp()`.** Tried and
+reverted: firing `rxe_sched_task(&qp->send_task)` after `rxe_finalize()`
+transmits while the rest of the restore tree is still being rebuilt --
+peer QPs (cross-QP / cross-process) may not exist yet, and SGE-referenced
+MR pages are not populated until CRIU's post-VMA Phase B. Result:
+transmit-to-nonexistent-peer (retry burst -> `RETRY_EXC`) and/or stale
+bytes on the wire. There is no tree-wide consistency barrier at that
+point. See the NOTE at the `rxe_qp_pause()` site in `rxe_restore_qp()`.
+
+The fix is **born-frozen + thaw-and-replay**, reusing the existing
+`FREEZE_CONTEXT` path -- no new UAPI:
+
+1. **Install paused.** `rxe_restore_qp()` calls `rxe_qp_pause(qp)` *before*
+   `rxe_finalize(qp)` (i.e. before the QP becomes reachable to
+   `rxe_pool_get_index` / `rxe_rcv`). Tasks are parked from birth. A fresh
+   task is `TASK_STATE_IDLE`; `rxe_disable_task` on a quiescent task takes
+   the fast path to `TASK_STATE_DRAINED` (no spin, no WARN -- the pool ref
+   from `rxe_add_to_pool_at_index` keeps `rxe_read(qp) >= 1`). This also
+   blocks the responder from acting on an early inbound packet (from a
+   peer that thawed first) before our MR buffers are in place.
+2. **Resume = enable + replay.** `rxe_qp_resume()` re-enables both tasks,
+   then: if `qp_state == RTS && sq_producer != sq_consumer`,
+   `rxe_sched_task(&qp->send_task)` (replays the rewound in-flight window
+   from §5.1). If the responder inbound queue (`qp->req_pkts`) is
+   non-empty, `rxe_sched_task(&qp->recv_task)` (drains packets queued
+   while frozen, which `rxe_enable_task` alone would not re-run).
+   Producer/consumer were already seeded by `rxe_qp_restore_inflight()`,
+   so resume decides per-QP with no extra caller state. Both kicks are
+   no-ops for a source QP resumed after a dump-freeze (empty ring/queue),
+   so one path serves both the dump-resume and the restore-thaw callers.
+3. **Thaw == replay trigger.** `FREEZE_CONTEXT(freeze=0)` already walks the
+   ucontext QP pool calling `rxe_qp_resume()` per QP, so it becomes the
+   one-shot "thaw + replay every QP in this ucontext."
+
+**Caller contract (the critical half, enforced by the orchestrator, not
+the kernel).** The thaw must be the *last* tree-wide restore step: do not
+issue `FREEZE_CONTEXT(freeze=0)` until, tree-wide, all uobjects are
+restored (Phase A + post-VMA Phase B), all peer QPs in the snapshot
+exist, and MR-backed memory is in place. A single-process self-loopback
+tree can thaw at the Phase B tail; a multi-process tree needs a global
+barrier near end-of-restore. A per-ufile fini is too weak -- the
+first-thawed requester would transmit to a peer qpn a sibling task has
+not installed yet. The kernel cannot enforce this; it only guarantees
+nothing moves until thawed.
+
 ## 6. Test harness
 
 ### 6.1 In-tree plumbing probe (as built, DONE)

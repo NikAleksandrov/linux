@@ -158,6 +158,9 @@ enum {
 #define RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE ((1u << UVERBS_ID_NS_SHIFT) + 3u)
 #define RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE ((1u << UVERBS_ID_NS_SHIFT) + 4u)
 #define RXE_IB_ATTR_QUERY_QP_RESP_RES	((1u << UVERBS_ID_NS_SHIFT) + 5u)
+/* Ucontext-scoped thaw trigger (method index 3 in rxe_ib_migrate_methods). */
+#define RXE_IB_METHOD_FREEZE_CONTEXT	((1u << UVERBS_ID_NS_SHIFT) + 3u)
+#define RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE (1u << UVERBS_ID_NS_SHIFT)
 
 /* ib_qp_type / ib_qp_state values used by the RESTORE_QP method args. */
 #define IB_QPT_RC_LOCAL				2
@@ -667,6 +670,37 @@ static int do_vfmig_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Ucontext-scoped thaw: the production restore flow installs every QP
+ * born-frozen and resumes them all with one FREEZE_CONTEXT(freeze=0) once
+ * the whole tree is consistent. We mirror that here to validate that a
+ * born-frozen restored QP can be thawed (and exercises rxe_qp_resume's
+ * replay kick) rather than leaving it parked.
+ */
+static int do_vfmig_freeze_context(int fd, uint8_t freeze)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[1];
+	} cmd = {};
+
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_FREEZE_CONTEXT;
+	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
+
+	cmd.attrs[0].attr_id	= RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE;
+	cmd.attrs[0].len	= sizeof(freeze);
+	cmd.attrs[0].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data	= freeze;
+
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs[0]);
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
@@ -1266,6 +1300,27 @@ int main(int argc, char **argv)
 	}
 	if (!fails)
 		printf("  PASS SQ/RQ/RES images round-tripped byte-identical\n");
+
+	/*
+	 * [6b] Born-frozen thaw. RESTORE_QP installs the QP datapath-paused;
+	 * the production flow resumes the whole ucontext with one
+	 * FREEZE_CONTEXT(freeze=0) once the restore tree is consistent. Drive
+	 * that here to confirm the born-frozen QP thaws cleanly via
+	 * rxe_qp_resume. The byte-equality checks above ran on the as-restored
+	 * (frozen) state, matching the frozen source snapshot. The SQ is empty
+	 * and no peer traffic exists in this single-process probe, so neither
+	 * resume kick (send_task replay / recv_task drain) fires -- the QP
+	 * state is unperturbed.
+	 */
+	printf("[6b] FREEZE_CONTEXT(freeze=0) thaws the born-frozen restored QP\n");
+	ret = do_vfmig_freeze_context(fd_restore, 0);
+	if (ret) {
+		fprintf(stderr, "  FAIL FREEZE_CONTEXT(thaw): %s\n",
+			strerror(-ret));
+		fails++;
+	} else {
+		printf("  PASS born-frozen restored QP thawed\n");
+	}
 
 	/*
 	 * [7] Actually mmap the three forced-offset rings (CQ + SQ + RQ)
