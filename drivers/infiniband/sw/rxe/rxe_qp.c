@@ -477,6 +477,22 @@ err1:
 }
 
 /*
+ * Seed a freshly-created ring's cursors to the source-side indices. For
+ * the SQ/RQ (QUEUE_TYPE_FROM_CLIENT) the client owns @producer and rxe
+ * owns @consumer (mirrored into the shared page and rxe's private copy).
+ * Indices are masked to slot width to match the wire bookkeeping.
+ */
+static void rxe_qp_seed_ring(struct rxe_queue *q, u32 producer, u32 consumer)
+{
+	producer &= q->index_mask;
+	consumer &= q->index_mask;
+
+	q->buf->producer_index = producer;
+	q->buf->consumer_index = consumer;
+	q->index = consumer;
+}
+
+/*
  * CRIU restore (S6a A2): stamp a freshly-created QP with the captured
  * wire state from the rxe_restore_qp_req UHW and land it directly at
  * its final IBTA state. No ib_modify_qp chain runs -- this is the
@@ -554,28 +570,31 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	qp->req.wqe_index	 = req->req_wqe_index;
 	atomic_set(&qp->ssn, req->ssn);
 
+	/*
+	 * Seed the freshly-created ring cursors to the source base so the
+	 * shared-page producer/consumer that userspace reads agree with
+	 * qp->req.wqe_index. The drained restore path (cursor-only, no image
+	 * tail) never calls rxe_qp_restore_inflight(), so without this the
+	 * ring is left at 0/0 while wqe_index sits at the source base: the
+	 * first post-restore post_send lands at slot 0, but the requester
+	 * computes wqe_index == producer and skips the WQE forever (no
+	 * packet, post_send hangs). The in-flight path re-seeds these from
+	 * its captured image below; the values are identical, so the
+	 * duplicate is harmless.
+	 */
+	if (qp->sq.queue)
+		rxe_qp_seed_ring(qp->sq.queue, req->sq_producer,
+				 req->sq_consumer);
+	if (qp->rq.queue && !qp->srq)
+		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
+				 req->rq_consumer);
+
 	spin_lock_irqsave(&qp->state_lock, flags);
 	qp->attr.qp_state	 = state;
 	qp->attr.cur_qp_state	 = state;
 	spin_unlock_irqrestore(&qp->state_lock, flags);
 
 	return 0;
-}
-
-/*
- * Seed a freshly-created ring's cursors to the source-side indices. For
- * the SQ/RQ (QUEUE_TYPE_FROM_CLIENT) the client owns @producer and rxe
- * owns @consumer (mirrored into the shared page and rxe's private copy).
- * Indices are masked to slot width to match the wire bookkeeping.
- */
-static void rxe_qp_seed_ring(struct rxe_queue *q, u32 producer, u32 consumer)
-{
-	producer &= q->index_mask;
-	consumer &= q->index_mask;
-
-	q->buf->producer_index = producer;
-	q->buf->consumer_index = consumer;
-	q->index = consumer;
 }
 
 /*
