@@ -791,6 +791,21 @@ static void rxe_qp_reset(struct rxe_qp *qp)
  */
 void rxe_qp_pause(struct rxe_qp *qp)
 {
+	unsigned long flags;
+
+	/*
+	 * Idempotent: a second freeze (e.g. both ucontext FREEZE_CONTEXT
+	 * and per-QP FREEZE_DATAPATH) must not re-run. dp_frozen pairs
+	 * with rxe_qp_resume so the enable/disable refcount stays matched.
+	 */
+	spin_lock_irqsave(&qp->state_lock, flags);
+	if (qp->dp_frozen) {
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		return;
+	}
+	qp->dp_frozen = true;
+	spin_unlock_irqrestore(&qp->state_lock, flags);
+
 	rxe_disable_task(&qp->send_task);
 	rxe_disable_task(&qp->recv_task);
 }
@@ -828,6 +843,23 @@ void rxe_qp_pause(struct rxe_qp *qp)
 void rxe_qp_resume(struct rxe_qp *qp)
 {
 	unsigned long flags;
+
+	/*
+	 * Idempotent (pairs with rxe_qp_pause): only thaw a QP that we
+	 * actually parked. A redundant resume on a live QP would
+	 * rxe_enable_task() -> force the task state to IDLE while a
+	 * send_task work item is still pending, so the next rnr-timer
+	 * reschedule does rxe_get()+num_sched++ but queue_work() returns
+	 * false (already pending), permanently leaking a task reservation
+	 * (num_sched > num_done) and hanging the eventual destroy.
+	 */
+	spin_lock_irqsave(&qp->state_lock, flags);
+	if (!qp->dp_frozen) {
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		return;
+	}
+	qp->dp_frozen = false;
+	spin_unlock_irqrestore(&qp->state_lock, flags);
 
 	rxe_enable_task(&qp->send_task);
 	rxe_enable_task(&qp->recv_task);

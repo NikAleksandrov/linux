@@ -289,6 +289,23 @@ first-thawed requester would transmit to a peer qpn a sibling task has
 not installed yet. The kernel cannot enforce this; it only guarantees
 nothing moves until thawed.
 
+**Idempotency (kernel-enforced).** `rxe_qp_pause()`/`rxe_qp_resume()`
+are idempotent via a `state_lock`-guarded `qp->dp_frozen` flag, so the
+orchestrator may thaw a QP through *either or both* paths (per-QP
+`FREEZE_DATAPATH(0)` and ucontext `FREEZE_CONTEXT(0)`) without harm. This
+is not cosmetic: a second `rxe_qp_resume()` on an already-live QP would
+call `rxe_enable_task()`, which unconditionally forces the task state to
+`TASK_STATE_IDLE`. If a `send_task` work item is *pending* at that moment
+(it is, during the post-thaw RNR-retry flood -- `rnr_nak_timer` reschedules
+~1500x/s for `rnr_retry=7`, `min_rnr_timer=12`), the next reschedule's
+`__reserve_if_idle()` sees IDLE and does `rxe_get()` + `num_sched++` but
+`queue_work()` returns false (work already queued) -- permanently leaking
+one task reservation. That surfaces as the `rxe_task.c` `num_done !=
+num_sched` WARN during the flood and, once the SEND finally completes, a
+50s `ibv_destroy_qp()` hang (`__rxe_cleanup` waits out the leaked ref ->
+`-ETIMEDOUT`). The `dp_frozen` guard makes the redundant thaw a no-op so
+`rxe_enable_task()` only ever runs on a genuinely parked (drained) task.
+
 ## 6. Test harness
 
 ### 6.1 In-tree plumbing probe (as built, DONE)
