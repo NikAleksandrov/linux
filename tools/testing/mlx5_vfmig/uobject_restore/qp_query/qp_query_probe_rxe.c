@@ -199,7 +199,7 @@ struct rxe_restore_qp_req_local {
 
 /* ----------------------- ioctl helpers ----------------------------------- */
 
-static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
+static int do_migrate_query_qp(int fd, uint32_t qp_handle,
 			     struct rxe_restore_qp_req_local *blob_out,
 			     uint64_t *user_handle_out)
 {
@@ -239,7 +239,7 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	return 0;
 }
 
-static int do_vfmig_query_cq(int fd, uint32_t cq_handle,
+static int do_migrate_query_cq(int fd, uint32_t cq_handle,
 			     struct rxe_query_cq_resp_local *blob_out)
 {
 	struct {
@@ -272,7 +272,7 @@ static int do_vfmig_query_cq(int fd, uint32_t cq_handle,
 	return 0;
 }
 
-static int do_vfmig_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
+static int do_migrate_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
@@ -495,7 +495,7 @@ static int subtest_query_fields(struct ibv_context *ctx, struct rc_qp *p)
 		return 1;
 	}
 
-	ret = do_vfmig_query_qp(ctx->cmd_fd, p->qp->handle, &blob,
+	ret = do_migrate_query_qp(ctx->cmd_fd, p->qp->handle, &blob,
 				&user_handle);
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_QP ioctl: %s%s\n", strerror(-ret),
@@ -559,7 +559,7 @@ static int subtest_query_cq(struct ibv_context *ctx, struct rc_qp *p)
 
 	printf("[2] QUERY_CQ field fidelity (vm_pgoff + cqe)\n");
 
-	ret = do_vfmig_query_cq(ctx->cmd_fd, p->cq->handle, &blob);
+	ret = do_migrate_query_cq(ctx->cmd_fd, p->cq->handle, &blob);
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_CQ ioctl: %s%s\n", strerror(-ret),
 			ret == -EOPNOTSUPP
@@ -592,7 +592,7 @@ static int subtest_query_cq(struct ibv_context *ctx, struct rc_qp *p)
 #undef CHECK
 
 	/* bogus handle must be rejected, mirroring QUERY_QP. */
-	ret = do_vfmig_query_cq(ctx->cmd_fd, 0xdeadbeefu, &blob);
+	ret = do_migrate_query_cq(ctx->cmd_fd, 0xdeadbeefu, &blob);
 	if (ret == -ENOENT) {
 		printf("  PASS QUERY_CQ(0xdeadbeef) -> -ENOENT\n");
 	} else {
@@ -610,7 +610,7 @@ static int subtest_freeze_lifecycle(struct ibv_context *ctx, struct rc_qp *p)
 
 	printf("[3] FREEZE_DATAPATH freeze/resume lifecycle\n");
 
-	ret = do_vfmig_freeze(ctx->cmd_fd, p->qp->handle, 1);
+	ret = do_migrate_freeze(ctx->cmd_fd, p->qp->handle, 1);
 	if (ret == 0)
 		printf("  PASS FREEZE_DATAPATH(freeze=1) -> 0\n");
 	else {
@@ -619,7 +619,7 @@ static int subtest_freeze_lifecycle(struct ibv_context *ctx, struct rc_qp *p)
 		fails++;
 	}
 
-	ret = do_vfmig_freeze(ctx->cmd_fd, p->qp->handle, 0);
+	ret = do_migrate_freeze(ctx->cmd_fd, p->qp->handle, 0);
 	if (ret == 0)
 		printf("  PASS FREEZE_DATAPATH(freeze=0) -> 0\n");
 	else {
@@ -637,7 +637,7 @@ static int subtest_bad_handle(struct ibv_context *ctx)
 	int ret;
 
 	printf("[4] QUERY_QP(bogus handle) -> -ENOENT\n");
-	ret = do_vfmig_query_qp(ctx->cmd_fd, 0xdeadbeefu, &blob, &user_handle);
+	ret = do_migrate_query_qp(ctx->cmd_fd, 0xdeadbeefu, &blob, &user_handle);
 	if (ret == -ENOENT) {
 		printf("  PASS QUERY_QP(0xdeadbeef) -> -ENOENT\n");
 		return 0;
@@ -687,7 +687,7 @@ static int subtest_freeze_context(struct ibv_context *ctx, struct rc_qp *p)
 	STEP(do_freeze_context(ctx->cmd_fd, 1), "FREEZE_CONTEXT(freeze=1)");
 	STEP(do_freeze_context(ctx->cmd_fd, 1),
 	     "FREEZE_CONTEXT(freeze=1) again (idempotent)");
-	STEP(do_vfmig_freeze(ctx->cmd_fd, p->qp->handle, 1),
+	STEP(do_migrate_freeze(ctx->cmd_fd, p->qp->handle, 1),
 	     "FREEZE_DATAPATH(freeze=1) while context-frozen (compose)");
 	STEP(do_freeze_context(ctx->cmd_fd, 0), "FREEZE_CONTEXT(freeze=0)");
 	STEP(do_freeze_context(ctx->cmd_fd, 0),

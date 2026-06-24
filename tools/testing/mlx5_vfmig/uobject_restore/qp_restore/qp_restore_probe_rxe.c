@@ -580,7 +580,7 @@ static int do_restore_qp(int fd, uint32_t target_handle, uint32_t pd_handle,
 	return 0;
 }
 
-static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
+static int do_migrate_query_qp(int fd, uint32_t qp_handle,
 			     struct rxe_restore_qp_req_local *blob_out,
 			     const struct qp_images *imgs)
 {
@@ -644,7 +644,7 @@ static int do_vfmig_query_qp(int fd, uint32_t qp_handle,
 	return 0;
 }
 
-static int do_vfmig_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
+static int do_migrate_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
@@ -683,7 +683,7 @@ static int do_vfmig_freeze(int fd, uint32_t qp_handle, uint8_t freeze)
  * born-frozen restored QP can be thawed (and exercises rxe_qp_resume's
  * replay kick) rather than leaving it parked.
  */
-static int do_vfmig_freeze_context(int fd, uint8_t freeze)
+static int do_migrate_freeze_context(int fd, uint8_t freeze)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
@@ -1123,7 +1123,7 @@ int main(int argc, char **argv)
 	/* [1] snapshot the source wire state (the "dump"). */
 	printf("[1] QUERY_QP snapshot of source QP 0x%x (+ ring images)\n",
 	       src_qpn);
-	ret = do_vfmig_query_qp(ctx->cmd_fd, src.qp->handle, &snap, &snap_imgs);
+	ret = do_migrate_query_qp(ctx->cmd_fd, src.qp->handle, &snap, &snap_imgs);
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_QP(source): %s%s\n",
 			strerror(-ret),
@@ -1154,7 +1154,7 @@ int main(int argc, char **argv)
 	/* [2] freeze + destroy the source to free the qpn. */
 	printf("[2] FREEZE_DATAPATH(source) + DESTROY_QP to free qpn 0x%x\n",
 	       src_qpn);
-	ret = do_vfmig_freeze(ctx->cmd_fd, src.qp->handle, 1);
+	ret = do_migrate_freeze(ctx->cmd_fd, src.qp->handle, 1);
 	if (ret) {
 		fprintf(stderr, "  FAIL FREEZE_DATAPATH(source): %s\n",
 			strerror(-ret));
@@ -1260,7 +1260,7 @@ int main(int argc, char **argv)
 
 	/* [6] re-query the restored QP; must be byte-equal to snapshot. */
 	printf("[6] QUERY_QP(restored) must match the source snapshot\n");
-	ret = do_vfmig_query_qp(fd_restore, QP_TARGET_HANDLE, &re, &re_imgs);
+	ret = do_migrate_query_qp(fd_restore, QP_TARGET_HANDLE, &re, &re_imgs);
 	if (ret) {
 		fprintf(stderr, "  FAIL QUERY_QP(restored): %s\n",
 			strerror(-ret));
@@ -1313,7 +1313,7 @@ int main(int argc, char **argv)
 	 * state is unperturbed.
 	 */
 	printf("[6b] FREEZE_CONTEXT(freeze=0) thaws the born-frozen restored QP\n");
-	ret = do_vfmig_freeze_context(fd_restore, 0);
+	ret = do_migrate_freeze_context(fd_restore, 0);
 	if (ret) {
 		fprintf(stderr, "  FAIL FREEZE_CONTEXT(thaw): %s\n",
 			strerror(-ret));
