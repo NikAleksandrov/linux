@@ -205,7 +205,7 @@ struct mlx5_ib_ucontext {
 	 * set, bfregi->sys_pages[] is sentinel-filled (MLX5_IB_INVALID_UAR_INDEX)
 	 * and any UAR mmap() is refused.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/uar_restore.md.
+	 * See tools/testing/criu_rdma/design/uar_restore.md.
 	 */
 	bool			vfmig_restore_pending;
 
@@ -221,7 +221,7 @@ struct mlx5_ib_ucontext {
 	 * alone cannot serve as that gate -- by then it's been cleared.
 	 *
 	 * See include/rdma/ib_verbs.h:ib_device_ops.ucontext_is_restore_mode
-	 * and tools/testing/mlx5_vfmig/design/uobject_restore.md.
+	 * and tools/testing/criu_rdma/design/uobject_restore.md.
 	 */
 	bool			vfmig_restore_mode;
 };
@@ -248,7 +248,7 @@ struct mlx5_ib_pd {
 	 * 0xef0c8a ("PDN unknown to allocator"), regardless of the
 	 * asserting uid -- the same shape FW returns for definitely-
 	 * bogus pdns (999, 5000, 0xffff). Empirically demonstrated by
-	 * tools/testing/mlx5_vfmig/uobject_restore/dealloc_pd_chain/.
+	 * tools/testing/criu_rdma/uobject_restore/dealloc_pd_chain/.
 	 *
 	 * mlx5_ib_dealloc_pd uses this flag to gate the suppression of
 	 * exactly that syndrome class on restored PDs, so the destructor
@@ -258,7 +258,7 @@ struct mlx5_ib_pd {
 	 * non-restored PD would be a real kernel/FW bookkeeping bug and
 	 * we want to surface it.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+	 * See tools/testing/criu_rdma/design/pd_registration_wipe.md
 	 * for the full empirical justification, leak-budget analysis,
 	 * and parallel with the upstream vfio-mlx5 SR-IOV VM-LM path.
 	 */

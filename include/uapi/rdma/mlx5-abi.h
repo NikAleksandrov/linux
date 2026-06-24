@@ -96,7 +96,7 @@ enum mlx5_ib_alloc_uctx_v2_flags {
 	 * Any UAR mmap() between alloc and restore is rejected by
 	 * uar_mmap()'s existing INVALID-slot check.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/uar_restore.md.
+	 * See tools/testing/criu_rdma/design/uar_restore.md.
 	 */
 	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE	= 1 << 1,
 	/*
@@ -115,7 +115,7 @@ enum mlx5_ib_alloc_uctx_v2_flags {
 	 * source-allocated FW resources (PDs/CQs/QPs/MKEYs whose
 	 * owning_uid was that ucontext) remain usable. Empirical
 	 * matrix from
-	 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/test_pd_adopt.sh
+	 * tools/testing/criu_rdma/uobject_restore/pd_adopt/test_pd_adopt.sh
 	 * (DEVX-source variant, FW 28.48.1000) falsifies this: LOAD
 	 * preserves the FW next_free_uctx counter but the
 	 * uctx-registration table itself is wiped, so the adopted uid
@@ -138,7 +138,7 @@ enum mlx5_ib_alloc_uctx_v2_flags {
 	 * capability that preserves the uctx registry across
 	 * LOAD_VHCA_STATE. Until then this path is reachable only via
 	 * a future probe binary that sets the bit explicitly.
-	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §9.1
+	 * See tools/testing/criu_rdma/design/uobject_restore.md §9.1
 	 * S3b "DEVX-adoption blind spot" for the full empirical chain.
 	 */
 	MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID	= 1 << 2,
@@ -244,7 +244,7 @@ struct mlx5_ib_alloc_pd_resp {
  * The adopted pdn must come from the source's pre-SAVE state and
  * is expected to still be reserved in firmware on the
  * destination VF after LOAD_VHCA_STATE. See
- * tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/ for
+ * tools/testing/criu_rdma/uobject_restore/fw_id_continuity/ for
  * the K6 evidence and uobject_restore/pd_adopt/ for the
  * empirical validation of the no-FW-round-trip adoption model.
  *
@@ -292,9 +292,9 @@ struct mlx5_ib_restore_pd_req {
  * The adopted mkey_index must come from the source's pre-SAVE
  * state and is expected to still be reserved in firmware on the
  * destination VF after LOAD_VHCA_STATE. The empirical chain is:
- *   - tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/
+ *   - tools/testing/criu_rdma/uobject_restore/fw_id_continuity/
  *     (K6 -- mkey allocator high-water survives LOAD);
- *   - tools/testing/mlx5_vfmig/uobject_restore/mr_adopt/
+ *   - tools/testing/criu_rdma/uobject_restore/mr_adopt/
  *     (S4b -- QUERY_MKEY confirms src_mkey_index alive on dest
  *     post-LOAD with mkc.{pd, start_addr, len} byte-equal to the
  *     source pre-SAVE view).
@@ -350,9 +350,9 @@ struct mlx5_ib_restore_mr_req {
  * The adopted cqn must come from the source's pre-SAVE state and
  * is expected to still be reserved in firmware on the destination
  * VF after LOAD_VHCA_STATE. The empirical chain is:
- *   - tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/
+ *   - tools/testing/criu_rdma/uobject_restore/fw_id_continuity/
  *     (K6 -- cqn allocator high-water survives LOAD);
- *   - tools/testing/mlx5_vfmig/uobject_restore/cq_adopt/
+ *   - tools/testing/criu_rdma/uobject_restore/cq_adopt/
  *     (S5b B0 -- QUERY_CQ confirms src_cqn alive on dest post-LOAD
  *     with cqc.{eqn, log_cq_size, log_page_size, page_offset,
  *     status, oi} byte-equal to the source pre-SAVE view; STRONG

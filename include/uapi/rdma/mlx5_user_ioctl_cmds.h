@@ -233,7 +233,7 @@ enum mlx5_ib_objects {
 	/*
 	 * Verb-only namespace (no per-instance state, no IDR) for the
 	 * VFMIG (CRIU SR-IOV migration) per-ucontext save/restore verbs.
-	 * See tools/testing/mlx5_vfmig/design/uar_restore.md.
+	 * See tools/testing/criu_rdma/design/uar_restore.md.
 	 */
 	MLX5_IB_OBJECT_VFMIG,
 };
@@ -378,7 +378,7 @@ enum mlx5_ib_get_data_direct_sysfs_path_attrs {
  * state was imported by SAVE_VHCA_STATE / LOAD_VHCA_STATE from the
  * source VHCA they were captured on.
  *
- * See tools/testing/mlx5_vfmig/design/uar_restore.md.
+ * See tools/testing/criu_rdma/design/uar_restore.md.
  */
 enum mlx5_ib_vfmig_methods {
 	MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT = (1U << UVERBS_ID_NS_SHIFT),
@@ -443,7 +443,7 @@ enum mlx5_ib_vfmig_methods {
 	 * resolves through ufile->idr, which is per-uverbs-fd. Same
 	 * "if you can see the ucontext, you can read its metadata"
 	 * boundary as UVERBS_METHOD_QUERY_MR (see core/uverbs_std_types_mr.c
-	 * + tools/testing/mlx5_vfmig/design/uobject_restore.md §7.7).
+	 * + tools/testing/criu_rdma/design/uobject_restore.md §7.7).
 	 *
 	 * Kernel-mode CQs (no udata at create time -- mcq->buf.umem is
 	 * NULL and mcq->db.u.pgdir is the kernel-allocated lane) reject
@@ -451,7 +451,7 @@ enum mlx5_ib_vfmig_methods {
 	 * RESTORE_CQ would have nothing to consume even if we synthesised
 	 * zeros.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.2.4.
+	 * See tools/testing/criu_rdma/design/uobject_restore.md §5.2.4.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_CQ,
 	/*
@@ -543,7 +543,7 @@ enum mlx5_ib_vfmig_methods {
 	 * or trans_qp.base.ubuffer.umem == NULL) reject with -ENXIO:
 	 * there are no source userspace VAs to emit.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.3.4.
+	 * See tools/testing/criu_rdma/design/uobject_restore.md §5.3.4.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_QP,
 	/*
@@ -583,7 +583,7 @@ enum mlx5_ib_vfmig_methods {
 	 * resolves through ufile->idr, which is per-uverbs-fd. Same model
 	 * as QUERY_CQ / QUERY_QP.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.1.4.
+	 * See tools/testing/criu_rdma/design/uobject_restore.md §5.1.4.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_PD,
 };

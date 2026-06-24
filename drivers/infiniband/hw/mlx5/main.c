@@ -2783,7 +2783,7 @@ static int mlx5_ib_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
  * high-water mark but lost the (pdn -> owner_uid) registration
  * entry). The same status/syndrome combo is also returned for
  * definitely-bogus pdns -- see test_pdn_highwater.sh and
- * test_dealloc_pd_chain.sh under tools/testing/mlx5_vfmig.
+ * test_dealloc_pd_chain.sh under tools/testing/criu_rdma.
  *
  * Reproduced on FW 28.48.1000 across ConnectX-7. If a future FW
  * version re-classes this with a different syndrome, mlx5_ib_dbg
@@ -2872,7 +2872,7 @@ static int mlx5_ib_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
  *     CQs do not reference PDs in cqc), but if a similar
  *     "registration wiped" symptom is found for them, the same
  *     vfmig_restored bool + syndrome match pattern should be
- *     applied -- see tools/testing/mlx5_vfmig/design/
+ *     applied -- see tools/testing/criu_rdma/design/
  *     pd_registration_wipe.md "Generalising to QP/CQ".
  */
 static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
@@ -2931,7 +2931,7 @@ static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
  * Two empirical results back this "Model A":
  *
  *   K6 (PARTIAL PASS,
- *       tools/testing/mlx5_vfmig/uobject_restore/fw_id_continuity/):
+ *       tools/testing/criu_rdma/uobject_restore/fw_id_continuity/):
  *     a fresh MLX5_CMD_OP_ALLOC_PD on the destination after LOAD
  *     returns a pdn strictly greater than the maximum pdn from the
  *     source ucontext (consistent +3 to +5 delta vs the
@@ -2940,7 +2940,7 @@ static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
  *     source's pdn slots are reserved on the destination.
  *
  *   pd_adopt (WEAK PASS,
- *       tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/):
+ *       tools/testing/criu_rdma/uobject_restore/pd_adopt/):
  *     CREATE_MKEY under uid=0 (the non-DEVX case -- mlx5_ib_alloc_pd
  *     sets mpd->uid = context->devx_uid, which is 0 for any
  *     ucontext that did not opt into MLX5_IB_ALLOC_UCTX_DEVX) is
@@ -3034,7 +3034,7 @@ static int mlx5_ib_restore_pd_fw_probe(struct mlx5_ib_dev *dev, u32 pdn,
 		 * fastest way to triangulate which one we're hitting; map
 		 * it against the PRM "syndrome dictionary" or the
 		 * `pd_adopt`'s reference matrix in
-		 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/.
+		 * tools/testing/criu_rdma/uobject_restore/pd_adopt/.
 		 */
 		if (fw_status)
 			*fw_status = MLX5_GET(create_mkey_out, out, status);
@@ -3106,7 +3106,7 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 	 *
 	 * Two empirically-distinguishable failure modes (decoded from
 	 * fw_status + fw_syndrome; cross-check with the matrix in
-	 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/test_pd_adopt.sh):
+	 * tools/testing/criu_rdma/uobject_restore/pd_adopt/test_pd_adopt.sh):
 	 *
 	 *   1) Stale pdn (uid=0 lane). pdn is the source's restrack id
 	 *      rather than its FW pdn, or the slot was never reserved
@@ -3137,7 +3137,7 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 	 *      context->devx_uid = 0, which lands in the ungated uid=0
 	 *      lane proven by the P_zero/N_zero cells. Restored
 	 *      processes lose DEVX features (mlx5dv_*); basic verbs
-	 *      work. See tools/testing/mlx5_vfmig/design/uobject_restore.md
+	 *      work. See tools/testing/criu_rdma/design/uobject_restore.md
 	 *      §9.1 S3b "DEVX-adoption blind spot" for the full empirical
 	 *      chain and future-FW options.
 	 */
@@ -3150,7 +3150,7 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 						  &fw_status, &fw_syndrome);
 		if (err) {
 			mlx5_ib_warn(dev,
-				     "restore_pd: FW probe rejected (pdn=0x%x, uid=%u): err=%d fw_status=0x%x fw_syndrome=0x%x -- %s; decode with tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/test_pd_adopt.sh\n",
+				     "restore_pd: FW probe rejected (pdn=0x%x, uid=%u): err=%d fw_status=0x%x fw_syndrome=0x%x -- %s; decode with tools/testing/criu_rdma/uobject_restore/pd_adopt/test_pd_adopt.sh\n",
 				     req.pdn, context->devx_uid, err,
 				     fw_status, fw_syndrome,
 				     context->devx_uid
@@ -3170,7 +3170,7 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 	 * is the expected/tolerated outcome (FW state is reclaimed at
 	 * VHCA close instead). Setting this is what ties the gate in
 	 * mlx5_ib_dealloc_pd to the §S3b registration-wipe analysis;
-	 * see tools/testing/mlx5_vfmig/design/pd_registration_wipe.md.
+	 * see tools/testing/criu_rdma/design/pd_registration_wipe.md.
 	 */
 	pd->vfmig_restored = true;
 	return 0;
@@ -3192,7 +3192,7 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
  *      pre-SAVE view, host-priv QUERY_MKEY rejects bogus indices
  *      with FW syndrome (gating works).
  * Both empirically PASS on FW 28.48.1000; see
- * tools/testing/mlx5_vfmig/design/uobject_restore.md §S4b.
+ * tools/testing/criu_rdma/design/uobject_restore.md §S4b.
  *
  * The dispatcher in uverbs_std_types_restore.c has already:
  *   - gated on mlx5_ib_ucontext_is_restore_mode
@@ -3418,7 +3418,7 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
  *      byte-equal to the source's pre-SAVE view; negative-control
  *      unknown cqns reject with FW syndrome (gating works).
  * Both empirically PASS on FW 28.48.1000; see
- * tools/testing/mlx5_vfmig/design/uobject_restore.md §S5b.
+ * tools/testing/criu_rdma/design/uobject_restore.md §S5b.
  *
  * The dispatcher in uverbs_std_types_restore.c has already:
  *   - gated on mlx5_ib_ucontext_is_restore_mode
@@ -3638,7 +3638,7 @@ err_buf:
  *
  * Empirical justification for skipping every step that would
  * normally be needed at RESTORE-time is the K7 "wider QPC
- * round-trip" chain (tools/testing/mlx5_vfmig/uobject_restore/
+ * round-trip" chain (tools/testing/criu_rdma/uobject_restore/
  * fw_id_continuity/, design/uobject_restore.md K7): on FW
  * 28.48.1000 the entire QPC round-trips byte-equal across SAVE/
  * LOAD for INIT, RTR, RTS, including the next_send_psn /

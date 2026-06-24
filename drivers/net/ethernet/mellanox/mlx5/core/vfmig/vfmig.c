@@ -1180,7 +1180,7 @@ out_unlock:
  *
  * Issues a raw FW QUERY_QP(opcode 0x50b) on the bound VF's mdev for
  * the supplied qpn and reports the subset of the QPC needed by the
- * ?6.3 piggyback experiment in tools/testing/mlx5_vfmig/design/uobject_restore.md.
+ * ?6.3 piggyback experiment in tools/testing/criu_rdma/design/uobject_restore.md.
  *
  * VF mdev lookup mirrors vfmig_ioc_probe_uid: resolve the VF pci_dev
  * from the PF + vf_id, take device_lock to keep ->driver and drvdata
@@ -6660,7 +6660,7 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
  * issued, so the firmware question is moot for in-tree
  * consumers (the vfio mlx5 LM variant driver also assumes one
  * LOAD per VM lifecycle). Empirically validated end-to-end on
- * 2026-06-09 by tools/testing/mlx5_vfmig/save_load/
+ * 2026-06-09 by tools/testing/criu_rdma/save_load/
  * multi_load_gates/test_multi_load_drift_gate.sh. See
  * vf_prerestore_split.md §3.5.5.1 for the gate-by-gate table.
  *

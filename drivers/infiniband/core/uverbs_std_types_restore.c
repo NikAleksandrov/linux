@@ -11,7 +11,7 @@
  * any other ucontext with -EPERM via the per-driver
  * ib_device_ops.ucontext_is_restore_mode predicate.
  *
- * See tools/testing/mlx5_vfmig/design/uobject_restore.md.
+ * See tools/testing/criu_rdma/design/uobject_restore.md.
  */
 
 #include <rdma/uverbs_std_types.h>

@@ -172,7 +172,7 @@ vfmig_dma_ops_dom_for(struct device *dev)
  * single IOVA mapping. Doing so would shrink the registry on large
  * MRs but complicates stage 2 unmap (one map_sg entry no longer
  * maps 1:1 to one registry entry). Coalescing is a stage-2 follow-
- * up tracked in tools/testing/mlx5_vfmig/design/user_mr_dma.md §4.3.
+ * up tracked in tools/testing/criu_rdma/design/user_mr_dma.md §4.3.
  */
 static int vfmig_dma_ops_map_sg(struct device *dev, struct scatterlist *sg,
 				int nents, enum dma_data_direction dir,

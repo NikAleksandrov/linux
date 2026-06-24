@@ -613,7 +613,7 @@ struct mlx5_vf_context {
 	 * post-teardown); use uuid_is_null() to test. Cleared
 	 * explicitly via mlx5_vfmig_pf_drop_vf_uuids() at SR-IOV
 	 * teardown (sriov_numvfs=0) and PF unload. See KS7.3 in
-	 * tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5.
+	 * tools/testing/criu_rdma/design/vf_prerestore_split.md §3.5.
 	 */
 	uuid_t	vf_uuid;
 	enum port_state_policy	policy;
@@ -1445,7 +1445,7 @@ static inline bool mlx5_vf_is_restored(const struct mlx5_core_dev *dev)
  * non-zero returns but should NOT fail the MR registration -- the MR
  * remains fully usable for data path, just not CRIU-restorable.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6
+ * Recorded in tools/testing/criu_rdma/design/user_mr_dma.md §6
  * (Stage 2 source-side retag).
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
@@ -1500,7 +1500,7 @@ mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
  * underlying CQ / QP / SRQ create -- the resource remains fully
  * usable for data path, just not CRIU-restorable.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6
+ * Recorded in tools/testing/criu_rdma/design/user_mr_dma.md §6
  * (Stage 2 source-side retag) and §A.E (DBR walkthrough).
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
@@ -1531,7 +1531,7 @@ mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
  *
  * Same fast-path / error semantics as the MR helper.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6.
+ * Recorded in tools/testing/criu_rdma/design/user_mr_dma.md §6.
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 int mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
@@ -1563,7 +1563,7 @@ mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
  *
  * Same fast-path / error semantics as the MR / CQ helpers.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6.
+ * Recorded in tools/testing/criu_rdma/design/user_mr_dma.md §6.
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 int mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
@@ -1590,7 +1590,7 @@ mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
  *
  * Same fast-path / error semantics as the MR / CQ / QP helpers.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §6.
+ * Recorded in tools/testing/criu_rdma/design/user_mr_dma.md §6.
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 int mlx5_vfmig_retag_user_srq(struct mlx5_core_dev *vf_dev, u32 srqn,
@@ -1652,7 +1652,7 @@ struct sg_table;
  * left in place so the caller's ib_umem_release() unwind reaches
  * vfmig_dma_ops.unmap_sg which skips zero-iova sgs safely.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §7 and
+ * Recorded in tools/testing/criu_rdma/design/user_mr_dma.md §7 and
  * §A.C (Stage 3 D3: mlx5_ib_umem_restore -> mlx5_vfmig_bind_user_mr
  * -> vfmig_iova_bind_user_object).
  */
@@ -1688,8 +1688,8 @@ mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
  *
  * Same return-code semantics as mlx5_vfmig_bind_user_mr.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/uobject_restore.md
- * §S5b and tools/testing/mlx5_vfmig/design/user_mr_dma.md §A.D.
+ * Recorded in tools/testing/criu_rdma/design/uobject_restore.md
+ * §S5b and tools/testing/criu_rdma/design/user_mr_dma.md §A.D.
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 int mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
@@ -1728,7 +1728,7 @@ mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
  *
  * Same return-code semantics as mlx5_vfmig_bind_user_mr.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/user_mr_dma.md §A.E.
+ * Recorded in tools/testing/criu_rdma/design/user_mr_dma.md §A.E.
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 int mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
@@ -1770,8 +1770,8 @@ mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
  *
  * Same return-code semantics as mlx5_vfmig_bind_user_mr.
  *
- * Recorded in tools/testing/mlx5_vfmig/design/uobject_restore.md
- * §S6b and tools/testing/mlx5_vfmig/design/user_mr_dma.md §A.D.
+ * Recorded in tools/testing/criu_rdma/design/uobject_restore.md
+ * §S6b and tools/testing/criu_rdma/design/user_mr_dma.md §A.D.
  */
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 int mlx5_vfmig_bind_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,

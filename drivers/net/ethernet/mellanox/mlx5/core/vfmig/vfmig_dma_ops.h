@@ -41,7 +41,7 @@
  * before iommu_detach_device, so the (custom dma_ops, custom iommu
  * domain) pairing is atomic from the DMA layer's point of view.
  *
- * See tools/testing/mlx5_vfmig/design/user_mr_dma.md for the
+ * See tools/testing/criu_rdma/design/user_mr_dma.md for the
  * three-stage plan and the wire-format / replay design that builds
  * on top of this shim.
  */

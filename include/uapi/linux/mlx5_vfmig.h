@@ -133,7 +133,7 @@ struct mlx5_vfmig_get_vhca_id {
  *                means the orchestrator has not (yet) stamped a
  *                UUID on this slot. Cleared on SR-IOV teardown
  *                (sriov_numvfs=0). See KS7.3 in
- *                tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ *                tools/testing/criu_rdma/design/vf_prerestore_split.md
  *                §3.5 for the dump-side / restore-side contract.
  *                Returned as all-zeros on out-of-range vf_id.
  *
@@ -142,7 +142,7 @@ struct mlx5_vfmig_get_vhca_id {
  *   struct size (sizeof in the _IOWR macro), so old userspace built
  *   against the smaller struct will get -ENOTTY from a new kernel
  *   rather than reading a partial / misaligned result. Recompile the
- *   in-tree tool (tools/testing/mlx5_vfmig) against this header.
+ *   in-tree tool (tools/testing/criu_rdma) against this header.
  */
 struct mlx5_vfmig_query_vf {
 	__u32 vf_id;		/* in  */
@@ -400,7 +400,7 @@ struct mlx5_vfmig_probe_uid {
  *   userspace test compare a QP's state across SAVE_VHCA_STATE +
  *   LOAD_VHCA_STATE without owning a userspace ib_qp handle for it.
  *
- *   Use-case: tools/testing/mlx5_vfmig/design/uobject_restore.md §6.3
+ *   Use-case: tools/testing/criu_rdma/design/uobject_restore.md §6.3
  *   piggyback experiment. On the source, allocate an RC QP, transition
  *   it through INIT / RTR / RTS via self-loopback (post N receive WRs
  *   along the way). Snapshot the QPC via this ioctl. SAVE, then on
@@ -452,7 +452,7 @@ struct mlx5_vfmig_probe_uid {
  *   struct size (sizeof in the _IOWR macro), so old userspace built
  *   against the smaller struct will get -ENOTTY from a new kernel
  *   rather than reading a partial / misaligned result. Recompile the
- *   in-tree tool (tools/testing/mlx5_vfmig) against this header.
+ *   in-tree tool (tools/testing/criu_rdma) against this header.
  */
 struct mlx5_vfmig_query_qp {
 	/* --- in --- */
@@ -714,7 +714,7 @@ struct mlx5_vfmig_probe_mkey {
 /*
  * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND:
  *   user_mr_dma stage-2 success-criterion accessor (see
- *   tools/testing/mlx5_vfmig/design/user_mr_dma.md section 6.4).
+ *   tools/testing/criu_rdma/design/user_mr_dma.md section 6.4).
  *
  *   Walks the target VF's per-VF vfmig_iova_domain registry and
  *   reports how many external (USER_PAGE / vfmig_dma_ops-backed)
@@ -1392,7 +1392,7 @@ struct mlx5_vfmig_probe_mr_destroy {
  *   neither @vhca_id (per-PF allocator, unstable across SAVE/LOAD)
  *   nor @vf_id (per-PF slot, may differ source-vs-destination) is
  *   a workload-stable identifier.  See KS7.3 in
- *   tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5
+ *   tools/testing/criu_rdma/design/vf_prerestore_split.md §3.5
  *   for the full contract.
  *
  *   Intended caller and timing:
@@ -1442,7 +1442,7 @@ struct mlx5_vfmig_probe_mr_destroy {
  *   (sriov_numvfs=0 -> sriov_numvfs=N -> SET_VF_UUID -> LOAD)
  *   is the validated route and is what the orchestrator
  *   workflow KS7.3 was designed for; see
- *   tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ *   tools/testing/criu_rdma/design/vf_prerestore_split.md
  *   §3.5.5.1 for the gate-by-gate empirical table.
  *
  *   Authorization is the cdev FD, same as the rest of the

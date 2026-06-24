@@ -595,7 +595,7 @@ enum rdma_nldev_attr {
 	 * (those with !res->user) MUST NOT carry this attribute -- it has no
 	 * meaning outside a ufile.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md §7.5.1.
+	 * See tools/testing/criu_rdma/design/uobject_restore.md §7.5.1.
 	 */
 	RDMA_NLDEV_ATTR_RES_HANDLE,		/* u32 */
 
@@ -617,7 +617,7 @@ enum rdma_nldev_attr {
 	 * conventional send_cq either (xrc target is sink-only), so
 	 * the attr is also conditional on qp->send_cq != NULL.
 	 *
-	 * See tools/testing/mlx5_vfmig/design/uobject_restore.md
+	 * See tools/testing/criu_rdma/design/uobject_restore.md
 	 * §S6b B6 / §5.3.4 for the dump-side discovery rationale.
 	 */
 	RDMA_NLDEV_ATTR_RES_SEND_CQN,		/* u32 */

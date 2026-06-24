@@ -280,7 +280,7 @@ err_cmd:
  * mlx5_qpc_adopt_qp -- VFMIG CRIU restore companion to
  * mlx5_qpc_create_qp. Skips FW CREATE_QP because the source's
  * qpn is already alive in the destination FW post-LOAD_VHCA_STATE
- * (see tools/testing/mlx5_vfmig/design/uobject_restore.md K7
+ * (see tools/testing/criu_rdma/design/uobject_restore.md K7
  * STRONG PASS: qpn allocator high-water survives LOAD, the FW
  * QPC round-trips byte-equal across SAVE/LOAD on FW 28.48.1000)
  * and only does the kernel-side mlx5_core_qp registration:

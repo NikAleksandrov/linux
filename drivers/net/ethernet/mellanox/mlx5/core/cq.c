@@ -204,7 +204,7 @@ EXPORT_SYMBOL(mlx5_core_create_cq);
  *      page_offset, status, oi} on the destination post-LOAD;
  *      negative-control unknown cqns reject with FW syndrome.
  * Both empirically PASS on FW 28.48.1000; see
- * tools/testing/mlx5_vfmig/design/uobject_restore.md §S5b.
+ * tools/testing/criu_rdma/design/uobject_restore.md §S5b.
  *
  * What this helper does (mirroring mlx5_create_cq's post-FW-cmd
  * tail, exactly):

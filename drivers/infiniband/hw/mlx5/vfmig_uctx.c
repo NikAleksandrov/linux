@@ -38,13 +38,13 @@
  *                    inputs RESTORE_QP takes as core attrs (type /
  *                    state / user_handle / cap / create_flags).
  *
- * See tools/testing/mlx5_vfmig/design/uar_restore.md for the full
+ * See tools/testing/criu_rdma/design/uar_restore.md for the full
  * design of the per-ucontext save/restore path, including the
  * rationale for living on the uverbs fd vs the /dev/mlx5_vfmig PF
  * cdev, and the empirical foundation that the snapshotted FW UAR
  * ids stay valid after LOAD_VHCA_STATE.
  *
- * See tools/testing/mlx5_vfmig/design/uobject_restore.md §5.2.4 for
+ * See tools/testing/criu_rdma/design/uobject_restore.md §5.2.4 for
  * the QUERY_CQ rationale (why driver-private vs core QUERY_CQ, why
  * the byte-equal payload contract, and the security boundary).
  * §5.3.4 covers QUERY_QP -- same shape, QP-shaped fields.
@@ -281,7 +281,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT)(
 	 * (then-current) belief that the CRIU agent's DEALLOC_PD
 	 * failure was caused by a uid mismatch between mpd->uid and
 	 * the FW PDC's owner-uid. Empirical investigation
-	 * (tools/testing/mlx5_vfmig/uobject_restore/qp_destroy_matrix,
+	 * (tools/testing/criu_rdma/uobject_restore/qp_destroy_matrix,
 	 * cq_destroy_matrix, mr_destroy_matrix, dealloc_pd_chain)
 	 * subsequently established:
 	 *
@@ -316,7 +316,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT)(
 	 * DEVX-direct manipulation (ibv_devx_obj_*) of restored
 	 * objects -- those use the wiped (uid -> uctx_attrs)
 	 * registration table for ownership validation. See
-	 * tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+	 * tools/testing/criu_rdma/design/pd_registration_wipe.md
 	 * "DEVX-direct opcodes" for the FW-team escalation path.
 	 */
 	if (meta.devx_uid != c->devx_uid) {

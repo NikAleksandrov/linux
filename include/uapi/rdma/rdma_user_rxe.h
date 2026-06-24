@@ -53,7 +53,7 @@ enum {
  * mode. The kernel latches a sticky bit on the resulting rxe_ucontext
  * that the per-driver ib_device_ops.ucontext_is_restore_mode predicate
  * reports to the generic UVERBS_METHOD_RESTORE_<TYPE> dispatchers.
- * See tools/testing/mlx5_vfmig/design/uobject_restore.md.
+ * See tools/testing/criu_rdma/design/uobject_restore.md.
  */
 enum {
 	RXE_ALLOC_UCTX_RESTORE_MODE = 1u << 0,

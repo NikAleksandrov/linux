@@ -151,7 +151,7 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	 * on a dead VF command ring (idempotent no-op the second time). The
 	 * detach (mlx5_sriov_detach) and enable-error paths reach teardown
 	 * only through here, so the call must stay. See
-	 * tools/testing/mlx5_vfmig/design/snapshot_ordering_pause_capture.md.
+	 * tools/testing/criu_rdma/design/snapshot_ordering_pause_capture.md.
 	 */
 	mlx5_vfmig_pf_drop_suspends(dev);
 

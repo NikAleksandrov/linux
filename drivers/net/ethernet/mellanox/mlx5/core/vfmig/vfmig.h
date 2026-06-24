@@ -184,8 +184,8 @@ void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev);
  * consumers. The cycle path, by contrast, drops the per-VF
  * IOVA domain in mlx5_sriov_disable() (drift_armed goes with
  * it) and is empirically validated end-to-end by
- * tools/testing/mlx5_vfmig/save_load/test_iova_tracked_save_load.sh.
- * See tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ * tools/testing/criu_rdma/save_load/test_iova_tracked_save_load.sh.
+ * See tools/testing/criu_rdma/design/vf_prerestore_split.md
  * §3.5.5.1 for the gate-by-gate empirical table.
  *
  * The hook only unblocks identity-tag recycling across the
