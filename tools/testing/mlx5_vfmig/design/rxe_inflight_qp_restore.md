@@ -174,9 +174,24 @@ intended recovery. Posted-but-unsent work (`> old req.wqe_index`) is
 sent for the first time. Net: the single rewind covers all three SQ
 regions correctly, given the restored PSNs.
 
-(Open verification item: confirm `qp->comp.psn` / `qp->req.psn` line up
-with the rewound replay so the completer retires the right WQEs as ACKs
-arrive. Add an assert/harness check.)
+**The rewind alone is NOT sufficient**, however: rewinding
+`req.wqe_index` does not touch the *per-WQE* DMA cursor. A blitted WQE
+that was mid/post-transmission at dump carries its consumed cursor
+(`wqe->dma.resid == 0`, `state == wqe_state_pending`), so `rxe_requester`
+would send a 0-byte payload (`payload = wqe->dma.resid`). The replay must
+therefore run through `req_retry()` (which resets
+`dma.resid`/`cur_sge`/`sge_offset` and `state` across
+`[sq_consumer, sq_producer)` and resumes the first unacked WQE from
+`qp->comp.psn`). That is driven from `rxe_qp_resume()` by arming
+`qp->req.need_retry = 1` (and clearing `wait_for_rnr_timer`) before the
+`send_task` kick -- see §5.4. `req_retry()` `break`s at the first
+`wqe_state_posted` WQE, so posted-but-unsent work is left untouched and
+sent for the first time, and `continue`s past `wqe_state_done`: it serves
+all three sub-cases.
+
+(Verification item, now observable via the CRIU pd_cq_qp_sq pass: confirm
+`qp->comp.psn` / `qp->req.psn` line up with the rewound replay so the
+completer retires the right WQEs as ACKs arrive.)
 
 ### 5.2 `rxe_qp_seed_ring()` helper (as built, `rxe_qp.c`)
 
@@ -240,14 +255,24 @@ The fix is **born-frozen + thaw-and-replay**, reusing the existing
    blocks the responder from acting on an early inbound packet (from a
    peer that thawed first) before our MR buffers are in place.
 2. **Resume = enable + replay.** `rxe_qp_resume()` re-enables both tasks,
-   then: if `qp_state == RTS && sq_producer != sq_consumer`,
-   `rxe_sched_task(&qp->send_task)` (replays the rewound in-flight window
-   from §5.1). If the responder inbound queue (`qp->req_pkts`) is
-   non-empty, `rxe_sched_task(&qp->recv_task)` (drains packets queued
-   while frozen, which `rxe_enable_task` alone would not re-run).
-   Producer/consumer were already seeded by `rxe_qp_restore_inflight()`,
-   so resume decides per-QP with no extra caller state. Both kicks are
-   no-ops for a source QP resumed after a dump-freeze (empty ring/queue),
+   then: if `qp_state == RTS && sq_producer != sq_consumer`, it arms a
+   retry (`qp->req.need_retry = 1`, `qp->req.wait_for_rnr_timer = 0`,
+   under `state_lock`) and `rxe_sched_task(&qp->send_task)`. The
+   `need_retry` arming is essential, not cosmetic: without it
+   `rxe_requester` sends `payload = wqe->dma.resid == 0` for the blitted
+   WQEs (consumed cursor); arming it makes the gate
+   `need_retry && !wait_for_rnr_timer` run `req_retry()`, which resets the
+   per-WQE DMA state across `[sq_consumer, sq_producer)` and replays the
+   in-flight window from `qp->comp.psn` (see §5.1). This mirrors
+   `rnr_nak_timer()` verbatim. If the responder inbound queue
+   (`qp->req_pkts`) is non-empty, `rxe_sched_task(&qp->recv_task)` (drains
+   packets queued while frozen, which `rxe_enable_task` alone would not
+   re-run). Producer/consumer were already seeded by
+   `rxe_qp_restore_inflight()`, so resume decides per-QP with no extra
+   caller state. All of this is a no-op for a source QP resumed after a
+   dump-freeze with an empty ring/queue; when the source ring is
+   non-empty, forcing the retry is the same recovery the retransmit timer
+   would have run (a freeze is indistinguishable from a network stall),
    so one path serves both the dump-resume and the restore-thaw callers.
 3. **Thaw == replay trigger.** `FREEZE_CONTEXT(freeze=0)` already walks the
    ucontext QP pool calling `rxe_qp_resume()` per QP, so it becomes the

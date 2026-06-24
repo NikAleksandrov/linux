@@ -803,9 +803,19 @@ void rxe_qp_pause(struct rxe_qp *qp)
  * into the ring with the cursors seeded (rxe_qp_restore_inflight), but
  * nothing reschedules the requester: there is no fresh post_send and no
  * inbound packet yet, so the [sq_consumer, sq_producer) WQEs would idle
- * forever. Kick send_task when the QP is RTS with outstanding SQ work;
- * rxe rewound req.wqe_index to sq_consumer so this replays the in-flight
- * window from scratch (the peer drops duplicate PSNs -- see §5.1).
+ * forever. Kick send_task when the QP is RTS with outstanding SQ work,
+ * after arming a retry (need_retry): the blitted WQEs keep the consumed
+ * DMA cursor from their original transmission (wqe->dma.resid == 0,
+ * state == wqe_state_pending), so rxe_requester would send a 0-byte
+ * payload (payload = wqe->dma.resid, rxe_req.c). req_retry() resets
+ * dma.resid/cur_sge/sge_offset and state across [sq_consumer,
+ * sq_producer) and resumes the first unacked WQE from qp->comp.psn, so
+ * the in-flight window replays correctly (the peer drops duplicate PSNs
+ * -- see §5.1). This mirrors rnr_nak_timer(): set need_retry +
+ * clear wait_for_rnr_timer under state_lock so the rxe_requester gate
+ * (need_retry && !wait_for_rnr_timer) fires immediately. A freeze is
+ * indistinguishable from a network stall, so triggering the retry the
+ * retransmit timer would have run is correct for a live source QP too.
  *
  * Also drain the responder: an inbound packet that arrived while the QP
  * was frozen (e.g. a peer thawed first) is queued on qp->req_pkts with
@@ -817,13 +827,20 @@ void rxe_qp_pause(struct rxe_qp *qp)
  */
 void rxe_qp_resume(struct rxe_qp *qp)
 {
+	unsigned long flags;
+
 	rxe_enable_task(&qp->send_task);
 	rxe_enable_task(&qp->recv_task);
 
 	if (qp->sq.queue && qp_state(qp) == IB_QPS_RTS &&
 	    queue_get_producer(qp->sq.queue, qp->sq.queue->type) !=
-	    queue_get_consumer(qp->sq.queue, qp->sq.queue->type))
+	    queue_get_consumer(qp->sq.queue, qp->sq.queue->type)) {
+		spin_lock_irqsave(&qp->state_lock, flags);
+		qp->req.need_retry = 1;
+		qp->req.wait_for_rnr_timer = 0;
+		spin_unlock_irqrestore(&qp->state_lock, flags);
 		rxe_sched_task(&qp->send_task);
+	}
 
 	if (!skb_queue_empty(&qp->req_pkts))
 		rxe_sched_task(&qp->recv_task);
