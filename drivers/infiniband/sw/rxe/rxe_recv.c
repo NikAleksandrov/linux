@@ -40,6 +40,24 @@ static int check_type_state(struct rxe_dev *rxe, struct rxe_pkt_info *pkt,
 	}
 
 	spin_lock_irqsave(&qp->state_lock, flags);
+	/*
+	 * CRIU (S6a): while the datapath is frozen for a snapshot the QP
+	 * deliberately stays in RTS (so query/restore observe the real
+	 * state), but it must not accept new work. Otherwise the RX path
+	 * keeps appending to qp->req_pkts/resp_pkts -- and every queued skb
+	 * pins a QP reference (taken in hdr_check, released only when the
+	 * responder/completer consumes it). With recv_task/send_task parked
+	 * those refs are never dropped, so (a) rxe_disable_task() can never
+	 * drain under an active flood (do_task spins in TASK_STATE_DRAINING
+	 * with no cond_resched -> soft lockup) and (b) a destroy of the
+	 * frozen QP blocks in __rxe_cleanup until the 50s refcount timeout
+	 * (-ETIMEDOUT). Drop new packets instead; an RC peer retransmits
+	 * after thaw and rxe_qp_resume() re-kicks anything still queued.
+	 */
+	if (unlikely(qp->dp_frozen)) {
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		return -EINVAL;
+	}
 	if (pkt->mask & RXE_REQ_MASK) {
 		if (unlikely(qp_state(qp) < IB_QPS_RTR)) {
 			spin_unlock_irqrestore(&qp->state_lock, flags);
