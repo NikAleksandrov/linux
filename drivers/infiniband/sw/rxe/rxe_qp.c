@@ -827,6 +827,28 @@ void rxe_qp_pause(struct rxe_qp *qp)
 
 	rxe_disable_task(&qp->send_task);
 	rxe_disable_task(&qp->recv_task);
+
+	/*
+	 * Leave the QP with empty packet queues so it can be queried,
+	 * resumed or destroyed without a leaked reference. check_type_state()
+	 * now drops inbound packets once dp_frozen is visible, but a packet
+	 * that read dp_frozen == false just before the store above can still
+	 * be queued onto req_pkts/resp_pkts after rxe_disable_task() parked
+	 * the tasks -- and every queued skb pins a QP reference that the
+	 * parked responder/completer will never release (the destroy path
+	 * would then block in __rxe_cleanup until the refcount timeout).
+	 *
+	 * synchronize_net() waits out any rxe_rcv() softirq already in
+	 * flight, so once it returns no further skb can be enqueued (newer
+	 * receives observe dp_frozen and are dropped). Draining afterward
+	 * therefore empties the queues for good. The pre-freeze backlog was
+	 * already consumed by rxe_disable_task() above; this only mops up the
+	 * race stragglers. The dropped packets are recovered by the RC peer's
+	 * retransmit after thaw.
+	 */
+	synchronize_net();
+	rxe_drain_req_pkts(qp);
+	rxe_drain_resp_pkts(qp);
 }
 
 /*
