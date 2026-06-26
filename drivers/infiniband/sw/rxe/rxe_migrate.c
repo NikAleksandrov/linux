@@ -184,6 +184,8 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 		 * so unlike the per-QP QUERY path there is no type gate.
 		 */
 		if (qp->is_user && ib_qp_ucontext(&qp->ibqp) == ucontext) {
+			rxe_dbg_qp(qp, "FREEZE_CONTEXT: freeze=%u match\n",
+				   freeze);
 			if (freeze)
 				rxe_qp_pause(qp);
 			else

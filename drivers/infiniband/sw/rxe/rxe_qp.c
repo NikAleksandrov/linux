@@ -820,6 +820,7 @@ void rxe_qp_pause(struct rxe_qp *qp)
 	spin_lock_irqsave(&qp->state_lock, flags);
 	if (qp->dp_frozen) {
 		spin_unlock_irqrestore(&qp->state_lock, flags);
+		rxe_dbg_qp(qp, "freeze: already frozen (redundant)\n");
 		return;
 	}
 	qp->dp_frozen = true;
@@ -849,6 +850,8 @@ void rxe_qp_pause(struct rxe_qp *qp)
 	synchronize_net();
 	rxe_drain_req_pkts(qp);
 	rxe_drain_resp_pkts(qp);
+
+	rxe_dbg_qp(qp, "freeze: parked, state=%d\n", qp_state(qp));
 }
 
 /*
@@ -883,6 +886,7 @@ void rxe_qp_pause(struct rxe_qp *qp)
  */
 void rxe_qp_resume(struct rxe_qp *qp)
 {
+	bool kick_send = false, kick_recv = false;
 	unsigned long flags;
 
 	/*
@@ -897,6 +901,8 @@ void rxe_qp_resume(struct rxe_qp *qp)
 	spin_lock_irqsave(&qp->state_lock, flags);
 	if (!qp->dp_frozen) {
 		spin_unlock_irqrestore(&qp->state_lock, flags);
+		rxe_dbg_qp(qp, "thaw: not frozen (redundant/none), state=%d\n",
+			   qp_state(qp));
 		return;
 	}
 	qp->dp_frozen = false;
@@ -913,10 +919,22 @@ void rxe_qp_resume(struct rxe_qp *qp)
 		qp->req.wait_for_rnr_timer = 0;
 		spin_unlock_irqrestore(&qp->state_lock, flags);
 		rxe_sched_task(&qp->send_task);
+		kick_send = true;
 	}
 
-	if (!skb_queue_empty(&qp->req_pkts))
+	if (!skb_queue_empty(&qp->req_pkts)) {
 		rxe_sched_task(&qp->recv_task);
+		kick_recv = true;
+	}
+
+	rxe_dbg_qp(qp,
+		   "thaw: state=%d sq(prod=%u cons=%u) kick_send=%d kick_recv=%d\n",
+		   qp_state(qp),
+		   qp->sq.queue ?
+			queue_get_producer(qp->sq.queue, qp->sq.queue->type) : 0,
+		   qp->sq.queue ?
+			queue_get_consumer(qp->sq.queue, qp->sq.queue->type) : 0,
+		   kick_send, kick_recv);
 }
 
 /* move the qp to the error state */
