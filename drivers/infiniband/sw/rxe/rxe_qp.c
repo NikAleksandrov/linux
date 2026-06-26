@@ -571,6 +571,24 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	atomic_set(&qp->ssn, req->ssn);
 
 	/*
+	 * Responder continuity scalars. These describe where the responder
+	 * sits in the *peer's* request stream (mid multi-packet message,
+	 * last ack/nak emitted), so they are independent of whether the
+	 * local SQ was in-flight: a drained / pure-responder QP still needs
+	 * them. Restore unconditionally here rather than in
+	 * rxe_qp_restore_inflight() (which only runs when an SQ/RQ/res image
+	 * tail is present). Without resp.opcode in particular, a peer
+	 * replaying a multi-packet RDMA WRITE/SEND hits check_op_seq() with
+	 * resp.opcode == OPCODE_NONE -> RESPST_ERR_MISSING_OPCODE_FIRST ->
+	 * AETH_NAK_INVALID_REQ, completing the peer's WQE with
+	 * IB_WC_REM_INV_REQ_ERR.
+	 */
+	qp->resp.ack_psn	 = req->resp_ack_psn & BTH_PSN_MASK;
+	qp->resp.opcode		 = req->resp_opcode;
+	qp->resp.status		 = req->resp_status;
+	qp->resp.aeth_syndrome	 = req->resp_aeth_syndrome;
+
+	/*
 	 * Seed the freshly-created ring cursors to the source base so the
 	 * shared-page producer/consumer that userspace reads agree with
 	 * qp->req.wqe_index. The drained restore path (cursor-only, no image
@@ -647,12 +665,12 @@ int rxe_qp_restore_inflight(struct rxe_qp *qp,
 		qp->resp.res_tail = req->res_tail;
 	}
 
-	/* responder scalars not covered by rxe_qp_restore_wire_state */
-	qp->resp.ack_psn	= req->resp_ack_psn & BTH_PSN_MASK;
-	qp->resp.opcode		= req->resp_opcode;
-	qp->resp.status		= req->resp_status;
-	qp->resp.aeth_syndrome	= req->resp_aeth_syndrome;
-
+	/*
+	 * Responder continuity scalars (resp.opcode/ack_psn/status/
+	 * aeth_syndrome) are restored unconditionally in
+	 * rxe_qp_restore_wire_state() -- they are needed even on the drained
+	 * path, so they must not be gated on an image tail being present.
+	 */
 	return 0;
 }
 
