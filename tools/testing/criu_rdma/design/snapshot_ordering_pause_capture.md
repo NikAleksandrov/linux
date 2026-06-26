@@ -328,3 +328,49 @@ The in-flight rxe QP *capture* (the variable-length ring + resp.resources
 serialization) is a separate, larger job tracked in
 `design/rxe_inflight_qp_restore.md`; it depends on Part B being the
 consistency point but is otherwise orthogonal.
+
+## Known limitation (PARKED): post-restore reg_mr hangs in UMR on mlx5 VFs
+
+Observed in `rdma_test_agent_vfmig_criu_swap_after_context`: after a vfmig
+CRIU swap onto a host-bound VF (`mlx5_core`-bound, with a netdev + RDMA
+device), the restored agent's first `ibv_reg_mr` wedges forever in
+`mlx5r_umr_post_send_wait()` and the process is stuck in uninterruptible
+`D` (SIGKILL has no effect). A later `sriov_numvfs=0` then also wedges in
+`synchronize_srcu()` (`uverbs_disassociate_api_pre` -> `ib_uverbs_remove_one`)
+-- but that teardown hang is purely secondary: `ib_unregister_device()` is
+waiting on the uverbs SRCU read lock held by the stuck `reg_mr` ioctl. Fix
+the primary and the teardown clears.
+
+What it is NOT (ruled out from the `-b -1` journal):
+- Not a resume-ordering / still-parked VHCA bug. The LOAD path logs
+  `applied N bytes of LOAD state to vf 0 (vhca_id 0x...); resumed` every
+  iteration -- the VHCA reaches firmware `RUNNING` before userspace runs.
+- Not a teardown/SR-IOV-disable bug.
+- Unrelated to the rxe work.
+
+Root cause: this is the Stage-1 MKEY/UAR reconstitution gap. `reg_user_mr`
+on a restored VF runs `create_real_mr -> mlx5r_umr_update_mr_pas ->
+mlx5r_umr_post_send_wait()`, which programs the MR translation by posting a
+WQE on the kernel UMR QP and ringing a UAR doorbell. On a restored VF the
+UMR/UAR/MKEY translation resources are not reconstituted coherently with the
+`LOAD_VHCA_STATE`'d firmware, so the WQE never completes. `umr.c`'s
+`wait_for_completion()` is untimed, hence the permanent `D` state; the VF
+then trips `poll_health` "Fatal error 3" (`MLX5_SENSOR_NIC_DISABLED`) and
+`DEALLOC_UAR` fails with `bad resource state(0x9)`. This is exactly the
+`FIXME(stage2+)` in `core/dev.c` / `core/en_tx.c` ("rebuild kernel MKEYs
+against destination IOVAs"); the old `en_tx.c` claim that userspace verbs
+are "unaffected" was wrong and has been corrected.
+
+Fix class (Stage 2, not yet scoped): on LOAD, rebuild/rebind the kernel
+MKEY + UAR + translation state against destination IOVAs so the UMR datapath
+is coherent before userspace touches it.
+
+Defense-in-depth (optional, separate decision): bound the UMR wait so a
+restored-VF `reg_mr` fails cleanly (`-ETIMEDOUT`/`-EIO`) instead of wedging
+the uverbs fd -> SRCU -> sriov teardown. Note this touches core mlx5 UMR
+shared by all devices, so it needs care and is not part of this parking.
+
+Next-time triage: full dmesg of the hung iteration -- expect `Fatal error 3`
++ `DEALLOC_UAR ... bad resource state` to land around the `reg_mr`; the
+kernel stack is `mlx5r_umr_post_send_wait <- _mlx5r_umr_update_mr_pas <-
+create_real_mr <- mlx5_ib_reg_user_mr <- ib_uverbs_reg_mr`.

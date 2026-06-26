@@ -695,10 +695,22 @@ netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev)
 	 *
 	 * We re-enable mlx5e on restored VFs (so the netdev exists and
 	 * RoCE GIDs flow naturally from `ip addr add`) but keep the data
-	 * path inert: drop every TX silently. Userspace RC QPs created
-	 * post-restore use their own MKEYs (allocated via mlx5_ib's
-	 * reg_user_mr against fresh registry entries) and have a separate
-	 * data path; they are NOT affected.
+	 * path inert: drop every TX silently.
+	 *
+	 * WARNING: this does NOT make userspace RDMA verbs safe. A
+	 * post-restore reg_user_mr goes through create_real_mr ->
+	 * mlx5r_umr_update_mr_pas -> mlx5r_umr_post_send_wait(), which
+	 * programs the MR's translation by posting a WQE on the kernel
+	 * UMR QP and ringing a UAR doorbell. On a restored VF the UMR /
+	 * UAR / MKEY translation resources are NOT reconstituted coherently
+	 * with the LOAD_VHCA_STATE'd firmware, so that WQE never completes:
+	 * mlx5r_umr_post_send_wait()'s untimed wait_for_completion() hangs
+	 * the caller in D state forever and the VF subsequently trips
+	 * poll_health "Fatal error 3" (MLX5_SENSOR_NIC_DISABLED) with
+	 * DEALLOC_UAR failing "bad resource state". The fix is the same
+	 * Stage-2 MKEY/UAR reconstitution called out below; until then any
+	 * UMR-driven verb (reg_mr/rereg_mr/large/ODP MRs) on a restored VF
+	 * is unsafe. See design/snapshot_ordering_pause_capture.md.
 	 *
 	 * Drop returns NETDEV_TX_OK so the stack never retries: ARP
 	 * entries cycle quietly, TCP retransmits "succeed" silently,
@@ -726,7 +738,7 @@ netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev)
 	 */
 	if (unlikely(mlx5_vf_is_restored(priv->mdev))) {
 		netdev_warn_once(dev,
-				 "vfmig: TX disabled on restored VF (Stage 1: kernel netdev MKEYs not rebound; userspace RDMA verbs unaffected)\n");
+				 "vfmig: TX disabled on restored VF (Stage 1: kernel MKEYs/UARs not rebound; UMR-driven verbs e.g. reg_mr are also unsafe and may hang)\n");
 		dev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
