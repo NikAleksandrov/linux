@@ -561,7 +561,7 @@ static int subtest_query_cq(struct ibv_context *ctx, struct rc_qp *p)
 	struct rxe_query_cq_resp_local blob = {};
 	int ret, fails = 0;
 
-	printf("[2] QUERY_CQ field fidelity (vm_pgoff + cqe)\n");
+	printf("[2] QUERY_CQ field fidelity (vm_pgoff + cqe + cursors)\n");
 
 	ret = do_migrate_query_cq(ctx->cmd_fd, p->cq->handle, &blob);
 	if (ret) {
@@ -592,7 +592,16 @@ static int subtest_query_cq(struct ibv_context *ctx, struct rc_qp *p)
 	      blob.cqe, p->cq->cqe);
 	CHECK(blob.vm_pgoff != 0, "vm_pgoff=0x%llx (non-zero user ring)",
 	      (unsigned long long)blob.vm_pgoff);
-	CHECK(blob.reserved == 0, "reserved=0");
+	/*
+	 * Fresh, never-posted CQ: both cursors sit at 0 and the CQE slot
+	 * region is non-empty (queue_data_size of the rounded ring). These
+	 * are the RESTORE_CQ inputs that round-trip the in-flight ring.
+	 */
+	CHECK(blob.producer == 0, "producer=%u (fresh CQ)", blob.producer);
+	CHECK(blob.consumer == 0, "consumer=%u (fresh CQ)", blob.consumer);
+	CHECK(blob.cqe_image_bytes != 0, "cqe_image_bytes=%u (non-zero ring)",
+	      blob.cqe_image_bytes);
+	CHECK(blob.reserved[0] == 0 && blob.reserved[1] == 0, "reserved=0");
 #undef CHECK
 
 	/* bogus handle must be rejected, mirroring QUERY_QP. */
