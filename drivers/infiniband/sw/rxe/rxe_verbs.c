@@ -1537,6 +1537,20 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 		goto err_cleanup;
 	}
 
+	/*
+	 * CRIU (S6a): the restored CQ is created empty; its pending CQEs and
+	 * producer/consumer are expected to arrive via the dumped CQ VMA being
+	 * written back into the mmap aliased at forced_vm_pgoff. Log the depth,
+	 * whether a source pgoff was plumbed (0 => the mmap cannot alias the
+	 * source page, so poll_cq won't see restored completions), and the
+	 * fresh ring cursors as a baseline. Cold path, dynamic-debug gated.
+	 */
+	rxe_dbg_cq(cq,
+		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx q(prod=%u cons=%u)\n",
+		   attr->cqe, (unsigned long long)forced_vm_pgoff,
+		   cq->queue ? queue_get_producer(cq->queue, QUEUE_TYPE_TO_ULP) : 0,
+		   cq->queue ? queue_get_consumer(cq->queue, QUEUE_TYPE_TO_ULP) : 0);
+
 	return 0;
 
 err_cleanup:
