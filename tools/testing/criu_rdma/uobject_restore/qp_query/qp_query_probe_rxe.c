@@ -109,12 +109,16 @@ struct ib_uverbs_ioctl_hdr {
 
 #define RXE_IB_ATTR_QUERY_CQ_HANDLE	(1u << UVERBS_ID_NS_SHIFT)
 #define RXE_IB_ATTR_QUERY_CQ_RESP_BLOB	((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE ((1u << UVERBS_ID_NS_SHIFT) + 2u)
 
 /* Mirror of include/uapi/rdma/rdma_user_rxe.h struct rxe_query_cq_resp. */
 struct rxe_query_cq_resp_local {
 	uint64_t	vm_pgoff;
 	uint32_t	cqe;
-	uint32_t	reserved;
+	uint32_t	producer;
+	uint32_t	consumer;
+	uint32_t	cqe_image_bytes;
+	uint32_t	reserved[2];
 };
 
 /*

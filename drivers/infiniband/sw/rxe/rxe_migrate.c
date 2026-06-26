@@ -62,14 +62,14 @@
 #include <rdma/uverbs_named_ioctl.h>
 
 /*
- * Emit one optional variable-length image attr on QUERY_QP. The dumper
- * provides the output buffer; it learns the authoritative byte length
- * from the rxe_restore_qp_req blob and round-trips the bytes opaquely.
- * Absent attr (dumper didn't ask) or zero-length image is a no-op; a
- * provided-but-too-small buffer is a hard error (no silent truncation).
+ * Emit one optional variable-length image attr on QUERY_QP / QUERY_CQ. The
+ * dumper provides the output buffer; it learns the authoritative byte length
+ * from the resp blob and round-trips the bytes opaquely. Absent attr (dumper
+ * didn't ask) or zero-length image is a no-op; a provided-but-too-small
+ * buffer is a hard error (no silent truncation).
  */
-static int rxe_query_qp_emit_image(struct uverbs_attr_bundle *attrs,
-				   u16 attr_id, const void *data, u32 len)
+static int rxe_query_emit_image(struct uverbs_attr_bundle *attrs,
+				u16 attr_id, const void *data, u32 len)
 {
 	int user_len;
 
@@ -302,14 +302,14 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	if (err)
 		return err;
 
-	err = rxe_query_qp_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+	err = rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
 				      qp->sq.queue->buf->data,
 				      blob.sq_image_bytes);
 	if (err)
 		return err;
 
 	if (blob.rq_image_bytes) {
-		err = rxe_query_qp_emit_image(attrs,
+		err = rxe_query_emit_image(attrs,
 					      RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
 					      qp->rq.queue->buf->data,
 					      blob.rq_image_bytes);
@@ -318,7 +318,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	}
 
 	if (blob.res_image_bytes) {
-		err = rxe_query_qp_emit_image(attrs,
+		err = rxe_query_emit_image(attrs,
 					      RXE_IB_ATTR_QUERY_QP_RESP_RES,
 					      qp->resp.resources,
 					      blob.res_image_bytes);
@@ -336,6 +336,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 		attrs, RXE_IB_ATTR_QUERY_CQ_HANDLE);
 	struct rxe_query_cq_resp blob = {};
 	struct rxe_cq *cq;
+	int err;
 
 	if (IS_ERR(ibcq))
 		return PTR_ERR(ibcq);
@@ -349,8 +350,31 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	blob.vm_pgoff = cq->queue->ip->info.offset;
 	blob.cqe      = ibcq->cqe;
 
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
-			      &blob, sizeof(blob));
+	/*
+	 * In-flight CQE ring round-trip (mirrors QUERY_QP). FREEZE_CONTEXT
+	 * only pauses QP tasks (it walks the QP pool), so the CQ itself is
+	 * not datapath-frozen; an unfrozen producer (e.g. a QP in another
+	 * ucontext sharing this CQ) could advance the cursor under us. Take
+	 * cq_lock just long enough to snapshot the two cursors coherently,
+	 * then drop it -- cq_lock is an irqsave spinlock and the blob/image
+	 * copies below fault to userspace and can sleep, so they must not run
+	 * under it. In the real CRIU flow the dumpee is stopped and all its
+	 * feeding QPs are frozen, so the ring is quiescent and the post-drop
+	 * image read is stable; the lock just closes the cross-context race.
+	 */
+	blob.cqe_image_bytes = queue_data_size(cq->queue);
+	spin_lock_irq(&cq->cq_lock);
+	blob.producer = queue_get_producer(cq->queue, cq->queue->type);
+	blob.consumer = queue_get_consumer(cq->queue, cq->queue->type);
+	spin_unlock_irq(&cq->cq_lock);
+
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
+
+	return rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE,
+				    cq->queue->buf->data, blob.cqe_image_bytes);
 }
 
 DECLARE_UVERBS_NAMED_METHOD(
@@ -399,7 +423,10 @@ DECLARE_UVERBS_NAMED_METHOD(
 			UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
 			    UVERBS_ATTR_TYPE(struct rxe_query_cq_resp),
-			    UA_MANDATORY));
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL));
 
 DECLARE_UVERBS_GLOBAL_METHODS(
 	RXE_IB_OBJECT_MIGRATE,

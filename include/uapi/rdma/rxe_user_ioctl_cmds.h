@@ -95,6 +95,13 @@ enum rxe_ib_query_qp_attrs {
 enum rxe_ib_query_cq_attrs {
 	RXE_IB_ATTR_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
+	/*
+	 * In-flight CQE ring image (optional): variable-length raw byte
+	 * region appended on QUERY_CQ. Length is reported in
+	 * rxe_query_cq_resp::cqe_image_bytes. Absent/zero-length for an
+	 * empty CQ. Mirrors RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE.
+	 */
+	RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE,
 };
 
 #endif

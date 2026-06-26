@@ -52,7 +52,17 @@
  *      kernel-side QP children at v0. (mlx5 S5b's analogous subtest
  *      8 will assert the inverse -- BAD_RES_STATE -- since mlx5 FW
  *      tracks cqn in QPCs as a tracked dep; design §10.8.)
+ *   8. In-flight CQE ring round-trip. RESTORE_CQ ships the ring bytes
+ *      + producer/consumer cursors (the QP SQ/RQ image path applied to
+ *      the CQ); QUERY_CQ reads them straight back. Asserts the cursors
+ *      and the CQE image are byte-identical, and -- via the producer
+ *      readback -- that the seed used the TO_CLIENT-direction
+ *      rxe_cq_seed_ring (q->index = producer), not rxe_qp_seed_ring
+ *      (q->index = consumer), which would clobber slot 0 on the next
+ *      rxe_cq_post. This is the kernel half of the CRIU fix for the
+ *      lost-CQE live-lock (the ring VMA CRIU never snapshots).
  *
+
  * Run on any host with CONFIG_RDMA_RXE=m. No root needed if the
  * caller is in the rdma group (or /dev/infiniband/uverbsN is
  * world-rw). Tested against rxe0 over loopback.
@@ -175,6 +185,36 @@ enum {
  * doesn't expose this through libibverbs.
  */
 #define UVERBS_ATTR_UHW_OUT			((uint16_t)4097)
+#define UVERBS_ATTR_UHW_IN			((uint16_t)4096)
+
+#define UVERBS_ID_NS_SHIFT			12
+#define UVERBS_ID_DRIVER_NS			(1u << UVERBS_ID_NS_SHIFT)
+
+/* Mirror of include/uapi/rdma/rxe_user_ioctl_cmds.h (driver-private). */
+#define RXE_IB_OBJECT_MIGRATE			(UVERBS_ID_DRIVER_NS + 0u)
+#define RXE_IB_METHOD_QUERY_CQ			((1u << UVERBS_ID_NS_SHIFT) + 2u)
+#define RXE_IB_ATTR_QUERY_CQ_HANDLE		(1u << UVERBS_ID_NS_SHIFT)
+#define RXE_IB_ATTR_QUERY_CQ_RESP_BLOB		((1u << UVERBS_ID_NS_SHIFT) + 1u)
+#define RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE	((1u << UVERBS_ID_NS_SHIFT) + 2u)
+
+/* Mirror of include/uapi/rdma/rdma_user_rxe.h struct rxe_query_cq_resp. */
+struct rxe_query_cq_resp_local {
+	uint64_t	vm_pgoff;
+	uint32_t	cqe;
+	uint32_t	producer;
+	uint32_t	consumer;
+	uint32_t	cqe_image_bytes;
+	uint32_t	reserved[2];
+};
+
+/* Mirror of include/uapi/rdma/rdma_user_rxe.h struct rxe_restore_cq_req. */
+struct rxe_restore_cq_req_local {
+	uint64_t	vm_pgoff;
+	uint32_t	producer;
+	uint32_t	consumer;
+	uint32_t	cqe_image_bytes;
+	uint32_t	reserved;
+};
 
 /*
  * Mirrors include/uapi/rdma/rdma_user_rxe.h's struct rxe_create_cq_resp
@@ -200,6 +240,7 @@ struct rxe_create_cq_resp_local {
 
 #define TARGET_HANDLE				0x4242u
 #define TARGET_HANDLE_2				0x4243u
+#define TARGET_HANDLE_3				0x4244u
 #define USER_HANDLE_TAG				0xDEADBEEFCAFEBABEull
 #define CQE_REQUESTED				64u
 
@@ -367,6 +408,140 @@ static int do_restore_cq(int fd, uint32_t target_handle, uint32_t cqe,
 	cmd.attrs[n].flags	= 0;
 	cmd.attrs[n].data	= (uintptr_t)&uhw_out;
 	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * RESTORE_CQ with an in-flight CQE ring image. Same core attrs as
+ * do_restore_cq, plus a UHW_IN tail carrying [rxe_restore_cq_req][image].
+ * @vm_pgoff is left 0 (monotonic fallback) -- the round-trip checks
+ * cursors + ring bytes via QUERY_CQ and never mmaps, so the forced offset
+ * is irrelevant here. @image may be NULL/@image_len 0 for the cursor-only
+ * (empty-CQ) variant.
+ */
+static int do_restore_cq_inflight(int fd, uint32_t target_handle, uint32_t cqe,
+				  uint32_t producer, uint32_t consumer,
+				  const void *image, uint32_t image_len,
+				  uint32_t *resp_cqe_out)
+{
+	struct rxe_create_cq_resp_local uhw_out = {};
+	struct rxe_restore_cq_req_local *req;
+	uint8_t *inbuf;
+	size_t inlen = sizeof(*req) + image_len;
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[7];
+	} cmd = {};
+	unsigned int n = 0;
+	int ret;
+
+	inbuf = calloc(1, inlen);
+	if (!inbuf)
+		return -ENOMEM;
+	req = (struct rxe_restore_cq_req_local *)inbuf;
+	req->producer        = producer;
+	req->consumer        = consumer;
+	req->cqe_image_bytes = image_len;
+	if (image && image_len)
+		memcpy(inbuf + sizeof(*req), image, image_len);
+
+	cmd.hdr.object_id	= UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id	= UVERBS_METHOD_RESTORE_CQ;
+	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_HANDLE;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= target_handle;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_CQE;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= cqe;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_USER_HANDLE;
+	cmd.attrs[n].len	= sizeof(uint64_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= USER_HANDLE_TAG;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= 0;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_RESP_CQE;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= (uintptr_t)resp_cqe_out;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_UHW_IN;
+	cmd.attrs[n].len	= (uint16_t)inlen;
+	cmd.attrs[n].flags	= 0;
+	cmd.attrs[n].data	= (uintptr_t)inbuf;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_UHW_OUT;
+	cmd.attrs[n].len	= sizeof(uhw_out);
+	cmd.attrs[n].flags	= 0;
+	cmd.attrs[n].data	= (uintptr_t)&uhw_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	ret = ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0 ? -errno : 0;
+	free(inbuf);
+	return ret;
+}
+
+/*
+ * QUERY_CQ (driver-private RXE_IB_OBJECT_MIGRATE). Reads the blob and, when
+ * @image_out is provided, the CQE ring image into it (capacity @image_cap).
+ */
+static int do_query_cq(int fd, uint32_t cq_handle,
+		       struct rxe_query_cq_resp_local *blob_out,
+		       void *image_out, uint32_t image_cap)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[3];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id	= RXE_IB_OBJECT_MIGRATE;
+	cmd.hdr.method_id	= RXE_IB_METHOD_QUERY_CQ;
+	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
+
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_CQ_HANDLE;
+	cmd.attrs[n].len	= 0;
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= cq_handle;
+	n++;
+
+	cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_CQ_RESP_BLOB;
+	cmd.attrs[n].len	= sizeof(*blob_out);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= (uintptr_t)blob_out;
+	n++;
+
+	if (image_out && image_cap) {
+		cmd.attrs[n].attr_id	= RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE;
+		cmd.attrs[n].len	= (uint16_t)image_cap;
+		cmd.attrs[n].flags	= 0;
+		cmd.attrs[n].data	= (uintptr_t)image_out;
+		n++;
+	}
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
@@ -1005,6 +1180,136 @@ static int subtest_destroy_round_trip(int fd)
 	return 0;
 }
 
+/*
+ * [8] In-flight CQE ring round-trip. RESTORE_CQ ships the ring bytes +
+ * cursors (the QP SQ/RQ image path, applied to the CQ), QUERY_CQ reads them
+ * straight back. We validate the new kernel paths end to end:
+ *   - QUERY_CQ emits producer/consumer/cqe_image_bytes + the CQE image;
+ *   - RESTORE_CQ blits the image (rxe_restore_cq_inflight) and seeds the
+ *     cursors via the TO_CLIENT-direction rxe_cq_seed_ring;
+ *   - the producer readback proves q->index was seeded from the *producer*
+ *     (not the consumer) -- the exact clobber bug that reusing
+ *     rxe_qp_seed_ring would introduce.
+ * A full "next rxe_cq_post lands at slot==producer" check needs a live QP
+ * datapath (out of scope for a raw-cdev probe); the producer readback is the
+ * proxy, since q->index==producer is precisely what makes the next post land.
+ */
+static int subtest_inflight_round_trip(int fd)
+{
+	struct rxe_query_cq_resp_local blob = {};
+	const uint32_t producer = 5, consumer = 2;
+	uint32_t resp_cqe = 0;
+	uint32_t image_bytes;
+	uint8_t *src = NULL, *dst = NULL;
+	int ret, fails = 0;
+
+	printf("[8] in-flight round-trip: RESTORE_CQ(image+cursors) -> QUERY_CQ byte-identical\n");
+
+	/*
+	 * Learn the authoritative ring geometry from a freshly-created CQ:
+	 * the kernel rounds cqe / elem_size, so cqe_image_bytes can't be
+	 * computed here.
+	 */
+	ret = do_restore_cq(fd, TARGET_HANDLE_3, CQE_REQUESTED, USER_HANDLE_TAG,
+			    0, -1, &resp_cqe);
+	if (ret) {
+		fprintf(stderr, "  FAIL seed RESTORE_CQ(0x%x): %s\n",
+			TARGET_HANDLE_3, strerror(-ret));
+		return 1;
+	}
+	ret = do_query_cq(fd, TARGET_HANDLE_3, &blob, NULL, 0);
+	if (ret) {
+		fprintf(stderr, "  FAIL QUERY_CQ(0x%x): %s%s\n", TARGET_HANDLE_3,
+			strerror(-ret),
+			ret == -EOPNOTSUPP ? "  (QUERY_CQ not registered?)" : "");
+		do_destroy_cq(fd, TARGET_HANDLE_3);
+		return 1;
+	}
+	image_bytes = blob.cqe_image_bytes;
+	if (image_bytes == 0) {
+		fprintf(stderr, "  FAIL QUERY_CQ reported cqe_image_bytes=0\n");
+		do_destroy_cq(fd, TARGET_HANDLE_3);
+		return 1;
+	}
+	if (blob.producer != 0 || blob.consumer != 0) {
+		fprintf(stderr,
+			"  FAIL fresh CQ cursors not zero (prod=%u cons=%u)\n",
+			blob.producer, blob.consumer);
+		fails++;
+	}
+	printf("  PASS QUERY_CQ(fresh) cqe=%u image_bytes=%u prod=0 cons=0\n",
+	       blob.cqe, image_bytes);
+
+	/* Re-mint at the same handle with a synthetic image + cursors. */
+	(void)do_destroy_cq(fd, TARGET_HANDLE_3);
+
+	src = malloc(image_bytes);
+	dst = malloc(image_bytes);
+	if (!src || !dst) {
+		fprintf(stderr, "  FAIL malloc image buffers\n");
+		free(src);
+		free(dst);
+		return 1;
+	}
+	for (uint32_t i = 0; i < image_bytes; i++)
+		src[i] = (uint8_t)(i * 7u + 0x11u);
+
+	ret = do_restore_cq_inflight(fd, TARGET_HANDLE_3, CQE_REQUESTED,
+				     producer, consumer, src, image_bytes,
+				     &resp_cqe);
+	if (ret) {
+		fprintf(stderr, "  FAIL RESTORE_CQ(image): %s\n", strerror(-ret));
+		free(src);
+		free(dst);
+		return 1;
+	}
+
+	memset(&blob, 0, sizeof(blob));
+	ret = do_query_cq(fd, TARGET_HANDLE_3, &blob, dst, image_bytes);
+	if (ret) {
+		fprintf(stderr, "  FAIL QUERY_CQ(restored): %s\n", strerror(-ret));
+		do_destroy_cq(fd, TARGET_HANDLE_3);
+		free(src);
+		free(dst);
+		return 1;
+	}
+
+	if (blob.producer != producer || blob.consumer != consumer) {
+		fprintf(stderr,
+			"  FAIL cursor mismatch: got prod=%u cons=%u want prod=%u cons=%u\n"
+			"       (producer readback proves q->index seeded from producer;\n"
+			"       reusing rxe_qp_seed_ring would report producer=%u)\n",
+			blob.producer, blob.consumer, producer, consumer, consumer);
+		fails++;
+	} else {
+		printf("  PASS cursors round-tripped: prod=%u cons=%u\n",
+		       blob.producer, blob.consumer);
+	}
+
+	if (blob.cqe_image_bytes != image_bytes) {
+		fprintf(stderr, "  FAIL image_bytes mismatch: got %u want %u\n",
+			blob.cqe_image_bytes, image_bytes);
+		fails++;
+	} else if (memcmp(src, dst, image_bytes) != 0) {
+		uint32_t i;
+
+		for (i = 0; i < image_bytes && src[i] == dst[i]; i++)
+			;
+		fprintf(stderr,
+			"  FAIL CQE ring image differs at byte %u (src=0x%02x dst=0x%02x)\n",
+			i, src[i], dst[i]);
+		fails++;
+	} else {
+		printf("  PASS CQE ring image byte-identical (%u bytes)\n",
+		       image_bytes);
+	}
+
+	(void)do_destroy_cq(fd, TARGET_HANDLE_3);
+	free(src);
+	free(dst);
+	return fails;
+}
+
 /* ----------------------- main -------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -1042,6 +1347,7 @@ int main(int argc, char **argv)
 	fails += subtest_comp_channel_rejected(fd_restore);
 	fails += subtest_nldev_handle_match(ibdev);
 	fails += subtest_destroy_round_trip(fd_restore);
+	fails += subtest_inflight_round_trip(fd_restore);
 
 	close(fd_restore);
 

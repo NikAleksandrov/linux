@@ -726,6 +726,42 @@ out:
 	return err;
 }
 
+/*
+ * CRIU in-flight CQ restore: blit the captured CQE ring image into the
+ * freshly-created ring. Mirrors rxe_restore_qp_inflight, but a CQ has a
+ * single ring so there is one image. The image geometry must match what
+ * rxe_cq_from_init just built; a mismatch is rejected rather than silently
+ * corrupting the ring. The caller seeds the cursors (rxe_cq_seed_ring) once
+ * this returns -- the producer/consumer live in the ring header, disjoint
+ * from buf->data, so blit order does not matter.
+ */
+static int rxe_restore_cq_inflight(struct rxe_cq *cq,
+				   const struct rxe_restore_cq_req *req,
+				   struct ib_udata *udata)
+{
+	const size_t hdr = sizeof(*req);
+	void *buf;
+	int err;
+
+	if (queue_data_size(cq->queue) != req->cqe_image_bytes)
+		return -EINVAL;
+	if (udata->inlen != hdr + req->cqe_image_bytes)
+		return -EINVAL;
+
+	buf = kvmalloc(udata->inlen, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	err = ib_copy_from_udata(buf, udata, udata->inlen);
+	if (err)
+		goto out;
+
+	memcpy(cq->queue->buf->data, buf + hdr, req->cqe_image_bytes);
+out:
+	kvfree(buf);
+	return err;
+}
+
 static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 			  const struct ib_qp_cap *cap,
 			  enum ib_qp_state qp_state, u32 create_flags,
@@ -1538,18 +1574,45 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	}
 
 	/*
-	 * CRIU (S6a): the restored CQ is created empty; its pending CQEs and
-	 * producer/consumer are expected to arrive via the dumped CQ VMA being
-	 * written back into the mmap aliased at forced_vm_pgoff. Log the depth,
-	 * whether a source pgoff was plumbed (0 => the mmap cannot alias the
-	 * source page, so poll_cq won't see restored completions), and the
-	 * fresh ring cursors as a baseline. Cold path, dynamic-debug gated.
+	 * CRIU (S6a): round-trip the in-flight CQE ring. The CQ ring is a
+	 * shared cdev VMA that CRIU does not snapshot, so unreaped CQEs and the
+	 * cursors are shipped through QUERY_CQ/RESTORE_CQ instead (mirrors the
+	 * QP SQ/RQ image path). The cursors are validated and seeded
+	 * unconditionally (cheap, and correct for a wrapped-but-empty ring);
+	 * the ring image, when present (cqe_image_bytes > 0 and an UHW_IN tail),
+	 * is blitted first. The user CQ ring is QUEUE_TYPE_TO_CLIENT so the seed
+	 * goes through rxe_cq_seed_ring (kernel-owned producer), NOT
+	 * rxe_qp_seed_ring -- see the helper for why reuse would clobber slot 0.
+	 */
+	if (req.producer > cq->queue->index_mask ||
+	    req.consumer > cq->queue->index_mask) {
+		err = -EINVAL;
+		rxe_dbg_cq(cq, "restore cq: cursor out of range (prod=%u cons=%u mask=%u)\n",
+			   req.producer, req.consumer, cq->queue->index_mask);
+		goto err_cleanup;
+	}
+
+	if (req.cqe_image_bytes) {
+		err = rxe_restore_cq_inflight(cq, &req, udata);
+		if (err) {
+			rxe_dbg_cq(cq, "restore cq image failed, err = %d\n", err);
+			goto err_cleanup;
+		}
+	}
+
+	rxe_cq_seed_ring(cq->queue, req.producer, req.consumer);
+
+	/*
+	 * Cold-path, dynamic-debug gated: log the geometry, whether a source
+	 * pgoff was plumbed (0 => the mmap cannot alias the source page) and
+	 * the seeded cursors (read in the ring's own TO_CLIENT direction).
 	 */
 	rxe_dbg_cq(cq,
-		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx q(prod=%u cons=%u)\n",
+		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx image_bytes=%u q(prod=%u cons=%u)\n",
 		   attr->cqe, (unsigned long long)forced_vm_pgoff,
-		   cq->queue ? queue_get_producer(cq->queue, QUEUE_TYPE_TO_ULP) : 0,
-		   cq->queue ? queue_get_consumer(cq->queue, QUEUE_TYPE_TO_ULP) : 0);
+		   req.cqe_image_bytes,
+		   queue_get_producer(cq->queue, cq->queue->type),
+		   queue_get_consumer(cq->queue, cq->queue->type));
 
 	return 0;
 

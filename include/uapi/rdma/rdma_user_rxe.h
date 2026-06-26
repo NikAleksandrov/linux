@@ -230,19 +230,42 @@ struct rxe_resize_cq_resp {
  * rxe_create_cq_resp::mi.offset returned via UHW_OUT equals
  * @vm_pgoff.
  *
+ * In-flight CQ ring round-trip (mirrors rxe_restore_qp_req + SQ image).
+ * A CQ ring is a shared cdev-file VMA that CRIU does not snapshot, so the
+ * unreaped CQEs and the producer/consumer cursors present at checkpoint
+ * are otherwise lost (post-restore ibv_poll_cq returns nothing and a
+ * polling client live-locks). The dumper sources these from QUERY_CQ and
+ * replays them here:
+ *   @producer / @consumer  the source ring cursors. The user CQ ring is
+ *       QUEUE_TYPE_TO_CLIENT, so the producer is kernel-owned (q->index,
+ *       mirrored to buf->producer_index) and the consumer is client-owned
+ *       (buf->consumer_index) -- the opposite ownership to the SQ/RQ. The
+ *       destination seeds them via rxe_cq_seed_ring() (NOT rxe_qp_seed_ring,
+ *       which seeds q->index from the consumer and would make the next
+ *       rxe_cq_post clobber slot 0).
+ *   @cqe_image_bytes  byte length of the CQE slot region
+ *       (queue_data_size(cq->queue)). The CQE ring image is appended to the
+ *       UHW_IN tail after this fixed struct, located by @cqe_image_bytes,
+ *       exactly like rxe_restore_qp_req + SQ image. Zero => empty-CQ fast
+ *       path (no blit). The destination validates it against the
+ *       freshly-created ring geometry (-EINVAL on mismatch).
+ *
  * Size note: must stay strictly larger than sizeof(__u64) (== 8B).
  * The uverbs ioctl bundle treats UHW_IN attrs with len <= 8 as
  * inline (the kernel reuses the bundle's data slot itself as the
  * inbuf), which clobbers @vm_pgoff with whatever value userspace
  * happened to put in struct ib_uverbs_attr::data (a pointer to
- * this struct, in the natural calling convention). The reserved
- * tail forces sizeof(struct rxe_restore_cq_req) > 8 so the
- * dispatcher takes the pointer path and copy_from_user reads the
- * real userspace buffer. Future fields can claim @reserved[].
+ * this struct, in the natural calling convention). The struct is
+ * sized > 8 so the dispatcher takes the pointer path and
+ * copy_from_user reads the real userspace buffer. @reserved must be
+ * 0 and backs forward-compat fields.
  */
 struct rxe_restore_cq_req {
 	__aligned_u64 vm_pgoff;
-	__aligned_u64 reserved;
+	__u32 producer;
+	__u32 consumer;
+	__u32 cqe_image_bytes;
+	__u32 reserved;
 };
 
 /*
@@ -260,16 +283,27 @@ struct rxe_restore_cq_req {
  *   @cqe       the CQ's user-visible entry count (cq->ibcq.cqe). Replayed
  *              into the RESTORE_CQ CQE method attr so the rebuilt ring has
  *              identical geometry (and thus identical mmap size).
+ *   @producer / @consumer  the live ring cursors (QUEUE_TYPE_TO_CLIENT:
+ *              producer == q->index, consumer == buf->consumer_index).
+ *              Replayed into rxe_restore_cq_req so the restored ring's
+ *              unreaped completions are visible to ibv_poll_cq.
+ *   @cqe_image_bytes  byte length of the CQE slot region
+ *              (queue_data_size(cq->queue)); the raw ring image follows in
+ *              the optional RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE attr.
  *
- * Sourcing both from this verb -- instead of scraping the cdev-VMA pgoff
- * from /proc/pid/smaps and the cqe from NLDEV -- makes CQ restore
- * VA-ordering-immune and symmetric with the QUERY_QP path, which is the
- * precondition for restoring a realistic PD + CQ(s) + QP(s) ufile.
+ * Sourcing these from this verb -- instead of scraping the cdev-VMA pgoff
+ * from /proc/pid/smaps and the cqe from NLDEV, and relying on a VMA
+ * write-back that never happens for the shared ring mapping -- makes CQ
+ * restore VA-ordering-immune and symmetric with the QUERY_QP path, which is
+ * the precondition for restoring a realistic PD + CQ(s) + QP(s) ufile.
  */
 struct rxe_query_cq_resp {
 	__aligned_u64 vm_pgoff;
 	__u32 cqe;
-	__u32 reserved;
+	__u32 producer;
+	__u32 consumer;
+	__u32 cqe_image_bytes;
+	__u32 reserved[2];
 };
 
 struct rxe_create_qp_resp {
