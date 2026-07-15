@@ -369,9 +369,12 @@ mlx5 (Part A, all green on FW 28.48.1000 / kernel 6.19-criu):
   bracket (SUSPEND(INITIATOR)+SUSPEND(RESPONDER) ... RESUME(RESPONDER)+
   RESUME(INITIATOR)) and all pass, exercising the new edges end-to-end.
 - Abort path: SUSPEND then RESUME with no SAVE in between (rollback).
-- Pending: the RUNNING_P2P hold-window probe on a host-bound VF
-  (Appendix D.4) -- not yet run; the directional harness soaks an unbound
-  VF only.
+- `save_load/test_running_p2p_hold_window.sh`: the RUNNING_P2P hold-window
+  probe on a *host-bound* VF (Appendix D.4). Parks VF0's initiator to
+  RUNNING_P2P (netdev down), holds quiescent, resumes, and reverifies the
+  datapath recovers via a bounded `ib_write_bw` both ways. Passing at
+  short holds; long-soak numbers still pending. Established the D.4
+  finding that the parked VF's own command ring must never be poked.
 
 rxe (Part B):
 - Extend `uverbs_ctx_holder` (CRIU side) with a peer that keeps pushing
@@ -698,3 +701,38 @@ long hold -- if so that is a driver change to spec *before* the barrier
 lands; and any host-bound vs VFIO-bound divergence. The CRIU side can
 supply the inbound-load generator (an `ib_write_bw --run_infinitely`
 config or a trimmed `rdma_test_agent` responder).
+
+Implemented as `save_load/test_running_p2p_hold_window.sh` (single-host,
+two VFs on one PF: VF0=DUT parked to RUNNING_P2P, VF1=peer). It runs a
+bounded `ib_write_bw` before and after the hold to prove the datapath
+works and recovers, and keys the anti-decay verdict on a clean
+`RESUME_VHCA(INITIATOR)` 1->0 after the soak (resume-initiator is only
+valid from RUNNING_P2P, so 1->0 proves the VHCA never silently decayed).
+
+#### D.4 findings so far
+
+- **A parked VF holds RUNNING_P2P cleanly.** Park DUT initiator (0->1),
+  hold quiescent (netdev down), resume (1->0), and the datapath fully
+  recovers in both directions -- no FW health syndrome, no TX timeout, no
+  FSM decay. Verified at short holds; the long-soak (60s/300s, loaded)
+  numbers are still to be filled in.
+
+- **Never poke the *parked* VF's own command ring.** Reading a DUT-side
+  FW counter (e.g. `hw_counters/rx_write_requests`, which issues a
+  `QUERY_Q_COUNTER` on the VF's *own* command ring) while it is at
+  RUNNING_P2P hangs the ring: the reader wedges in an unkillable D-state
+  FW-command wait (a `timeout` SIGKILL cannot reap it) and then stalls the
+  subsequent SR-IOV teardown -- a hard host wedge needing a reboot. This
+  is a device-context command on the VF; PF-issued *other_function*
+  commands (`SUSPEND/RESUME/QUERY_VF` on the PF cdev) are unaffected and
+  remain the safe way to observe a parked VF. Consequently the harness
+  and the future barrier must derive responder liveness from the **peer's
+  completions**, not from a DUT-side query, and `dp_state` polling must go
+  through the PF cdev (`query_vf`), never the VF's sysfs counters.
+
+- **Host-bound VFs must keep the netdev DOWN while parked** (Appendix B):
+  an admin-up netdev queues a stray Ethernet TX on the parked initiator's
+  SQ, which never drains and trips the TX watchdog every ~15s; tearing
+  that fragile VF down can then wedge in the uverbs-SRCU limitation. The
+  harness brings both VF netdevs down before parking and back up only for
+  the post-hold recovery check.
