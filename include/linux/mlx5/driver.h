@@ -525,6 +525,19 @@ enum {
 	MLX5_PF_NOTIFY_ENABLE_VF,
 };
 
+/*
+ * Datapath-quiesce state of a VF's VHCA on the firmware migration FSM's
+ * RUNNING <-> RUNNING_P2P <-> STOP ladder. Tracked persistently per VF in
+ * vfs_ctx[].vfmig_dp_state so SAVE, SR-IOV teardown, and the directional
+ * SUSPEND/RESUME ioctls agree on the current parked depth.
+ * See design/datapath_pause_resume.md Part A/C.
+ */
+enum mlx5_vfmig_dp_state {
+	MLX5_VFMIG_DP_RUNNING = 0,	/* both directions live */
+	MLX5_VFMIG_DP_P2P,		/* initiator parked, responder live */
+	MLX5_VFMIG_DP_STOP,		/* fully parked; cmd ring dead */
+};
+
 struct mlx5_vf_context {
 	int	enabled;
 	u64	port_guid;
@@ -571,24 +584,26 @@ struct mlx5_vf_context {
 	 */
 	u8	vfmig_tracked:1;
 	/*
-	 * Datapath-quiesce state for the stop-and-copy snapshot ordering
-	 * fix (KS7.6, design/datapath_pause_resume.md Part A).
+	 * Datapath-quiesce state for the snapshot-ordering fix (KS7.6,
+	 * design/datapath_pause_resume.md Part A/C).
 	 *
-	 * @vfmig_suspended: set once /dev/mlx5_vfmig SUSPEND_VHCA has
-	 *   latched SUSPEND_VHCA(INITIATOR)+SUSPEND_VHCA(RESPONDER) on this
-	 *   VF's vhca_id, and cleared by RESUME_VHCA. Persists across a
-	 *   save session so SAVE_VHCA_STATE can tell whether the caller
-	 *   already parked the VF (skip the in-SAVE suspend, leave resume
-	 *   to the caller) vs. the legacy self-suspend+resume-on-close
-	 *   flow. Force-cleared (with a best-effort RESUME) at SR-IOV
-	 *   teardown so a crashed dumper can't strand a VF suspended.
+	 * @vfmig_dp_state: current parked depth on the RUNNING/RUNNING_P2P/
+	 *   STOP ladder (enum mlx5_vfmig_dp_state). Moved by /dev/mlx5_vfmig
+	 *   SUSPEND_VHCA / RESUME_VHCA (which may drive a single ladder step
+	 *   or the full pair), and set to STOP by a DEFER_RESUME restore.
+	 *   Persists across a save session so SAVE_VHCA_STATE can tell
+	 *   whether the caller already parked the VF (skip/complete the
+	 *   in-SAVE suspend, leave resume to the caller) vs. the legacy
+	 *   self-suspend+resume-on-close flow. Force-driven back to RUNNING
+	 *   (best-effort RESUME) at SR-IOV teardown so a crashed dumper
+	 *   can't strand a VF parked.
 	 *
 	 * @vfmig_defer_resume: set via MARK_RESTORED { DEFER_RESUME } on
 	 *   the destination. Tells mlx5_vfmig_vf_apply_pending_load() to
 	 *   run SUSPEND+LOAD_VHCA_STATE but skip the trailing RESUME pair,
-	 *   leaving the restored VHCA parked until CRIU issues RESUME_VHCA
-	 *   at RESUME_DEVICES_LATE (after all MR/ring VMAs are restored).
-	 *   Cleared by RESUME_VHCA alongside @vfmig_suspended.
+	 *   leaving the restored VHCA parked (STOP) until CRIU issues
+	 *   RESUME_VHCA at RESUME_DEVICES_LATE (after all MR/ring VMAs are
+	 *   restored). Cleared by RESUME_VHCA.
 	 *
 	 * Plain u8 (not bitfields) on purpose: they must not share a
 	 * storage unit with @vfmig_tracked above, whose probe-time reader
@@ -596,7 +611,7 @@ struct mlx5_vf_context {
 	 * RESUME ioctls and would otherwise see a torn read from the
 	 * read-modify-write of an adjacent bitfield.
 	 */
-	u8	vfmig_suspended;
+	u8	vfmig_dp_state;
 	u8	vfmig_defer_resume;
 	struct vfmig_iova_domain *vfmig_iova_dom;
 	/*

@@ -2785,6 +2785,56 @@ static int vfmig_cmd_resume_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 }
 
 /*
+ * Drive a VHCA along the RUNNING(0) <-> RUNNING_P2P(1) <-> STOP(2) ladder
+ * from @from to @to, issuing one firmware SUSPEND/RESUME per ladder step in
+ * the FW-mandated order (suspend initiator-then-responder going down; resume
+ * responder-then-initiator coming up). On a step failure it stops and reports
+ * the state actually reached in *@reached (best-effort: no rollback -- the
+ * latched state stays truthful and a later RESUME can recover). Returns 0 or
+ * the first firmware error. @reached is always set. See
+ * design/datapath_pause_resume.md Part C.
+ */
+static int vfmig_dp_transition(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+			       u8 from, u8 to, u8 *reached)
+{
+	int err = 0;
+	u8 s = from;
+
+	while (s < to) {		/* deeper suspend */
+		u16 op_mod = (s == MLX5_VFMIG_DP_RUNNING) ?
+			MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR :
+			MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER;
+
+		err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id, op_mod);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SUSPEND_VHCA(%s) vhca_id 0x%04x failed: %d\n",
+				       s == MLX5_VFMIG_DP_RUNNING ? "INITIATOR" : "RESPONDER",
+				       vhca_id, err);
+			break;
+		}
+		s++;
+	}
+	while (s > to) {		/* resume */
+		u16 op_mod = (s == MLX5_VFMIG_DP_STOP) ?
+			MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER :
+			MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR;
+
+		err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id, op_mod);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: RESUME_VHCA(%s) vhca_id 0x%04x failed: %d\n",
+				       s == MLX5_VFMIG_DP_STOP ? "RESPONDER" : "INITIATOR",
+				       vhca_id, err);
+			break;
+		}
+		s--;
+	}
+	*reached = s;
+	return err;
+}
+
+/*
  * Stop-the-world slice of mlx5vf_cmd_query_vhca_migration_state: no
  * incremental queries, no chunk_mode (we do single-shot SAVE), no
  * PRE_COPY error handling. *@size_out gets required_umem_size in bytes.
@@ -4716,10 +4766,12 @@ static void vfmig_save_release_resources(struct mlx5_vfmig_save_ctx *ctx)
 	 * we won't issue a stray RESUME if the corresponding SUSPEND
 	 * never succeeded.
 	 *
-	 * Only auto-resume if this session owns the suspend (legacy self-
-	 * suspend). When the VF was parked by an explicit SUSPEND_VHCA
-	 * before SAVE, the caller owns the resume via RESUME_VHCA -- and
-	 * the persistent vfmig_suspended bit stays set across this close.
+	 * Only auto-resume the ladder steps this session issued (tracked in
+	 * suspended_initiator/responder). When the VF was parked externally
+	 * by SUSPEND_VHCA before SAVE, the caller owns that suspend's resume
+	 * via RESUME_VHCA -- and the persistent vfmig_dp_state stays put
+	 * across this close. A P2P-start SAVE undoes only its own responder
+	 * suspend, leaving the caller-owned initiator parked.
 	 */
 	if (!ctx->owns_suspend)
 		return;
@@ -4775,11 +4827,13 @@ static const struct file_operations mlx5_vfmig_save_fops = {
 
 /*
  * MLX5_VFMIG_IOC_SUSPEND_VHCA: park the VF's datapath ahead of a memory
- * snapshot (the "pause" half of the stop-and-copy ordering fix). Issues
- * SUSPEND_VHCA(INITIATOR) then SUSPEND_VHCA(RESPONDER) and latches the
- * persistent vfmig_suspended bit so a later SAVE skips its self-suspend
- * and leaves the resume to the caller. Idempotent. Caller holds
- * vfmig->lock for read. See design/datapath_pause_resume.md.
+ * snapshot (the "pause" half of the snapshot-ordering fix). @flags selects
+ * which ladder step(s) to drive (see MLX5_VFMIG_DIR_FLAG_*): 0 == the fused
+ * RUNNING->STOP pair (legacy behaviour), INITIATOR == RUNNING->P2P,
+ * RESPONDER == P2P->STOP. The reached depth is latched in vfmig_dp_state so
+ * a later SAVE skips/completes its self-suspend and leaves the resume to the
+ * caller. Idempotent. Caller holds vfmig->lock for read.
+ * See design/datapath_pause_resume.md.
  */
 static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
 				   void __user *uarg)
@@ -4788,20 +4842,44 @@ static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
 	struct mlx5_vfmig_suspend_vhca arg;
 	struct mlx5_core_sriov *sriov;
 	bool migratable = false;
+	u8 cur, target, reached;
+	u32 dir;
 	u16 vhca_id;
 	int err;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.flags || arg.reserved[0] || arg.reserved[1])
+	if (arg.reserved[0] || arg.reserved[1])
+		return -EINVAL;
+	dir = arg.flags ? arg.flags : MLX5_VFMIG_DIR_FLAG_ALL;
+	if (dir & ~(u32)MLX5_VFMIG_DIR_FLAG_ALL)
 		return -EINVAL;
 
 	sriov = &pf_mdev->priv.sriov;
 	if (arg.vf_id >= sriov->num_vfs)
 		return -EINVAL;
 
-	/* Idempotent: already parked, no firmware traffic. */
-	if (sriov->vfs_ctx[arg.vf_id].vfmig_suspended)
+	cur = sriov->vfs_ctx[arg.vf_id].vfmig_dp_state;
+
+	/*
+	 * Map the requested direction(s) onto a target depth. Suspending the
+	 * initiator parks it (>= P2P); suspending the responder implies the
+	 * initiator is already parked and drives to STOP. A responder-only
+	 * suspend while still RUNNING is out of order (FW requires
+	 * initiator-first) -- reject it.
+	 */
+	if ((dir & MLX5_VFMIG_DIR_FLAG_RESPONDER) &&
+	    !(dir & MLX5_VFMIG_DIR_FLAG_INITIATOR) && cur == MLX5_VFMIG_DP_RUNNING)
+		return -EINVAL;
+
+	target = cur;
+	if ((dir & MLX5_VFMIG_DIR_FLAG_INITIATOR) && target < MLX5_VFMIG_DP_P2P)
+		target = MLX5_VFMIG_DP_P2P;
+	if (dir & MLX5_VFMIG_DIR_FLAG_RESPONDER)
+		target = MLX5_VFMIG_DP_STOP;
+
+	/* Idempotent: already at (or past) the requested depth. */
+	if (target <= cur)
 		return 0;
 
 	err = vfmig_check_pf_migration_caps(pf_mdev);
@@ -4822,45 +4900,29 @@ static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
 	if (err)
 		return err;
 
-	/* Quiesce: initiator (egress) first, then responder (ingress). */
-	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
-		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR);
-	if (err) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: SUSPEND_VHCA(INITIATOR) vf %u (vhca_id 0x%04x) failed: %d\n",
-			       arg.vf_id, vhca_id, err);
+	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target, &reached);
+	sriov->vfs_ctx[arg.vf_id].vfmig_dp_state = reached;
+	if (err)
 		return err;
-	}
 
-	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
-		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER);
-	if (err) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: SUSPEND_VHCA(RESPONDER) vf %u (vhca_id 0x%04x) failed: %d\n",
-			       arg.vf_id, vhca_id, err);
-		/* Roll back the initiator suspend so we don't half-park. */
-		(void)vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
-			MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR);
-		return err;
-	}
-
-	sriov->vfs_ctx[arg.vf_id].vfmig_suspended = 1;
 	mlx5_core_info(pf_mdev,
-		       "vfmig: suspended VF %u (vhca_id 0x%04x) datapath (snapshot-ordering pause)\n",
-		       arg.vf_id, vhca_id);
+		       "vfmig: suspended VF %u (vhca_id 0x%04x) datapath %u->%u (snapshot-ordering pause)\n",
+		       arg.vf_id, vhca_id, cur, reached);
 	return 0;
 }
 
 /*
  * MLX5_VFMIG_IOC_RESUME_VHCA: un-park a VF previously suspended via
- * SUSPEND_VHCA (or left parked by a DEFER_RESUME restore). Issues
- * RESUME_VHCA(RESPONDER) then RESUME_VHCA(INITIATOR) and clears the
- * persistent vfmig_suspended / vfmig_defer_resume bits. Idempotent.
- * Best-effort like vfmig_save_release_resources: a failed RESUME is
- * logged and surfaced but the parked bits are cleared regardless (an
- * FW resume failure is not fixable by retrying the bit, and leaving
- * vfmig_suspended set would wrongly suppress a future SAVE's self-
- * suspend). Caller holds vfmig->lock for read.
+ * SUSPEND_VHCA (or left parked by a DEFER_RESUME restore). @flags selects
+ * which ladder step(s) to drive (see MLX5_VFMIG_DIR_FLAG_*): 0 == the fused
+ * STOP->RUNNING pair (legacy behaviour), RESPONDER == STOP->P2P (revive the
+ * responder so a peer can answer before its initiator is released),
+ * INITIATOR == P2P->RUNNING. The reached depth is latched in vfmig_dp_state;
+ * the one-shot @vfmig_defer_resume hint is consumed (cleared) on any resume.
+ * An initiator-only resume while still STOP is out of order (FW requires
+ * responder-first) and is rejected. Idempotent. Best-effort: a failed RESUME
+ * is logged and surfaced, and the truthful reached depth is latched.
+ * Caller holds vfmig->lock for read.
  */
 static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
 				  void __user *uarg)
@@ -4868,51 +4930,61 @@ static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
 	struct mlx5_vfmig_resume_vhca arg;
 	struct mlx5_core_sriov *sriov;
+	u8 cur, target, reached;
+	u32 dir;
 	u16 vhca_id;
-	int err, err2;
+	int err;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.flags || arg.reserved[0] || arg.reserved[1])
+	if (arg.reserved[0] || arg.reserved[1])
+		return -EINVAL;
+	dir = arg.flags ? arg.flags : MLX5_VFMIG_DIR_FLAG_ALL;
+	if (dir & ~(u32)MLX5_VFMIG_DIR_FLAG_ALL)
 		return -EINVAL;
 
 	sriov = &pf_mdev->priv.sriov;
 	if (arg.vf_id >= sriov->num_vfs)
 		return -EINVAL;
 
-	/* Idempotent: nothing parked. Clear any stale defer-resume hint. */
-	if (!sriov->vfs_ctx[arg.vf_id].vfmig_suspended) {
-		sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume = 0;
+	cur = sriov->vfs_ctx[arg.vf_id].vfmig_dp_state;
+
+	/*
+	 * Map the requested direction(s) onto a target depth. Resuming the
+	 * responder revives it (STOP->P2P, so <= P2P); resuming the initiator
+	 * drives all the way to RUNNING. An initiator-only resume while still
+	 * STOP is out of order (FW requires responder-first) -- reject it.
+	 */
+	if ((dir & MLX5_VFMIG_DIR_FLAG_INITIATOR) &&
+	    !(dir & MLX5_VFMIG_DIR_FLAG_RESPONDER) && cur == MLX5_VFMIG_DP_STOP)
+		return -EINVAL;
+
+	target = cur;
+	if ((dir & MLX5_VFMIG_DIR_FLAG_RESPONDER) && target > MLX5_VFMIG_DP_P2P)
+		target = MLX5_VFMIG_DP_P2P;
+	if (dir & MLX5_VFMIG_DIR_FLAG_INITIATOR)
+		target = MLX5_VFMIG_DP_RUNNING;
+
+	/* The defer-resume hint is one-shot: any resume consumes it. */
+	sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume = 0;
+
+	/* Idempotent: already at (or above) the requested depth. */
+	if (target >= cur)
 		return 0;
-	}
 
 	err = vfmig_query_vhca_id(pf_mdev, arg.vf_id + 1, &vhca_id);
 	if (err)
 		return err;
 
-	/* Resume in the inverse order of suspend: responder, then initiator. */
-	err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
-		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER);
+	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target, &reached);
+	sriov->vfs_ctx[arg.vf_id].vfmig_dp_state = reached;
 	if (err)
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: RESUME_VHCA(RESPONDER) vf %u (vhca_id 0x%04x) failed: %d\n",
-			       arg.vf_id, vhca_id, err);
+		return err;
 
-	err2 = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
-		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR);
-	if (err2)
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: RESUME_VHCA(INITIATOR) vf %u (vhca_id 0x%04x) failed: %d\n",
-			       arg.vf_id, vhca_id, err2);
-
-	sriov->vfs_ctx[arg.vf_id].vfmig_suspended = 0;
-	sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume = 0;
-
-	if (!err && !err2)
-		mlx5_core_info(pf_mdev,
-			       "vfmig: resumed VF %u (vhca_id 0x%04x) datapath\n",
-			       arg.vf_id, vhca_id);
-	return err ? err : err2;
+	mlx5_core_info(pf_mdev,
+		       "vfmig: resumed VF %u (vhca_id 0x%04x) datapath %u->%u\n",
+		       arg.vf_id, vhca_id, cur, reached);
+	return 0;
 }
 
 /*
@@ -4992,16 +5064,38 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	ctx->pd_allocated = true;
 
 	/*
-	 * Quiesce. If the VF was already parked by an explicit
-	 * SUSPEND_VHCA (the snapshot-ordering early hook), skip the
-	 * in-SAVE suspend and leave the resume to the caller's
-	 * RESUME_VHCA. Otherwise self-suspend (initiator/egress first,
-	 * then responder/ingress) and resume on close per the legacy
-	 * policy. See design/datapath_pause_resume.md Part A.4.
+	 * Quiesce to STOP for the state capture, but only own (and later
+	 * undo) the ladder steps this SAVE actually issues:
+	 *   - STOP already: an explicit SUSPEND_VHCA fully parked the VF
+	 *     (snapshot-ordering early hook); do nothing and leave the
+	 *     resume to the caller's RESUME_VHCA.
+	 *   - RUNNING_P2P: an explicit SUSPEND_VHCA(INITIATOR) parked the
+	 *     initiator; complete to STOP by suspending the responder only.
+	 *     On close we resume just the responder (back to P2P), leaving
+	 *     the initiator parked for the caller.
+	 *   - RUNNING: legacy standalone SAVE; self-suspend both directions
+	 *     and resume both on close.
+	 * The persistent vfmig_dp_state is owned by SUSPEND/RESUME_VHCA and
+	 * is deliberately left untouched here: SAVE's suspend is transient
+	 * and reversed on close. See design/datapath_pause_resume.md A.4.
 	 */
-	if (sriov->vfs_ctx[arg.vf_id].vfmig_suspended) {
+	switch (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state) {
+	case MLX5_VFMIG_DP_STOP:
 		ctx->owns_suspend = false;
-	} else {
+		break;
+	case MLX5_VFMIG_DP_P2P:
+		ctx->owns_suspend = true;
+		err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
+			MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SUSPEND_VHCA(RESPONDER) vf %u (vhca_id 0x%04x) failed: %d\n",
+				       arg.vf_id, vhca_id, err);
+			goto err_suspend;
+		}
+		ctx->suspended_responder = true;
+		break;
+	default: /* MLX5_VFMIG_DP_RUNNING */
 		ctx->owns_suspend = true;
 
 		err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
@@ -5023,6 +5117,7 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 			goto err_suspend;
 		}
 		ctx->suspended_responder = true;
+		break;
 	}
 
 	err = vfmig_cmd_query_vhca_migration_state(pf_mdev, vhca_id,
@@ -6109,14 +6204,15 @@ int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 	/*
 	 * Snapshot-ordering restore mirror: if userspace asked to defer
 	 * the resume (MARK_RESTORED { DEFER_RESUME }), leave the VHCA in
-	 * the "loaded but stopped" state and latch vfmig_suspended so the
-	 * later MLX5_VFMIG_IOC_RESUME_VHCA -- issued at RESUME_DEVICES_LATE
-	 * once all MR/ring VMAs are restored -- brings the datapath live.
-	 * The defer hint is consumed here. See
+	 * the "loaded but stopped" state and latch vfmig_dp_state = STOP so
+	 * the later MLX5_VFMIG_IOC_RESUME_VHCA -- issued at
+	 * RESUME_DEVICES_LATE once all MR/ring VMAs are restored -- brings
+	 * the datapath live. The defer hint is consumed here. See
 	 * design/datapath_pause_resume.md Part A.5.
 	 */
 	if (defer_resume) {
-		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_suspended = 1;
+		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_dp_state =
+			MLX5_VFMIG_DP_STOP;
 		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_defer_resume = 0;
 		mlx5_core_info(pf_mdev,
 			       "vfmig: applied %llu bytes of LOAD state to vf %u (vhca_id 0x%04x); resume deferred (parked for RESUME_DEVICES_LATE)\n",
@@ -6406,48 +6502,40 @@ static void vfmig_pf_drop_suspends_locked(struct mlx5_vfmig_pf *vfmig)
 	total_vfs = sriov->num_vfs;
 	mutex_lock(&vfmig->ctxs_lock);
 	for (i = 0; i < total_vfs; i++) {
+		u8 cur, reached;
 		u16 vhca_id;
 		int err;
 
-		if (!sriov->vfs_ctx[i].vfmig_suspended) {
+		cur = sriov->vfs_ctx[i].vfmig_dp_state;
+		if (cur == MLX5_VFMIG_DP_RUNNING) {
 			sriov->vfs_ctx[i].vfmig_defer_resume = 0;
 			continue;
 		}
-		sriov->vfs_ctx[i].vfmig_suspended = 0;
+		sriov->vfs_ctx[i].vfmig_dp_state = MLX5_VFMIG_DP_RUNNING;
 		sriov->vfs_ctx[i].vfmig_defer_resume = 0;
 		mutex_unlock(&vfmig->ctxs_lock);
 
 		/*
-		 * A VF reaching teardown still datapath-suspended is
-		 * abnormal: the orchestrator should RESUME_VHCA before
-		 * destroy. Its command ring is dead (STOP needs >=
-		 * RUNNING_P2P), so without this resume the per-VF DESTROY
-		 * teardown stalls a full MLX5_CMD_TIMEOUT per command.
+		 * A VF reaching teardown still datapath-parked is abnormal:
+		 * the orchestrator should RESUME_VHCA before destroy. In STOP
+		 * the command ring is dead, so without this resume the per-VF
+		 * DESTROY teardown stalls a full MLX5_CMD_TIMEOUT per command.
 		 * Warn (not info) so the condition is visible rather than
-		 * surfacing as a mysterious multi-minute hang.
+		 * surfacing as a mysterious multi-minute hang. Drive whatever
+		 * ladder steps are outstanding (STOP -> RUNNING or P2P ->
+		 * RUNNING) back to RUNNING; failures are logged by the helper.
 		 */
 		mlx5_core_warn(pf_mdev,
-			       "vfmig: tearing down vf %d while datapath-suspended; resuming first\n",
-			       i);
+			       "vfmig: tearing down vf %d while datapath-parked (state %u); resuming first\n",
+			       i, cur);
 		err = vfmig_query_vhca_id(pf_mdev, i + 1, &vhca_id);
-		if (err) {
+		if (err)
 			mlx5_core_warn(pf_mdev,
 				       "vfmig: teardown resume: QUERY vhca_id vf %d failed: %d\n",
 				       i, err);
-		} else {
-			err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
-				MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER);
-			if (err)
-				mlx5_core_warn(pf_mdev,
-					       "vfmig: teardown RESUME_VHCA(RESPONDER) vf %d (vhca_id 0x%04x) failed: %d\n",
-					       i, vhca_id, err);
-			err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id,
-				MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR);
-			if (err)
-				mlx5_core_warn(pf_mdev,
-					       "vfmig: teardown RESUME_VHCA(INITIATOR) vf %d (vhca_id 0x%04x) failed: %d\n",
-					       i, vhca_id, err);
-		}
+		else
+			(void)vfmig_dp_transition(pf_mdev, vhca_id, cur,
+						  MLX5_VFMIG_DP_RUNNING, &reached);
 		mutex_lock(&vfmig->ctxs_lock);
 	}
 	mutex_unlock(&vfmig->ctxs_lock);

@@ -101,7 +101,7 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
  * alongside mlx5_vfmig_pf_drop_pending_loads(), before the VFs are
  * disabled, so that:
  *   - a crashed/aborted dumper that latched MLX5_VFMIG_IOC_SUSPEND_VHCA
- *     without a matching RESUME can't strand vfmig_suspended set into
+ *     without a matching RESUME can't strand vfmig_dp_state parked into
  *     the next sriov_numvfs cycle (which would wrongly suppress the
  *     next SAVE's self-suspend), and
  *   - the firmware is left in a clean (resumed) state for any VF that
