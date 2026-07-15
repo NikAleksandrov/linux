@@ -1525,8 +1525,11 @@ struct mlx5_vfmig_set_vf_uuid {
  *   Returns 0 on success; -EINVAL if @vf_id is out of range, @flags has
  *   unknown bits, or the requested step is out of order for the current
  *   state; -EOPNOTSUPP if the VF is not migration-enabled; -ENODEV if the
- *   PF is gone; any negative firmware-error code if a SUSPEND step fails
- *   (the reached state is latched; the caller can RESUME to recover).
+ *   PF is gone; any negative firmware-error code if a SUSPEND step fails.
+ *   On failure the fused pair (@flags == 0) is all-or-nothing: a partial
+ *   step is rolled back to the starting state, so the call is either fully
+ *   applied or fully reverted. A directional (single-step) call instead
+ *   latches the reached state; the caller can RESUME to recover.
  */
 struct mlx5_vfmig_suspend_vhca {
 	__u32 vf_id;	/* in  */
@@ -1557,7 +1560,9 @@ struct mlx5_vfmig_suspend_vhca {
  *   Returns 0 on success; -EINVAL if @vf_id is out of range, @flags has
  *   unknown bits, or the requested step is out of order for the current
  *   state; -ENODEV if the PF is gone; any negative firmware-error code if
- *   a RESUME step fails.
+ *   a RESUME step fails. On failure the fused pair (@flags == 0) is
+ *   all-or-nothing (a partial step is rolled back to the starting state); a
+ *   directional call latches the reached state instead.
  */
 struct mlx5_vfmig_resume_vhca {
 	__u32 vf_id;	/* in  */

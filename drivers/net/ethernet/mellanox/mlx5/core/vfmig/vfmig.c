@@ -2794,42 +2794,93 @@ static int vfmig_cmd_resume_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
  * the first firmware error. @reached is always set. See
  * design/datapath_pause_resume.md Part C.
  */
+/* Park one ladder step deeper from state @s (RUNNING->P2P or P2P->STOP). */
+static int vfmig_dp_suspend_step(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+				 u8 s)
+{
+	u16 op_mod = (s == MLX5_VFMIG_DP_RUNNING) ?
+		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR :
+		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER;
+	int err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id, op_mod);
+
+	if (err)
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SUSPEND_VHCA(%s) vhca_id 0x%04x failed: %d\n",
+			       s == MLX5_VFMIG_DP_RUNNING ? "INITIATOR" : "RESPONDER",
+			       vhca_id, err);
+	return err;
+}
+
+/* Unpark one ladder step shallower from state @s (STOP->P2P or P2P->RUNNING). */
+static int vfmig_dp_resume_step(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+				u8 s)
+{
+	u16 op_mod = (s == MLX5_VFMIG_DP_STOP) ?
+		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER :
+		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR;
+	int err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id, op_mod);
+
+	if (err)
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RESUME_VHCA(%s) vhca_id 0x%04x failed: %d\n",
+			       s == MLX5_VFMIG_DP_STOP ? "RESPONDER" : "INITIATOR",
+			       vhca_id, err);
+	return err;
+}
+
+/*
+ * Walk the datapath FSM ladder from @from to @to one firmware step at a
+ * time, latching the depth actually reached in *@reached and returning the
+ * first step error (0 on success).
+ *
+ * @atomic selects the failure contract:
+ *   false -- truthful single-edge latch: stop at the failing step and leave
+ *            the VF at that intermediate depth. Used by the directional
+ *            (single-step) ioctl paths, which explicitly opt into stepping
+ *            the ladder and own recovery via a follow-up call, and by the
+ *            SR-IOV teardown force-resume (already driving toward RUNNING).
+ *   true  -- all-or-nothing: on a partial failure, best-effort reverse the
+ *            steps already applied back to @from so the call is either fully
+ *            applied or fully reverted. Used by the fused (flags == 0) ioctl
+ *            paths so a legacy caller can never be left stranded mid-ladder
+ *            (byte-identical to the pre-directional rollback behaviour).
+ */
 static int vfmig_dp_transition(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
-			       u8 from, u8 to, u8 *reached)
+			       u8 from, u8 to, bool atomic, u8 *reached)
 {
 	int err = 0;
 	u8 s = from;
 
 	while (s < to) {		/* deeper suspend */
-		u16 op_mod = (s == MLX5_VFMIG_DP_RUNNING) ?
-			MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR :
-			MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER;
-
-		err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id, op_mod);
-		if (err) {
-			mlx5_core_warn(pf_mdev,
-				       "vfmig: SUSPEND_VHCA(%s) vhca_id 0x%04x failed: %d\n",
-				       s == MLX5_VFMIG_DP_RUNNING ? "INITIATOR" : "RESPONDER",
-				       vhca_id, err);
+		err = vfmig_dp_suspend_step(pf_mdev, vhca_id, s);
+		if (err)
 			break;
-		}
 		s++;
 	}
 	while (s > to) {		/* resume */
-		u16 op_mod = (s == MLX5_VFMIG_DP_STOP) ?
-			MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER :
-			MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR;
-
-		err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id, op_mod);
-		if (err) {
-			mlx5_core_warn(pf_mdev,
-				       "vfmig: RESUME_VHCA(%s) vhca_id 0x%04x failed: %d\n",
-				       s == MLX5_VFMIG_DP_STOP ? "RESPONDER" : "INITIATOR",
-				       vhca_id, err);
+		err = vfmig_dp_resume_step(pf_mdev, vhca_id, s);
+		if (err)
 			break;
-		}
 		s--;
 	}
+
+	if (err && atomic && s != from) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: fused datapath transition vhca_id 0x%04x failed at state %u; rolling back to %u\n",
+			       vhca_id, s, from);
+		/* Reverse whatever partial progress we made (best-effort). */
+		while (s > from)	/* undo a partial suspend */
+			if (vfmig_dp_resume_step(pf_mdev, vhca_id, s))
+				break;
+			else
+				s--;
+		while (s < from)	/* undo a partial resume */
+			if (vfmig_dp_suspend_step(pf_mdev, vhca_id, s))
+				break;
+			else
+				s++;
+	}
+
 	*reached = s;
 	return err;
 }
@@ -4900,7 +4951,13 @@ static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
 	if (err)
 		return err;
 
-	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target, &reached);
+	/*
+	 * Fused (flags == 0) is all-or-nothing so a legacy caller is never
+	 * stranded mid-ladder; a directional caller keeps the truthful
+	 * single-edge latch and owns recovery.
+	 */
+	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target,
+				  arg.flags == 0, &reached);
 	sriov->vfs_ctx[arg.vf_id].vfmig_dp_state = reached;
 	if (err)
 		return err;
@@ -4920,8 +4977,10 @@ static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
  * INITIATOR == P2P->RUNNING. The reached depth is latched in vfmig_dp_state;
  * the one-shot @vfmig_defer_resume hint is consumed (cleared) on any resume.
  * An initiator-only resume while still STOP is out of order (FW requires
- * responder-first) and is rejected. Idempotent. Best-effort: a failed RESUME
- * is logged and surfaced, and the truthful reached depth is latched.
+ * responder-first) and is rejected. Idempotent. Failure handling matches
+ * SUSPEND_VHCA: the fused pair (flags == 0) is all-or-nothing (a partial
+ * failure is rolled back to the starting depth), while a directional call
+ * latches the truthful reached depth and surfaces the error.
  * Caller holds vfmig->lock for read.
  */
 static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
@@ -4976,7 +5035,9 @@ static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
 	if (err)
 		return err;
 
-	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target, &reached);
+	/* Fused (flags == 0) is all-or-nothing; directional keeps the latch. */
+	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target,
+				  arg.flags == 0, &reached);
 	sriov->vfs_ctx[arg.vf_id].vfmig_dp_state = reached;
 	if (err)
 		return err;
@@ -6535,7 +6596,8 @@ static void vfmig_pf_drop_suspends_locked(struct mlx5_vfmig_pf *vfmig)
 				       i, err);
 		else
 			(void)vfmig_dp_transition(pf_mdev, vhca_id, cur,
-						  MLX5_VFMIG_DP_RUNNING, &reached);
+						  MLX5_VFMIG_DP_RUNNING, false,
+						  &reached);
 		mutex_lock(&vfmig->ctxs_lock);
 	}
 	mutex_unlock(&vfmig->ctxs_lock);

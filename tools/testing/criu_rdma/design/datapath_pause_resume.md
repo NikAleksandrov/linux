@@ -288,6 +288,19 @@ requested depth is already reached (idempotent). Consumers of the
 tri-state: SAVE self-suspend (A.4, skips iff already `STOP`, completes
 from `P2P`), and teardown force-resume (A.3).
 
+Failure contract differs by caller so legacy behaviour is preserved
+exactly. The **fused** pair (`flags == 0`) is **all-or-nothing**: if a
+two-edge transition fails on its second edge, the helper best-effort
+reverses the applied edge back to the starting depth, so a legacy caller
+is either fully applied or fully reverted and can never be stranded at
+`RUNNING_P2P` with no tracker to resume it (this is what makes the
+"byte-identical to before this split" claim literally true on the error
+path too). A **directional** call keeps the truthful single-edge latch --
+it opts into stepping the ladder and owns recovery via a follow-up call.
+Teardown force-resume also uses the latch form (it is already driving
+toward RUNNING). The `atomic` argument to `vfmig_dp_transition()` selects
+between the two.
+
 Validated by `save_load/test_directional_suspend_resume.sh` (every ladder
 edge, both out-of-order rejections, the unknown-flag rejection, and the
 fused path) and `test_suspend_resume_split.sh` subtest 8 (SAVE from P2P).
