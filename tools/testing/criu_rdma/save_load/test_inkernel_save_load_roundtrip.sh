@@ -101,11 +101,16 @@ echo "$PRE"
 
 echo "=== Phase B: SAVE ==="
 sudo dmesg -C
-# snapshot-ordering: pause datapath (CRIU CHECKPOINT_DEVICES), then
-# capture (SAVE is suspend-aware and skips its own suspend), then resume.
-sudo "$TOOL" "$PF" suspend_vhca 0
+# snapshot-ordering: two-phase dump-side quiesce (design C.7). Pause the
+# initiator (RUNNING -> P2P), then -- after the cross-host barrier, a
+# no-op on this single host -- the responder (P2P -> STOP), at CRIU
+# CHECKPOINT_DEVICES. SAVE is suspend-aware (sees STOP, skips its own
+# suspend); resume walks the ladder back up.
+sudo "$TOOL" "$PF" suspend_vhca 0 initiator
+sudo "$TOOL" "$PF" suspend_vhca 0 responder
 sudo "$TOOL" "$PF" save_vhca_state 0 "$BLOB" $SAVE_FLAGS
-sudo "$TOOL" "$PF" resume_vhca 0
+sudo "$TOOL" "$PF" resume_vhca 0 responder
+sudo "$TOOL" "$PF" resume_vhca 0 initiator
 ls -l "$BLOB"
 SAVE_BYTES=$(stat -c %s "$BLOB")
 [ "$SAVE_BYTES" -gt 16 ] || { echo "blob suspiciously small: $SAVE_BYTES"; exit 1; }

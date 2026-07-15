@@ -158,11 +158,16 @@ echo "src pdns: src0=$src0_pdn src1=$src1_pdn src2=$src2_pdn (max=$src_max_pdn)"
 # ---------- Phase B: SAVE + tear down source ----------
 
 echo "=== Phase B: SAVE + tear down source ==="
-# snapshot-ordering: pause datapath (CRIU CHECKPOINT_DEVICES), then
-# capture (SAVE is suspend-aware and skips its own suspend), then resume.
-sudo "$TOOL" "$PF" suspend_vhca 0
+# snapshot-ordering: two-phase dump-side quiesce (design C.7). Pause the
+# initiator (RUNNING -> P2P), then -- after the cross-host barrier, a
+# no-op on this single host -- the responder (P2P -> STOP), at CRIU
+# CHECKPOINT_DEVICES. SAVE is suspend-aware (sees STOP, skips its own
+# suspend); resume walks the ladder back up.
+sudo "$TOOL" "$PF" suspend_vhca 0 initiator
+sudo "$TOOL" "$PF" suspend_vhca 0 responder
 sudo "$TOOL" "$PF" save_vhca_state 0 "$BLOB"
-sudo "$TOOL" "$PF" resume_vhca 0
+sudo "$TOOL" "$PF" resume_vhca 0 responder
+sudo "$TOOL" "$PF" resume_vhca 0 initiator
 sudo chmod 0644 "$BLOB"
 echo "  save bytes: $(stat -c %s "$BLOB")"
 for i in 0 1 2; do quit_probe "$i"; done

@@ -458,11 +458,15 @@ fi
 
 echo "=== Phase B: SAVE (now emits HOST_PAGE records before FW_DATA) ==="
 sudo dmesg -C
-# snapshot-ordering: pause datapath (CRIU CHECKPOINT_DEVICES), then
-# capture (SAVE is suspend-aware and skips its own suspend), then resume.
-sudo "$TOOL" "$PF" suspend_vhca 0
+# This harness is deliberately the LEGACY-standalone regression: no
+# explicit SUSPEND/RESUME_VHCA bracket, so SAVE exercises its own
+# self-suspend-on-entry + resume-on-close path (design A.4, owns_suspend
+# = true from RUNNING). This is byte-identical to the pre-split behavior
+# and is the one full save/load roundtrip that guards it -- the
+# directional two-phase dump bracket (Appendix D.3) is covered by the
+# other save_load / uobject_restore harnesses and by
+# test_directional_suspend_resume.sh.
 sudo "$TOOL" "$PF" save_vhca_state 0 "$BLOB" $SAVE_FLAGS
-sudo "$TOOL" "$PF" resume_vhca 0
 # The save tool creates the blob 0600 root:root by default. For
 # cross-host scp-as-user to succeed without sudo on both ends, drop
 # it to world-readable. The blob holds firmware migration state, no

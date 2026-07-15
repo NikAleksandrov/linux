@@ -25,8 +25,13 @@
 #   5. RESUME_VHCA is idempotent (second call succeeds).
 #   6. SUSPEND_VHCA on an out-of-range vf_id is rejected (EINVAL).
 #   7. mark_restored with the defer_resume flag is accepted.
-#   8. Teardown force-resume: re-suspend, then sriov_numvfs=0, and
-#      confirm the teardown path logged "force-resuming parked vf".
+#   8. SAVE starting from RUNNING_P2P (only the initiator pre-parked)
+#      completes the quiesce to STOP itself, produces a non-trivial blob,
+#      and on close resumes only the responder -- leaving the VF at P2P
+#      (proven by a lone resume-initiator logging datapath 1->0).
+#   9. Teardown force-resume: re-suspend, then sriov_numvfs=0, and
+#      confirm the teardown path warned "tearing down vf 0 while
+#      datapath-parked".
 #
 # Usage:
 #   sudo PF=0000:08:00.0 ./test_suspend_resume_split.sh
@@ -204,19 +209,75 @@ else
     fail "mark_restored defer_resume returned $TOOL_RC"
 fi
 
-# --- subtest 8: teardown force-resumes a parked VF --------------------
+# --- subtest 8: SAVE starting from RUNNING_P2P completes to STOP ------
+#
+# When the caller parks only the initiator (RUNNING -> P2P) and then
+# SAVEs, SAVE is suspend-aware and must complete the quiesce itself:
+# suspend the responder (P2P -> STOP) for the capture, own only that
+# responder step, and on save_fd close resume just the responder (STOP
+# -> P2P), leaving the caller-owned initiator parked. We prove the VF is
+# left at P2P (not STOP, not RUNNING) by resuming the initiator alone
+# afterwards and watching for the datapath 1->0 line.
 
-echo "=== subtest 8: SR-IOV teardown force-resumes a still-parked VF ==="
+echo "=== subtest 8: SAVE from RUNNING_P2P completes to STOP + returns to P2P on close ==="
+run_tool resume_vhca 0                 # ensure RUNNING baseline (idempotent)
+sudo dmesg -C
+run_tool suspend_vhca 0 initiator      # RUNNING -> P2P
+if [ "$TOOL_RC" -eq 0 ] && sudo dmesg | grep -Eq "vfmig: suspended VF 0 .*datapath 0->1"; then
+    pass "parked initiator (RUNNING -> P2P)"
+else
+    fail "suspend initiator did not reach P2P (rc=$TOOL_RC)"
+fi
+sudo dmesg -C
+run_tool save_vhca_state 0 "$BLOB"
+if [ "$TOOL_RC" -eq 0 ]; then
+    pass "SAVE from P2P returned 0"
+else
+    fail "SAVE from P2P returned $TOOL_RC"
+fi
+if [ -e "$BLOB" ] && [ "$(stat -c %s "$BLOB" 2>/dev/null || echo 0)" -gt 16 ]; then
+    pass "SAVE from P2P produced a non-trivial blob"
+else
+    fail "SAVE from P2P produced no/tiny blob"
+fi
+# SAVE's internal responder suspend/resume are silent (no info line); a
+# fresh external "snapshot-ordering pause" line would mean SAVE wrongly
+# took the standalone self-suspend path instead of the P2P-completion one.
+if sudo dmesg | grep -q "vfmig: suspended VF 0 .*snapshot-ordering pause"; then
+    fail "SAVE emitted an external pause line (took the wrong suspend path)"
+else
+    pass "SAVE used its silent internal responder suspend (no external pause line)"
+fi
+if sudo dmesg | grep -Eq "(SUSPEND|RESUME)_VHCA\((INITIATOR|RESPONDER)\).*failed"; then
+    fail "firmware SUSPEND/RESUME error logged during SAVE"
+else
+    pass "no firmware SUSPEND/RESUME error during SAVE"
+fi
+# Prove the post-close state is P2P: a lone resume-initiator must succeed
+# and log the P2P -> RUNNING (1->0) transition. If SAVE had left the VF
+# at STOP, this step would be out of order; if at RUNNING, there would be
+# no transition to make.
+sudo dmesg -C
+run_tool resume_vhca 0 initiator
+if [ "$TOOL_RC" -eq 0 ] && sudo dmesg | grep -Eq "vfmig: resumed VF 0 .*datapath 1->0"; then
+    pass "SAVE left VF at P2P; resume initiator drove P2P -> RUNNING"
+else
+    fail "VF not at P2P after SAVE close (resume initiator rc=$TOOL_RC)"
+fi
+
+# --- subtest 9: teardown force-resumes a parked VF --------------------
+
+echo "=== subtest 9: SR-IOV teardown force-resumes a still-parked VF ==="
 run_tool suspend_vhca 0
 [ "$TOOL_RC" -eq 0 ] || fail "re-suspend before teardown failed (rc=$TOOL_RC)"
 sudo dmesg -C
 echo 1 | sudo tee "$(vf_path $PF)/sriov_drivers_autoprobe" >/dev/null 2>&1 || true
 echo 0 | sudo tee "$(vf_path $PF)/sriov_numvfs"            >/dev/null
 sleep 1
-if sudo dmesg | grep -q "vfmig: tearing down vf 0 while datapath-suspended"; then
+if sudo dmesg | grep -q "vfmig: tearing down vf 0 while datapath-parked"; then
     pass "teardown warned + force-resumed parked vf 0"
 else
-    fail "teardown did not warn 'tearing down vf 0 while datapath-suspended'"
+    fail "teardown did not warn 'tearing down vf 0 while datapath-parked'"
 fi
 
 # --- summary -----------------------------------------------------------

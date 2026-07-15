@@ -159,10 +159,10 @@ VF=""  # VFs gone; skip unbind in cleanup
 # --- subtest 3: teardown warned about the parked VF -------------------
 
 echo "=== subtest 3: teardown logged the force-resume warn ==="
-if sudo dmesg | grep -q "vfmig: tearing down vf 0 while datapath-suspended"; then
+if sudo dmesg | grep -q "vfmig: tearing down vf 0 while datapath-parked"; then
     pass "teardown warned + force-resumed parked vf 0"
 else
-    fail "teardown did not warn 'tearing down vf 0 while datapath-suspended'"
+    fail "teardown did not warn 'tearing down vf 0 while datapath-parked'"
 fi
 
 # --- summary -----------------------------------------------------------
