@@ -114,6 +114,7 @@ TESTS=(
   "vfio_save_load|save_load/test_vfio_save_load_roundtrip.sh||xfail:non-tracked LOAD superseded; SAVE side still validated"
   "suspend_resume_split|save_load/test_suspend_resume_split.sh||run"
   "directional_suspend_resume|save_load/test_directional_suspend_resume.sh||run"
+  "running_p2p_hold_window|save_load/test_running_p2p_hold_window.sh|HOLD=15|run"
   "teardown_resume_timing|save_load/test_teardown_resume_timing.sh||run"
   "multi_load_stage_gate|save_load/multi_load_gates/test_multi_load_stage_gate.sh||run"
   "user_object_replay|save_load/user_object_replay/test_user_object_replay.sh||run"

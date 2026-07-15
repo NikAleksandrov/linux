@@ -184,10 +184,24 @@ echo "VF0(DUT)=$VF0  VF1(peer)=$VF1"
 run_tool enable_migratable 0; [ "$TOOL_RC" -eq 0 ] || { echo "FATAL: enable_migratable 0"; exit 1; }
 run_tool enable_migratable 1; [ "$TOOL_RC" -eq 0 ] || { echo "FATAL: enable_migratable 1"; exit 1; }
 
+# Retry each bind once: a prior harness in a sweep (e.g. suspend_resume_split's
+# mark_restored) can leave a stale "restored" marker on this vf index, so the
+# first probe takes the post-LOAD restore fast-path and fails QUERY_HCA_CAP.
+# That failed probe *consumes* the marker, so the second bind succeeds.
+# (Recreating VFs via numvfs does not clear the marker.)
 for v in $VF0 $VF1; do
     echo mlx5_core | sudo tee "$(vf_path $v)/driver_override" >/dev/null
-    timeout 120 bash -c "echo '$v' | sudo tee /sys/bus/pci/drivers/mlx5_core/bind >/dev/null" 2>/dev/null || true
-    [ -e "/sys/bus/pci/drivers/mlx5_core/$v" ] || { echo "FATAL: bind $v to mlx5_core failed"; exit 1; }
+    bound=0
+    for attempt in 1 2; do
+        if timeout 120 bash -c "echo '$v' | sudo tee /sys/bus/pci/drivers/mlx5_core/bind >/dev/null" 2>/dev/null \
+            && [ -e "/sys/bus/pci/drivers/mlx5_core/$v" ]; then
+            bound=1
+            break
+        fi
+        echo "  bind $v attempt $attempt failed (likely stale restored marker, now consumed); retrying"
+        sleep 1
+    done
+    [ "$bound" -eq 1 ] || { echo "FATAL: bind $v to mlx5_core failed"; exit 1; }
 done
 sleep 2
 
