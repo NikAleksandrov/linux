@@ -855,16 +855,60 @@ static int do_mark(int fd, unsigned int vf_id, unsigned int defer_resume)
 }
 
 /*
+ * Human-readable label for a MLX5_VFMIG_DIR_FLAG_* mask. flags==0 means
+ * the fused pair (both directions), same as MLX5_VFMIG_DIR_FLAG_ALL.
+ */
+static const char *dir_label(unsigned int flags)
+{
+	unsigned int d = flags ? (flags & MLX5_VFMIG_DIR_FLAG_ALL) : MLX5_VFMIG_DIR_FLAG_ALL;
+
+	switch (d) {
+	case MLX5_VFMIG_DIR_FLAG_INITIATOR: return "initiator";
+	case MLX5_VFMIG_DIR_FLAG_RESPONDER: return "responder";
+	case MLX5_VFMIG_DIR_FLAG_ALL:       return "both";
+	default:                            return "?";
+	}
+}
+
+/*
+ * Parse an optional suspend/resume direction token into a
+ * MLX5_VFMIG_DIR_FLAG_* mask. Accepts the keywords
+ * initiator/init, responder/resp, both/all, or a raw numeric mask (so
+ * harnesses can drive invalid-bit negative tests). Returns 0 on success.
+ */
+static int parse_dir(const char *s, unsigned int *out)
+{
+	char *end;
+	unsigned long v;
+
+	if (!strcmp(s, "initiator") || !strcmp(s, "init"))
+		*out = MLX5_VFMIG_DIR_FLAG_INITIATOR;
+	else if (!strcmp(s, "responder") || !strcmp(s, "resp"))
+		*out = MLX5_VFMIG_DIR_FLAG_RESPONDER;
+	else if (!strcmp(s, "both") || !strcmp(s, "all"))
+		*out = MLX5_VFMIG_DIR_FLAG_ALL;
+	else {
+		v = strtoul(s, &end, 0);
+		if (*end != '\0')
+			return -1;
+		*out = (unsigned int)v;
+	}
+	return 0;
+}
+
+/*
  * MLX5_VFMIG_IOC_SUSPEND_VHCA wrapper. Parks the VF's RDMA datapath
- * (SUSPEND_VHCA initiator+responder) ahead of a memory snapshot -- the
- * "pause" half of the stop-and-copy ordering fix. CRIU calls this at
- * the early CHECKPOINT_DEVICES hook, before the dumpee's memory is
- * copied. Idempotent. See
+ * ahead of a memory snapshot -- the "pause" half of the snapshot-ordering
+ * fix. @flags picks the ladder step(s): 0 == the fused initiator+responder
+ * pair (RUNNING->STOP), or a MLX5_VFMIG_DIR_FLAG_* subset for a single
+ * step (RUNNING->P2P or P2P->STOP). CRIU calls the fused form at the early
+ * CHECKPOINT_DEVICES hook; the directional form drives the cross-host
+ * two-phase quiesce. Idempotent. See
  * tools/testing/criu_rdma/design/datapath_pause_resume.md.
  */
-static int do_suspend(int fd, unsigned int vf_id)
+static int do_suspend(int fd, unsigned int vf_id, unsigned int flags)
 {
-	struct mlx5_vfmig_suspend_vhca arg = { .vf_id = vf_id };
+	struct mlx5_vfmig_suspend_vhca arg = { .vf_id = vf_id, .flags = flags };
 
 	if (ioctl(fd, MLX5_VFMIG_IOC_SUSPEND_VHCA, &arg) < 0) {
 		if (errno == EOPNOTSUPP)
@@ -873,36 +917,42 @@ static int do_suspend(int fd, unsigned int vf_id)
 				vf_id);
 		else if (errno == EINVAL)
 			fprintf(stderr,
-				"vf_id %u out of range (have you set sriov_numvfs?)\n",
-				vf_id);
+				"SUSPEND_VHCA: invalid arg (vf_id=%u flags=0x%x): out-of-range vf_id, unknown flag bits, or an out-of-order step (e.g. suspend responder while still RUNNING)\n",
+				vf_id, flags);
 		else
 			perror("SUSPEND_VHCA");
 		return 1;
 	}
-	printf("suspended vf %u datapath\n", vf_id);
+	printf("suspended vf %u datapath (dir=%s flags=0x%x)\n",
+	       vf_id, dir_label(flags), flags);
 	return 0;
 }
 
 /*
  * MLX5_VFMIG_IOC_RESUME_VHCA wrapper. Un-parks a VF previously
  * suspended via suspend_vhca (or left parked by a defer-resume
- * restore). On the destination, CRIU calls this at RESUME_DEVICES_LATE
- * after all MR/ring VMAs have been restored. Idempotent.
+ * restore). @flags picks the ladder step(s): 0 == the fused
+ * responder+initiator pair (STOP->RUNNING), or a MLX5_VFMIG_DIR_FLAG_*
+ * subset for a single step (STOP->P2P revives the responder so a peer can
+ * answer before its initiator is released; P2P->RUNNING). On the
+ * destination, CRIU calls the fused form at RESUME_DEVICES_LATE after all
+ * MR/ring VMAs have been restored. Idempotent.
  */
-static int do_resume(int fd, unsigned int vf_id)
+static int do_resume(int fd, unsigned int vf_id, unsigned int flags)
 {
-	struct mlx5_vfmig_resume_vhca arg = { .vf_id = vf_id };
+	struct mlx5_vfmig_resume_vhca arg = { .vf_id = vf_id, .flags = flags };
 
 	if (ioctl(fd, MLX5_VFMIG_IOC_RESUME_VHCA, &arg) < 0) {
 		if (errno == EINVAL)
 			fprintf(stderr,
-				"vf_id %u out of range (have you set sriov_numvfs?)\n",
-				vf_id);
+				"RESUME_VHCA: invalid arg (vf_id=%u flags=0x%x): out-of-range vf_id, unknown flag bits, or an out-of-order step (e.g. resume initiator while still STOP)\n",
+				vf_id, flags);
 		else
 			perror("RESUME_VHCA");
 		return 1;
 	}
-	printf("resumed vf %u datapath\n", vf_id);
+	printf("resumed vf %u datapath (dir=%s flags=0x%x)\n",
+	       vf_id, dir_label(flags), flags);
 	return 0;
 }
 
@@ -1216,12 +1266,16 @@ static void usage(const char *argv0)
 		"  list\n"
 		"  load_vhca_state  <vf_id> <blob_path>\n"
 		"  save_vhca_state  <vf_id> <blob_path> [keep_suspended]\n"
-		"  suspend_vhca     <vf_id>\n"
+		"  suspend_vhca     <vf_id> [initiator|responder|both]\n"
 		"                   pause RDMA datapath before memory snapshot\n"
-		"                   (stop-and-copy ordering; CHECKPOINT_DEVICES)\n"
-		"  resume_vhca      <vf_id>\n"
+		"                   (snapshot ordering; CHECKPOINT_DEVICES).\n"
+		"                   dir omitted/both: fused RUNNING->STOP;\n"
+		"                   initiator: RUNNING->P2P; responder: P2P->STOP\n"
+		"  resume_vhca      <vf_id> [initiator|responder|both]\n"
 		"                   un-park a suspended/defer-resumed VF\n"
-		"                   (RESUME_DEVICES_LATE)\n"
+		"                   (RESUME_DEVICES_LATE).\n"
+		"                   dir omitted/both: fused STOP->RUNNING;\n"
+		"                   responder: STOP->P2P; initiator: P2P->RUNNING\n"
 		"  enable_migratable <vf_id>\n"
 		"  set_tracked       <vf_id> <0|1>\n"
 		"  set_vf_uuid       <vf_id> <uuid-string>\n"
@@ -1291,14 +1345,22 @@ int main(int argc, char **argv)
 		ret = do_mark(fd, strtoul(argv[3], NULL, 0), defer_resume);
 	} else if (verb_eq(verb, "suspend_vhca") ||
 		   verb_eq(verb, "suspend")) {
-		if (argc != 4)
+		unsigned int dir = 0;
+
+		if (argc != 4 && argc != 5)
 			goto badargs;
-		ret = do_suspend(fd, strtoul(argv[3], NULL, 0));
+		if (argc == 5 && parse_dir(argv[4], &dir))
+			goto badargs;
+		ret = do_suspend(fd, strtoul(argv[3], NULL, 0), dir);
 	} else if (verb_eq(verb, "resume_vhca") ||
 		   verb_eq(verb, "resume")) {
-		if (argc != 4)
+		unsigned int dir = 0;
+
+		if (argc != 4 && argc != 5)
 			goto badargs;
-		ret = do_resume(fd, strtoul(argv[3], NULL, 0));
+		if (argc == 5 && parse_dir(argv[4], &dir))
+			goto badargs;
+		ret = do_resume(fd, strtoul(argv[3], NULL, 0), dir);
 	} else if (verb_eq(verb, "get_vhca_id")) {
 		if (argc != 4)
 			goto badargs;
