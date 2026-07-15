@@ -860,7 +860,7 @@ static int do_mark(int fd, unsigned int vf_id, unsigned int defer_resume)
  * "pause" half of the stop-and-copy ordering fix. CRIU calls this at
  * the early CHECKPOINT_DEVICES hook, before the dumpee's memory is
  * copied. Idempotent. See
- * tools/testing/criu_rdma/design/snapshot_ordering_pause_capture.md.
+ * tools/testing/criu_rdma/design/datapath_pause_resume.md.
  */
 static int do_suspend(int fd, unsigned int vf_id)
 {

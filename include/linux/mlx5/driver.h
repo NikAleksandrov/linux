@@ -572,7 +572,7 @@ struct mlx5_vf_context {
 	u8	vfmig_tracked:1;
 	/*
 	 * Datapath-quiesce state for the stop-and-copy snapshot ordering
-	 * fix (KS7.6, design/snapshot_ordering_pause_capture.md Part A).
+	 * fix (KS7.6, design/datapath_pause_resume.md Part A).
 	 *
 	 * @vfmig_suspended: set once /dev/mlx5_vfmig SUSPEND_VHCA has
 	 *   latched SUSPEND_VHCA(INITIATOR)+SUSPEND_VHCA(RESPONDER) on this

@@ -710,7 +710,7 @@ netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev)
 	 * DEALLOC_UAR failing "bad resource state". The fix is the same
 	 * Stage-2 MKEY/UAR reconstitution called out below; until then any
 	 * UMR-driven verb (reg_mr/rereg_mr/large/ODP MRs) on a restored VF
-	 * is unsafe. See design/snapshot_ordering_pause_capture.md.
+	 * is unsafe. See design/datapath_pause_resume.md.
 	 *
 	 * Drop returns NETDEV_TX_OK so the stack never retries: ARP
 	 * entries cycle quietly, TCP retransmits "succeed" silently,

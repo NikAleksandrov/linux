@@ -4,7 +4,7 @@
 # test_suspend_resume_split.sh -- exercise the split SUSPEND_VHCA /
 # RESUME_VHCA ioctls and the suspend-aware SAVE_VHCA_STATE / teardown
 # behavior introduced for the CRIU stop-and-copy snapshot-ordering fix.
-# See tools/testing/criu_rdma/design/snapshot_ordering_pause_capture.md
+# See tools/testing/criu_rdma/design/datapath_pause_resume.md
 # (Part A).
 #
 # Why an unbound VF: SUSPEND_VHCA / RESUME_VHCA are PF-issued

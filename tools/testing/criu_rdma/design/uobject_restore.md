@@ -976,7 +976,7 @@ and gets the same bytes.
 > live ring payload + all cursors + `qp->resp.resources` -- designed in
 > **`design/rxe_inflight_qp_restore.md`** (approach B1). That work assumes
 > the datapath is *paused* (not drained) at a consistent snapshot point,
-> which is the subject of **`design/snapshot_ordering_pause_capture.md`**.
+> which is the subject of **`design/datapath_pause_resume.md`**.
 
 #### 5.3.1 v0 state coverage
 

@@ -67,8 +67,8 @@
  *
  *   @flags:
  *     MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME -- the snapshot-ordering
- *       restore mirror (design/snapshot_ordering_pause_capture.md Part
- *       A.4). When set, the next probe runs SUSPEND_VHCA +
+ *       restore mirror (design/datapath_pause_resume.md Part
+ *       A.5). When set, the next probe runs SUSPEND_VHCA +
  *       LOAD_VHCA_STATE but SKIPS the trailing RESUME pair, leaving the
  *       restored VHCA parked. Userspace (CRIU) must later issue
  *       MLX5_VFMIG_IOC_RESUME_VHCA -- at RESUME_DEVICES_LATE, after all

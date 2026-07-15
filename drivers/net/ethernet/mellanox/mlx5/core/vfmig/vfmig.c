@@ -4154,7 +4154,7 @@ struct mlx5_vfmig_save_ctx {
 	 * self-suspend). False when the VF was already parked by an
 	 * explicit MLX5_VFMIG_IOC_SUSPEND_VHCA before SAVE -- in that case
 	 * the caller owns the resume (via RESUME_VHCA) and release() must
-	 * NOT auto-resume. See design/snapshot_ordering_pause_capture.md
+	 * NOT auto-resume. See design/datapath_pause_resume.md
 	 * Part A.3.
 	 */
 	bool owns_suspend;
@@ -4779,7 +4779,7 @@ static const struct file_operations mlx5_vfmig_save_fops = {
  * SUSPEND_VHCA(INITIATOR) then SUSPEND_VHCA(RESPONDER) and latches the
  * persistent vfmig_suspended bit so a later SAVE skips its self-suspend
  * and leaves the resume to the caller. Idempotent. Caller holds
- * vfmig->lock for read. See design/snapshot_ordering_pause_capture.md.
+ * vfmig->lock for read. See design/datapath_pause_resume.md.
  */
 static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
 				   void __user *uarg)
@@ -4997,7 +4997,7 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	 * in-SAVE suspend and leave the resume to the caller's
 	 * RESUME_VHCA. Otherwise self-suspend (initiator/egress first,
 	 * then responder/ingress) and resume on close per the legacy
-	 * policy. See design/snapshot_ordering_pause_capture.md Part A.3.
+	 * policy. See design/datapath_pause_resume.md Part A.4.
 	 */
 	if (sriov->vfs_ctx[arg.vf_id].vfmig_suspended) {
 		ctx->owns_suspend = false;
@@ -6113,7 +6113,7 @@ int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 	 * later MLX5_VFMIG_IOC_RESUME_VHCA -- issued at RESUME_DEVICES_LATE
 	 * once all MR/ring VMAs are restored -- brings the datapath live.
 	 * The defer hint is consumed here. See
-	 * design/snapshot_ordering_pause_capture.md Part A.4.
+	 * design/datapath_pause_resume.md Part A.5.
 	 */
 	if (defer_resume) {
 		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_suspended = 1;

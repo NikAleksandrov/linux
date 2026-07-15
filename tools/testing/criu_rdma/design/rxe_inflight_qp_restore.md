@@ -3,7 +3,7 @@
 #
 # Audience: kernel agent (drivers/infiniband/sw/rxe)
 # Builds on: design/uobject_restore.md §5.3 (rxe S6a QP save/restore)
-#            design/snapshot_ordering_pause_capture.md (consistency point)
+#            design/datapath_pause_resume.md (consistency point)
 # Goal: restore a non-quiesced (in-flight) rxe RC/UC/UD QP without
 #       forcing the application to drain at checkpoint.
 #
@@ -53,7 +53,7 @@ slots), plus the scalar `qp->resp` bookkeeping.
 ## 2. Consistency point (no drain)
 
 CRIU freezes the whole process before `QUERY_QP`, and (per
-`design/snapshot_ordering_pause_capture.md`) the datapath is *paused*
+`design/datapath_pause_resume.md`) the datapath is *paused*
 (`rxe_qp_pause`) at the early hook before memory is copied. So userspace
 cannot post and the rxe tasks cannot advance during capture -- the
 snapshot is consistent **without** draining. We keep FREEZE == pause.
