@@ -4,9 +4,12 @@
 # Audience: kernel agent (drivers/infiniband/sw/rxe, drivers/net/.../mlx5)
 # Peer doc on the CRIU side: plugin + cr-dump/cr-restore hook wiring
 # Scope: mlx5 (largest blast radius) and rxe control planes.
-# Status: Part A (mlx5 SUSPEND/RESUME split) and Part B (rxe freeze
-#         methods) are IMPLEMENTED. Part C (cross-host directional
-#         resume, H1) is PROPOSED. See the change history in Appendix C.
+# Status: Part A (mlx5 SUSPEND/RESUME split, including the directional
+#         flags + tri-state vfmig_dp_state) and Part B (rxe freeze
+#         methods) are IMPLEMENTED. The directional primitive is the
+#         kernel half of H1; the cross-host *orchestration* built on it
+#         (dump/restore two-phase barrier) is PROPOSED and gated on the
+#         D.1 syndrome -- see Appendix D. Change history in Appendix C.
 
 ## Overview
 
@@ -99,32 +102,36 @@ commands (`vfmig_cmd_suspend_vhca` / `vfmig_cmd_resume_vhca`, op_mods
 So firmware parks initiator-first (RUNNING -> RUNNING_P2P -> STOP) and
 revives responder-first (STOP -> RUNNING_P2P -> RUNNING). LOAD is only
 accepted on a fully-parked (`STOP`) VHCA (else bad-parameter, syndrome
-0x2c9bb0 on CX-7). The current ioctls always drive the full pair, i.e.
-RUNNING<->STOP in one call; the intermediate `RUNNING_P2P` is not yet
-individually addressable (that is Part C).
+0x2c9bb0 on CX-7). A caller can drive either the full RUNNING<->STOP pair
+in one call (`flags == 0`, the default) or a single ladder edge via the
+directional flags (A.6); the intermediate `RUNNING_P2P` is individually
+addressable. The per-VF `vfmig_dp_state` (A.3) tracks the reached depth.
 
 ### A.2 The ioctls
 
 ```c
 /* MLX5_VFMIG_IOC_SUSPEND_VHCA (_IOW(MAGIC, 0x13, ...)) -- early-hook quiesce.
- *   Issues SUSPEND_VHCA(INITIATOR) then SUSPEND_VHCA(RESPONDER) on the
- *   vf_id's vhca_id (PF-issued, other_function=1) -> STOP. Latches
- *   priv.sriov.vfs_ctx[vf_id].vfmig_suspended = 1. Idempotent: returns 0
- *   with no FW traffic if already suspended. Requires migratable (same
- *   gate as SAVE). VF may be bound or unbound. */
+ *   flags == 0 (default): issues SUSPEND_VHCA(INITIATOR) then
+ *   SUSPEND_VHCA(RESPONDER) on the vf_id's vhca_id (PF-issued,
+ *   other_function=1) -> STOP. Directional flags (A.6) drive a single
+ *   ladder edge instead. Latches the reached depth in
+ *   priv.sriov.vfs_ctx[vf_id].vfmig_dp_state. Idempotent: returns 0 with
+ *   no FW traffic if already at/past the requested depth. Requires
+ *   migratable (same gate as SAVE). VF may be bound or unbound. */
 struct mlx5_vfmig_suspend_vhca { __u32 vf_id; __u32 flags; __u32 reserved[2]; };
 
 /* MLX5_VFMIG_IOC_RESUME_VHCA (_IOW(MAGIC, 0x14, ...)) -- late-hook
- *   un-quiesce / abort rollback. Issues RESUME_VHCA(RESPONDER) then
- *   RESUME_VHCA(INITIATOR) -> RUNNING. Clears vfmig_suspended and
- *   vfmig_defer_resume. Idempotent: returns 0 with no FW traffic if not
- *   suspended. Best-effort: a failed FW resume is logged and surfaced,
- *   but the parked bits are cleared regardless (a stuck bit would wrongly
- *   suppress a future SAVE's self-suspend). */
+ *   un-quiesce / abort rollback. flags == 0 (default): issues
+ *   RESUME_VHCA(RESPONDER) then RESUME_VHCA(INITIATOR) -> RUNNING.
+ *   Directional flags (A.6) drive a single edge. Latches vfmig_dp_state
+ *   and clears vfmig_defer_resume. Idempotent: returns 0 with no FW
+ *   traffic if already at/above the requested depth. Best-effort: a
+ *   failed FW resume is logged and surfaced, and the truthful reached
+ *   depth is latched. */
 struct mlx5_vfmig_resume_vhca { __u32 vf_id; __u32 flags; __u32 reserved[2]; };
 ```
 
-`flags` is currently reserved (must be 0); Part C gives it meaning.
+`flags == 0` means the fused pair; the directional flag bits are A.6.
 
 ### A.3 Persistent per-VF state
 
@@ -135,59 +142,70 @@ save context:
 
 ```c
 /* include/linux/mlx5/driver.h : struct mlx5_vf_context (vfs_ctx[vf_id]) */
-u8  vfmig_suspended;     /* 1 once SUSPEND_VHCA latched STOP */
-u8  vfmig_defer_resume;  /* restore: bind LOADs but leaves suspended;
+enum mlx5_vfmig_dp_state {          /* reached depth on the A.1 ladder */
+	MLX5_VFMIG_DP_RUNNING = 0, /* both directions live */
+	MLX5_VFMIG_DP_P2P,         /* initiator parked, responder live */
+	MLX5_VFMIG_DP_STOP,        /* fully parked; cmd ring dead */
+};
+u8  vfmig_dp_state;      /* current parked depth (SUSPEND/RESUME_VHCA) */
+u8  vfmig_defer_resume;  /* restore: bind LOADs but leaves in STOP;
                           * RESUME_VHCA (late hook) finishes it */
 ```
 
 Teardown safety: `mlx5_device_disable_sriov()` drops `vfmig_pending_load`
-slots and also force-`RESUME_VHCA`s (best-effort) + clears
-`vfmig_suspended` for any VF still parked, so a crashed/aborted dumper
-that latched SUSPEND without a matching RESUME cannot strand a VF
-suspended into the next provisioning.
+slots and also force-drives any non-`RUNNING` VF back to `RUNNING`
+(best-effort `RESUME_VHCA`, walking whatever ladder edges are outstanding)
+so a crashed/aborted dumper that parked a VF without a matching RESUME
+cannot strand it into the next provisioning.
 
 ### A.4 SAVE is suspend-aware (back-compatible)
 
-`MLX5_VFMIG_IOC_SAVE_VHCA_STATE` still requires a suspended VHCA, but it
-no longer *unconditionally* suspends. The thing it tracks is **ownership
-of the resume**: if SAVE parked the VF itself, SAVE resumes it on close;
-if the VF was already parked by an earlier `SUSPEND_VHCA`, SAVE leaves it
-parked and the resume belongs to whoever issued that suspend. The state
-that carries this is `ctx->owns_suspend` (per save session) plus
-`ctx->suspended_initiator` / `ctx->suspended_responder` (which FW ops this
-session actually issued, so close never issues a stray RESUME).
+`MLX5_VFMIG_IOC_SAVE_VHCA_STATE` still requires a fully-parked (`STOP`)
+VHCA for the capture, but it no longer *unconditionally* suspends: it
+drives only the ladder edges needed to *reach* STOP from the current
+`vfmig_dp_state`, and on close undoes exactly those. The thing it tracks
+is **ownership of the resume**: SAVE only resumes edges it issued itself;
+edges an external `SUSPEND_VHCA` issued belong to that caller. This is
+carried by `ctx->suspended_initiator` / `ctx->suspended_responder` (which
+FW ops this session issued) plus `ctx->owns_suspend` (issued any).
 
 ```
 SAVE(vf_id, flags):                       # vfmig_ioc_save_vhca_state()
-  if vfs_ctx[vf_id].vfmig_suspended:       # already parked by an earlier
-      ctx->owns_suspend = false            #   SUSPEND_VHCA ioctl -> SAVE
-                                           #   issues no suspend of its own
-  else:                                    # standalone SAVE parks it:
-      SUSPEND_VHCA(INITIATOR)              #   initiator (egress) first,
-      SUSPEND_VHCA(RESPONDER)              #   then responder (ingress)
-      ctx->owns_suspend = true
-      ctx->suspended_{initiator,responder} = true
+  switch vfs_ctx[vf_id].vfmig_dp_state:
+    STOP:   owns_suspend = false           # externally parked; own nothing
+    P2P:    SUSPEND_VHCA(RESPONDER)        # complete P2P -> STOP ourselves;
+            suspended_responder = true     #   the external caller owns the
+            owns_suspend = true            #   initiator suspend
+    RUNNING:SUSPEND_VHCA(INITIATOR)        # standalone SAVE parks both:
+            SUSPEND_VHCA(RESPONDER)        #   initiator (egress) first,
+            suspended_{initiator,responder}=true   # then responder (ingress)
+            owns_suspend = true
   QUERY_SIZE / alloc PD+pages+MKEY / SAVE_VHCA_STATE   # (unchanged)
+  # persistent vfmig_dp_state is NOT touched here: SAVE's suspend is
+  # transient and reversed on close.
 
 close(save_fd):                            # vfmig_save_release_resources()
   free image resources
-  if !ctx->owns_suspend:      return        # someone else owns the resume;
-                                            #   leave parked (vfmig_suspended
-                                            #   stays set), CRIU RESUMEs later
+  if !ctx->owns_suspend:      return        # someone else owns the resume
   if flags & KEEP_SUSPENDED:  return        # caller asked to stay parked
-  RESUME_VHCA(RESPONDER)                    # else undo our own suspend, in
-  RESUME_VHCA(INITIATOR)                    #   inverse order, best-effort,
-                                            #   gated by suspended_* bools
+  if suspended_responder: RESUME_VHCA(RESPONDER)   # undo our own edges, in
+  if suspended_initiator: RESUME_VHCA(INITIATOR)   #   inverse order, best-
+                                            #   effort, gated per-direction
 ```
 
-Same code, two callers:
-- **Standalone SAVE** (no prior suspend, no `KEEP_SUSPENDED`): suspends on
-  entry, resumes on close -- byte-identical to before this split, so every
-  existing harness (`test_iova_tracked_save_load.sh` et al.) is unaffected.
-- **CRIU flow**: the early hook already issued `SUSPEND_VHCA` (so
-  `vfmig_suspended` is set), SAVE sees `owns_suspend = false` and never
-  touches the suspend state, close leaves the VF parked, and CRIU resumes
-  it later with `RESUME_VHCA` at the late restore hook.
+Three callers, one code path:
+- **Standalone SAVE** (VF `RUNNING`, no `KEEP_SUSPENDED`): suspends both on
+  entry, resumes both on close -- byte-identical to before this split, so
+  every existing harness (`test_iova_tracked_save_load.sh` et al.) is
+  unaffected.
+- **CRIU flow, fully pre-parked** (early hook drove `STOP`): SAVE sees
+  `owns_suspend = false`, touches no suspend state, and close leaves the
+  VF parked; CRIU resumes later via `RESUME_VHCA`.
+- **CRIU flow, P2P pre-parked** (dump-side two-phase quiesce, Appendix
+  D.3, has parked only the initiator): SAVE completes `P2P -> STOP` for
+  the capture and on close resumes only the responder (`STOP -> P2P`),
+  leaving the caller-owned initiator parked. Covered by
+  `test_suspend_resume_split.sh` subtest 8.
 
 ### A.5 Restore side: where RESUME can and cannot be deferred
 
@@ -237,6 +255,43 @@ the restore path**. It is described, with the command-ring constraints it
 must respect, in Appendix B. Until it is integrated, the SAVE-side
 suspend above is the only active guardrail for host-bound restores.
 
+### A.6 Directional flags: single-step ladder (implemented)
+
+The reserved `flags` word on both ioctls (A.2) selects which ladder edge
+to drive. `flags == 0` is the fused pair (unchanged); a directional
+subset drives one edge and stops at the intermediate `RUNNING_P2P`. This
+is the kernel primitive H1 needs (the cross-host orchestration that
+drives it is Appendix D).
+
+```c
+/* include/uapi/linux/mlx5_vfmig.h */
+#define MLX5_VFMIG_DIR_FLAG_INITIATOR (1u << 0)
+#define MLX5_VFMIG_DIR_FLAG_RESPONDER (1u << 1)
+/* flags == 0 is treated as INITIATOR|RESPONDER == the legacy fused pair. */
+```
+
+| ioctl + flag                | edge                    | precondition |
+|-----------------------------|-------------------------|--------------|
+| SUSPEND, INITIATOR          | RUNNING -> RUNNING_P2P  | RUNNING      |
+| SUSPEND, RESPONDER          | RUNNING_P2P -> STOP     | RUNNING_P2P  |
+| RESUME, RESPONDER           | STOP -> RUNNING_P2P     | STOP         |
+| RESUME, INITIATOR           | RUNNING_P2P -> RUNNING  | RUNNING_P2P  |
+| SUSPEND/RESUME, flags == 0  | RUNNING <-> STOP (fused)| any          |
+
+The driver maps `flags` + current `vfmig_dp_state` to a target depth,
+issues only the needed edges in FW-mandated order (a shared
+`vfmig_dp_transition()` ladder helper), and latches the reached depth. It
+returns `-EINVAL` for an out-of-order single step (e.g. `SUSPEND(RESPONDER)`
+while still RUNNING, or `RESUME(INITIATOR)` while still STOP) rather than
+issuing an FW command that will fault, and 0 with no FW traffic when the
+requested depth is already reached (idempotent). Consumers of the
+tri-state: SAVE self-suspend (A.4, skips iff already `STOP`, completes
+from `P2P`), and teardown force-resume (A.3).
+
+Validated by `save_load/test_directional_suspend_resume.sh` (every ladder
+edge, both out-of-order rejections, the unknown-flag rejection, and the
+fused path) and `test_suspend_resume_split.sh` subtest 8 (SAVE from P2P).
+
 ---
 
 ## Part B: rxe control plane -- datapath freeze methods
@@ -284,211 +339,39 @@ consistency point but is otherwise orthogonal.
 
 ---
 
-## Part C (PROPOSED): cross-host directional suspend/resume (H1)
-
-> Status: PROPOSED, not implemented. Contingent on the C.0 syndrome
-> confirmation. This is the fix shape for the ib_write_bw post-restore
-> ERR if that failure is confirmed to be a cross-host ordering race --
-> on the resume side (C.4) and/or the dump side (C.7) -- rather than the
-> Stage-1 MKEY/MTT gap (see the Known Limitation).
-
-### C.0 Motivation and validation gate
-
-`ib_write_bw_vfmig_criu_swap` regressed on the new setups: after a CRIU
-swap the one-sided WRITE client makes brief forward progress
-(`last_acked_psn` advances, one ~17.5 Gb/s sample) and then its RC QP
-flips to ERR, while the peer responder stays healthy in RTR. The
-two-sided `rdma_test_agent_..._after_qp` control *passes* on the same
-setup -- and its post-restore round-trip acts as an **implicit readiness
-barrier** (a single request cannot complete until both endpoints are up,
-and RC retries paper over the startup gap), whereas ib_write_bw resumes
-streaming with no barrier.
-
-H1: the restore path resumes **each VF's datapath fully and independently
-per host** (Part A's bind-time inline resume drives the RESPONDER+
-INITIATOR pair, `vfmig.c:4730-4745` / `:5183-5189`). With no cross-host
-ordering guarantee, the client initiator can go live and post WRITEs
-before the peer responder has resumed at the restored `epsn`; the stream
-hits a divergence seam, retries `retry_count=7` times, and the QP goes to
-ERR. This is the VFIO P2P quiescing problem, but *between hosts*.
-
-**Validation gate**: H1 vs the Stage-1 MKEY/MTT gap is decided by the
-error-CQE syndrome -- `0x15/0x16` (retry-exceeded) confirms H1;
-`0x04/0x11` (local protection/access) points at the MTT gap. As of the
-last run the syndrome had not been captured (no `mlx5_poll_one` error-cqe
-line surfaced), and the "client restored before VF/link exists" sub-theory
-was refuted by the restore timeline (both links active before CRIU
-restore). Do not implement Part C until the syndrome confirms H1.
-
-### C.1 Enabling primitive: RUNNING_P2P (already in firmware)
-
-`RUNNING_P2P` (A.1) is exactly "responder live, initiator parked, command
-ring alive". Both direction op_mods already exist in the driver; what is
-missing is the ability for a caller to *stop at* RUNNING_P2P instead of
-always driving the full RUNNING<->STOP pair.
-
-### C.2 API change: directional flags (back-compatible)
-
-No new ioctl numbers or structs: give meaning to the reserved `flags`
-word on the existing `mlx5_vfmig_suspend_vhca` / `mlx5_vfmig_resume_vhca`
-(A.2). `flags == 0` stays the fused pair, so today's callers are
-byte-identical.
-
-```c
-#define MLX5_VFMIG_DIR_FLAG_INITIATOR (1u << 0)
-#define MLX5_VFMIG_DIR_FLAG_RESPONDER (1u << 1)
-/* flags == 0 is treated as INITIATOR|RESPONDER == the legacy fused pair. */
-
-/* MLX5_VFMIG_IOC_SUSPEND_VHCA, flags = MLX5_VFMIG_DIR_FLAG_INITIATOR:
- *   RUNNING -> RUNNING_P2P. Parks only the initiator; the responder keeps
- *   answering peers and the command ring stays live. Sets
- *   vfs_ctx[vf_id].vfmig_dp_state = VFMIG_DP_P2P.
- *   -EINVAL unless the VHCA is currently RUNNING (VFMIG_DP_RUNNING).
- *
- * MLX5_VFMIG_IOC_RESUME_VHCA, flags = MLX5_VFMIG_DIR_FLAG_INITIATOR:
- *   RUNNING_P2P -> RUNNING. Revives the initiator. Sets vfmig_dp_state =
- *   VFMIG_DP_RUNNING. -EINVAL unless currently RUNNING_P2P.
- *
- * MLX5_VFMIG_IOC_RESUME_VHCA, flags = MLX5_VFMIG_DIR_FLAG_RESPONDER:
- *   STOP -> RUNNING_P2P. Revives the responder from a full park (the
- *   path that starts from a LOAD/defer, which leaves the VHCA in STOP).
- *   Sets vfmig_dp_state = VFMIG_DP_P2P. -EINVAL unless currently STOP.
- *
- * MLX5_VFMIG_IOC_SUSPEND_VHCA, flags = MLX5_VFMIG_DIR_FLAG_RESPONDER:
- *   RUNNING_P2P -> STOP. Deepens a P2P park to a full stop. Not used by
- *   the H1 restore flow, but IS the second phase of the dump-side
- *   two-phase quiesce (C.7).
- *   Sets vfmig_dp_state = VFMIG_DP_STOP. -EINVAL unless RUNNING_P2P.
- *
- * flags = 0 (both): RUNNING<->STOP in one call, exactly as A.2 today.
- */
-```
-
-The driver validates the requested direction against the current
-`vfmig_dp_state` and returns `-EINVAL` for an out-of-order request (e.g.
-`RESUME(INITIATOR)` on a STOP VHCA) rather than issuing an FW command
-that will fault.
-
-**Why the H1 restore flow issues no standalone `SUSPEND_VHCA(RESPONDER)`.**
-The flow (C.4) never drives the destination VHCA down to STOP. It starts
-from a fully-bound **RUNNING** VF (bind runs the fused resume), drops it
-one step to **RUNNING_P2P** with `SUSPEND(INITIATOR)`, and later lifts it
-back with `RESUME(INITIATOR)`. The `RUNNING_P2P -> STOP` edge --
-`SUSPEND(RESPONDER)` -- is only needed to reach the full STOP that
-SAVE/LOAD require, and that is already covered by the fused
-`SUSPEND(flags=0)`. `RESUME(RESPONDER)` is defined because the *other*
-restore path (defer-resume, which leaves the VHCA in STOP after LOAD) has
-to climb `STOP -> RUNNING_P2P -> RUNNING`; if that path is combined with
-the cross-host barrier, phase 1 is `RESUME(RESPONDER)` and phase 2 is
-`RESUME(INITIATOR)`. Standalone `SUSPEND(RESPONDER)` is not on the
-*restore* path at all -- but it is the second phase of the *dump*-side
-two-phase quiesce (C.7), so it is not merely a symmetry knob.
-
-### C.3 Per-VF state: distinguish STOP from RUNNING_P2P
-
-Replace the single `vfmig_suspended` bool with a tri-state so teardown and
-SAVE-skip logic can tell the two parked states apart:
-
-```c
-enum { VFMIG_DP_RUNNING = 0, VFMIG_DP_P2P, VFMIG_DP_STOP };
-u8 vfmig_dp_state;
-```
-
-- SAVE self-suspend skip: skip iff `vfmig_dp_state != RUNNING`.
-- Teardown force-resume: drive **any** non-RUNNING VF back to RUNNING
-  (STOP needs the full pair; RUNNING_P2P needs only RESUME(INITIATOR)).
-- Idempotency: an already-satisfied phase op returns 0, no FW traffic.
-
-### C.4 Restore integration: post-bind initiator park
-
-Reuse the *proven* bind->RUNNING arc (Appendix B) and park only the
-initiator afterward -- do NOT bind straight into RUNNING_P2P through the
-probe until that is proven safe (same command-ring hazard as A.5):
-
-```
-bind VF                 -> RUNNING (inline resume pair; probe cmd ring OK)
-configure while RUNNING:    ip link set vf mac; ip addr add (GID); ip neigh
-SUSPEND_VHCA(INITIATOR) -> RUNNING_P2P  (responder live; initiator parked)
-CRIU restores VMAs / process memory
-=== cross-host barrier: every migrated VF is RUNNING_P2P AND memory in place ===
-RESUME_VHCA(INITIATOR)  -> RUNNING       (first WRITE hits a live, PSN-aligned peer)
-```
-
-Parking only the initiator is **one option**, not a kernel mandate. The
-CRIU agent may instead resume both directions (the fused pair) exactly as
-today, or use the two-phase form above; the kernel just exposes both and
-the choice is CRIU-agent policy. The symmetric question on the *dump*
-side, however, is more than a policy knob -- see C.7.
-
-### C.5 Where the barrier lives (NOT the kernel)
-
-The kernel only exposes the two phases and the `query_vf`-observable
-`vfmig_dp_state`. The cross-host rendezvous ("hold all initiators until
-every peer responder is up") is an **orchestrator / CRIU-plugin**
-responsibility: `RESUME_DEVICES_LATE` grows two sub-steps with a barrier
-between them -- responder-live (already the case here: bind reaches
-RUNNING, then only the initiator is parked to RUNNING_P2P) ->
-control-channel barrier -> resume-initiator.
-
-### C.6 Open decisions
-
-- [decision] flags on the existing ioctls (recommended: zero UAPI churn,
-  back-compatible) vs. a new ioctl pair.
-- [decision] tri-state `vfmig_dp_state` (cleaner, touches every current
-  reader of `vfmig_suspended`) vs. adding a second
-  `vfmig_initiator_parked` bit.
-- [validate] RUNNING_P2P hold-window safety for a host-bound VF (mirror
-  Appendix B but park at RUNNING_P2P via SUSPEND(INITIATOR); confirm no
-  cmd-timeout / health event and that the responder still ACKs an
-  incoming WRITE while parked).
-
-### C.7 Dump-side symmetry: two-phase quiesce (candidate root cause)
-
-The resume-ordering race (C.0) has a dump-side twin that may be the
-*actual* corruption source. Today the SAVE side parks each VF with the
-fused pair (`SUSPEND(INITIATOR)` then `SUSPEND(RESPONDER)` -> STOP),
-**independently per host, with no cross-host barrier**. For a connected RC
-pair that is not safe:
-
-> If host A completes *both* suspends (reaches STOP) while host B is still
-> RUNNING, B's initiator keeps sending to an A whose responder is already
-> dead. Those in-flight requests are dropped, and A's captured responder
-> state (`epsn`, `msn`, ...) does not account for them. On restore the two
-> images disagree at exactly one PSN seam -- the shape we see in
-> ib_write_bw. One side finishing both operations before the other starts
-> either is precisely the hazard.
-
-This is the classic reason VFIO quiesces an entire P2P group to
-`RUNNING_P2P` before any member goes to STOP. The symmetric dump flow is
-the inverse of the C.4 resume order:
-
-```
-SUSPEND_VHCA(INITIATOR) on every VF   -> all peers at RUNNING_P2P
-                                         (no new requests originated;
-                                          responders still drain + ACK)
-=== cross-host barrier: all initiators parked, in-flight drained ===
-SUSPEND_VHCA(RESPONDER) on every VF   -> all peers at STOP
-capture (SAVE_VHCA_STATE)
-```
-
-Note this uses the standalone `SUSPEND_VHCA(RESPONDER)` phase that C.2
-defines -- the dump side is exactly where that phase earns its keep, even
-though the restore flow alone does not need it. A full H1 fix therefore
-likely touches **both** the dump and restore sides. As with C.0, gate
-implementation on confirming the failure is a PSN/ordering seam (the CQE
-syndrome) before building the two-phase dump.
-
----
-
 ## Validation & tests
 
-mlx5 (Part A):
-- `save_load/test_suspend_resume_split.sh`: SUSPEND (early) -> verify VF
-  parked (a wire op stalls / a counter freezes) -> SAVE{KEEP_SUSPENDED}
-  -> RESUME -> verify datapath live again.
-- Regression: `test_iova_tracked_save_load.sh` byte-identical green (SAVE
-  still self-suspends + resumes on close).
+mlx5 (Part A, all green on FW 28.48.1000 / kernel 6.19-criu):
+- `save_load/test_suspend_resume_split.sh` (20 checks): fused SUSPEND
+  (early) -> SAVE skips its own suspend + does not auto-resume -> RESUME;
+  idempotency; out-of-range reject; `mark_restored{defer_resume}`;
+  subtest 8 SAVE-from-P2P (A.4 P2P branch: SAVE completes P2P->STOP and
+  restores to P2P on close); subtest 9 teardown force-resumes a parked
+  bound VF (and warns).
+- `save_load/test_directional_suspend_resume.sh` (15 checks): every A.6
+  ladder edge (0->1, 1->2, 2->1, 1->0), both out-of-order rejections
+  (resume-initiator-from-STOP, suspend-responder-from-RUNNING), the
+  unknown-flag reject, and the fused 0<->2 path.
+- `save_load/test_teardown_resume_timing.sh` (3 checks): SR-IOV teardown
+  of a parked *bound* VF is fast (~4s, not the multi-minute stall) and
+  logs the force-resume warn.
+- Legacy standalone regression: `test_iova_tracked_save_load.sh` runs a
+  full SAVE/LOAD roundtrip with **no** explicit SUSPEND/RESUME bracket, so
+  SAVE self-suspends on entry and resumes on close (A.4, `owns_suspend`
+  from RUNNING) -- byte-identical to before this split. This is the one
+  full roundtrip guarding the legacy path; it is deliberately NOT
+  converted to the directional bracket. (The legacy *fused* `flags == 0`
+  bracket around a real SAVE is separately covered by
+  `test_suspend_resume_split.sh` subtests 1-3.)
+- The ~16 dump-bracket harnesses (`user_object_replay`, `*_restore`,
+  `*_adopt`, `*_destroy_matrix`, `dealloc_pd_chain`, `pdn_highwater`,
+  `fw_id_continuity`, ...) were converted to the two-phase directional
+  bracket (SUSPEND(INITIATOR)+SUSPEND(RESPONDER) ... RESUME(RESPONDER)+
+  RESUME(INITIATOR)) and all pass, exercising the new edges end-to-end.
 - Abort path: SUSPEND then RESUME with no SAVE in between (rollback).
+- Pending: the RUNNING_P2P hold-window probe on a host-bound VF
+  (Appendix D.4) -- not yet run; the directional harness soaks an unbound
+  VF only.
 
 rxe (Part B):
 - Extend `uverbs_ctx_holder` (CRIU side) with a peer that keeps pushing
@@ -543,10 +426,10 @@ Next-time triage: full dmesg of the hung iteration -- expect `Fatal error
 stack `mlx5r_umr_post_send_wait <- _mlx5r_umr_update_mr_pas <-
 create_real_mr <- mlx5_ib_reg_user_mr <- ib_uverbs_reg_mr`.
 
-Relationship to Part C / H1: this MKEY/MTT gap is the *other* candidate
-for the ib_write_bw ERR (the `0x04/0x11` syndrome branch in C.0). The two
-are distinguished by the CQE syndrome; whichever the syndrome points to is
-the one to pursue.
+Relationship to H1 (Appendix D): this MKEY/MTT gap is the *other*
+candidate for the ib_write_bw ERR (the `0x04/0x11` syndrome branch in
+D.1). The two are distinguished by the CQE syndrome; whichever the
+syndrome points to is the one to pursue.
 
 ---
 
@@ -646,3 +529,172 @@ traffic-carrying) VF netdev during the parked window; keep it down.
 - Doc reworked from issue-status into a design doc: current-state
   architecture + API reference up front; rationale, experiment, and this
   history moved to appendices.
+- Part C kernel primitive implemented (ahead of the H1 gate, since it is
+  back-compatible): directional `MLX5_VFMIG_DIR_FLAG_{INITIATOR,RESPONDER}`
+  flags on SUSPEND/RESUME_VHCA driving single ladder edges; the
+  `vfmig_suspended` bool replaced by tri-state `vfmig_dp_state`
+  (RUNNING/P2P/STOP) via a shared `vfmig_dp_transition()` helper; SAVE
+  self-suspend made depth-aware (skip from STOP, complete from P2P);
+  teardown force-resume walks any outstanding edges. Directional-flags
+  content folded into A.6/A.3 as the implemented reference. New harness
+  `test_directional_suspend_resume.sh`, a SAVE-from-P2P subtest in
+  `test_suspend_resume_split.sh`, and ~16 dump-bracket harnesses converted
+  to the two-phase directional quiesce -- full sweep green.
+- Standalone "Part C" section dissolved: the directional primitive was
+  implemented (A.3/A.4/A.6), so the still-proposed cross-host
+  orchestration built on it moved to Appendix D and the redundant
+  implemented-primitive subsections were dropped.
+
+## Appendix D: proposed cross-host orchestration (H1)
+
+> Status: PROPOSED, gated on D.1. The kernel primitive it relies on
+> (directional flags + tri-state `vfmig_dp_state`) is IMPLEMENTED
+> (A.6/A.3); what is proposed here is the CRIU/orchestrator-side
+> sequencing that drives it across two hosts. This is the fix shape for
+> the ib_write_bw post-restore ERR *only if* that failure turns out to be
+> a cross-host ordering race rather than the Stage-1 MKEY/MTT gap (see the
+> Known limitation). The primitive was landed ahead of this gate because
+> it is back-compatible (`flags == 0` is byte-identical to before) and
+> independently useful; the orchestration below is not built yet.
+
+### D.1 Motivation and validation gate
+
+`ib_write_bw_vfmig_criu_swap` regressed on the new setups: after a CRIU
+swap the one-sided WRITE client makes brief forward progress
+(`last_acked_psn` advances, one ~17.5 Gb/s sample) and then its RC QP
+flips to ERR, while the peer responder stays healthy in RTR. The
+two-sided `rdma_test_agent_..._after_qp` control *passes* on the same
+setup -- and its post-restore round-trip acts as an **implicit readiness
+barrier** (a single request cannot complete until both endpoints are up,
+and RC retries paper over the startup gap), whereas ib_write_bw resumes
+streaming with no barrier.
+
+H1: the restore path resumes **each VF's datapath fully and independently
+per host** (Part A's bind-time inline resume drives the RESPONDER+
+INITIATOR pair). With no cross-host ordering guarantee, the client
+initiator can go live and post WRITEs before the peer responder has
+resumed at the restored `epsn`; the stream hits a divergence seam, retries
+`retry_count=7` times, and the QP goes to ERR. This is the VFIO P2P
+quiescing problem, but *between hosts*.
+
+**Validation gate**: H1 vs the Stage-1 MKEY/MTT gap is decided by the
+error-CQE syndrome -- `0x15/0x16` (retry-exceeded) confirms H1;
+`0x04/0x11` (local protection/access) points at the MTT gap. As of the
+last run the syndrome had not been captured (no `mlx5_poll_one` error-cqe
+line surfaced), and the "client restored before VF/link exists" sub-theory
+was refuted by the restore timeline (both links active before CRIU
+restore). Do not build the orchestration below until the syndrome
+confirms H1.
+
+### D.2 Restore barrier: post-bind initiator park
+
+Reuse the *proven* bind->RUNNING arc (Appendix B) and park only the
+initiator afterward -- do NOT bind straight into RUNNING_P2P through the
+probe until that is proven safe (same command-ring hazard as A.5):
+
+```
+bind VF                 -> RUNNING (inline resume pair; probe cmd ring OK)
+configure while RUNNING:    ip link set vf mac; ip addr add (GID); ip neigh
+SUSPEND_VHCA(INITIATOR) -> RUNNING_P2P  (responder live; initiator parked)
+CRIU restores VMAs / process memory
+=== cross-host barrier: every migrated VF is RUNNING_P2P AND memory in place ===
+RESUME_VHCA(INITIATOR)  -> RUNNING       (first WRITE hits a live, PSN-aligned peer)
+```
+
+The kernel only exposes the two phases (A.6) and the
+`query_vf`-observable `vfmig_dp_state`. The cross-host rendezvous ("hold
+all initiators until every peer responder is up") is an **orchestrator /
+CRIU-plugin** responsibility, not a kernel one: `RESUME_DEVICES_LATE`
+grows two sub-steps with a barrier between them -- responder-live (bind
+reaches RUNNING, then only the initiator is parked to RUNNING_P2P) ->
+control-channel barrier -> resume-initiator. Parking only the initiator
+is one option; the CRIU agent may instead resume the fused pair exactly
+as today. The kernel exposes both and the choice is CRIU-agent policy.
+
+The `STOP -> RUNNING_P2P` edge (`RESUME(RESPONDER)`) exists for the *other*
+restore path -- defer-resume, which leaves the VHCA in STOP after LOAD:
+if that path is combined with the barrier, phase 1 is `RESUME(RESPONDER)`
+and phase 2 is `RESUME(INITIATOR)`.
+
+### D.3 Dump barrier: two-phase quiesce (candidate root cause)
+
+The resume-ordering race (D.1) has a dump-side twin that may be the
+*actual* corruption source. Today the SAVE side parks each VF with the
+fused pair (`SUSPEND(INITIATOR)` then `SUSPEND(RESPONDER)` -> STOP),
+**independently per host, with no cross-host barrier**. For a connected RC
+pair that is not safe:
+
+> If host A completes *both* suspends (reaches STOP) while host B is still
+> RUNNING, B's initiator keeps sending to an A whose responder is already
+> dead. Those in-flight requests are dropped, and A's captured responder
+> state (`epsn`, `msn`, ...) does not account for them. On restore the two
+> images disagree at exactly one PSN seam -- the shape we see in
+> ib_write_bw. One side finishing both operations before the other starts
+> either is precisely the hazard.
+
+This is the classic reason VFIO quiesces an entire P2P group to
+`RUNNING_P2P` before any member goes to STOP. The symmetric dump flow is
+the inverse of the D.2 resume order, and is exactly where the standalone
+`SUSPEND_VHCA(RESPONDER)` edge (A.6) earns its keep:
+
+```
+SUSPEND_VHCA(INITIATOR) on every VF   -> all peers at RUNNING_P2P
+                                         (no new requests originated;
+                                          responders still drain + ACK)
+=== cross-host barrier: all initiators parked, in-flight drained ===
+SUSPEND_VHCA(RESPONDER) on every VF   -> all peers at STOP
+capture (SAVE_VHCA_STATE)
+```
+
+The existing dump-bracket harnesses already issue this two-phase order on
+a single host (a no-op barrier); the real cross-host barrier is the CRIU
+side. A full H1 fix therefore likely touches **both** the dump and restore
+sides. As with D.1, gate implementation on confirming the failure is a
+PSN/ordering seam (the CQE syndrome).
+
+### D.4 Prerequisite: RUNNING_P2P hold-window probe (kernel-owned)
+
+Before the CRIU-side barrier is worth building, the kernel must answer one
+question the current tests do NOT cover: can a **host-bound** VF sit at
+**RUNNING_P2P** (initiator parked, responder live) for the full duration
+of a restore -- tens of seconds, budget ~5 min -- while a peer keeps
+sending it RDMA traffic, then return cleanly to RUNNING via
+`RESUME(INITIATOR)`, with no command-ring timeout, FW health syndrome,
+device fatal/recovery, or silent FSM decay? The directional harness only
+soaks an *unbound* VF; "responder-live, initiator-parked, under load, for
+a long time" on a bound VF has never been exercised.
+
+Probe (needs only the directional flags, no CRIU; a peer drives inbound
+load):
+
+1. Bind a VF to `mlx5_core`, configure netdev (MAC/GID/neigh) -- the real
+   restore config, not a bare VFIO handle -- and bring up an RC QP to a
+   peer that will drive inbound traffic.
+2. Peer streams RDMA WRITEs (ideally a few READs) *to* our VF so its
+   responder stays continuously active.
+3. `SUSPEND_VHCA(INITIATOR)` -> assert `dp_state == RUNNING_P2P`.
+4. **Soak** at RUNNING_P2P under inbound load at `T=60s` and `T=300s`;
+   repeat each *idle* (no inbound) to separate "load keeps it alive" from
+   "stable regardless".
+5. `RESUME_VHCA(INITIATOR)` -> assert `dp_state == RUNNING`; post from our
+   initiator and confirm normal completion; tear down clean.
+
+PASS (all, for every T): `dp_state` stays RUNNING_P2P for the whole soak;
+responder keeps serving inbound ops (peer completions succeed, no growing
+retransmit); no `mlx5_core` command timeout, FW health-buffer syndrome,
+devlink `fw`/`fw_fatal` reporter trip, or "Fatal error"/recovery in dmesg;
+after resume the initiator completes normally with the QP not in ERR.
+FAIL: any command-ring timeout / FW syndrome during the hold; device
+fatal / recovery / VF reset; responder stops ACKing while parked; or state
+leaves RUNNING_P2P without an ioctl.
+
+Instrument: `dp_state` polled via `query_vf` across the soak; dmesg (mlx5
+health, `cmd_ent`/command timeout, EQ/async, fatal); devlink health
+reporters before/during/after; peer-side completion status + retransmit
+counters. Writeup answers: PASS/FAIL at 60s and 300s (loaded + idle); if
+FAIL, the empirical max safe hold and failing signature; whether a
+**driver keepalive** (periodic FW command while parked) is required over a
+long hold -- if so that is a driver change to spec *before* the barrier
+lands; and any host-bound vs VFIO-bound divergence. The CRIU side can
+supply the inbound-load generator (an `ib_write_bw --run_infinitely`
+config or a trimmed `rdma_test_agent` responder).
