@@ -633,11 +633,16 @@ int rxe_qp_restore_inflight(struct rxe_qp *qp,
 			    const void *sq_image, const void *rq_image,
 			    const void *res_image)
 {
+	int err;
+
 	if (sq_image) {
-		if (!qp->sq.queue ||
-		    queue_data_size(qp->sq.queue) != req->sq_image_bytes)
+		if (!qp->sq.queue)
 			return -EINVAL;
-		memcpy(qp->sq.queue->buf->data, sq_image, req->sq_image_bytes);
+		err = queue_inflight_restore(qp->sq.queue, req->sq_producer,
+					     req->sq_consumer, sq_image,
+					     req->sq_image_bytes);
+		if (err)
+			return err;
 		rxe_qp_seed_ring(qp->sq.queue, req->sq_producer,
 				 req->sq_consumer);
 		/* rewind requester to the unacked tail for replay */
@@ -645,10 +650,13 @@ int rxe_qp_restore_inflight(struct rxe_qp *qp,
 	}
 
 	if (rq_image) {
-		if (!qp->rq.queue || qp->srq ||
-		    queue_data_size(qp->rq.queue) != req->rq_image_bytes)
+		if (!qp->rq.queue || qp->srq)
 			return -EINVAL;
-		memcpy(qp->rq.queue->buf->data, rq_image, req->rq_image_bytes);
+		err = queue_inflight_restore(qp->rq.queue, req->rq_producer,
+					     req->rq_consumer, rq_image,
+					     req->rq_image_bytes);
+		if (err)
+			return err;
 		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
 				 req->rq_consumer);
 	}

@@ -66,7 +66,8 @@
  * dumper provides the output buffer; it learns the authoritative byte length
  * from the resp blob and round-trips the bytes opaquely. Absent attr (dumper
  * didn't ask) or zero-length image is a no-op; a provided-but-too-small
- * buffer is a hard error (no silent truncation).
+ * buffer is a hard error (no silent truncation). Used for fixed-shape arrays
+ * (the RC responder-resources array); ring images use rxe_query_emit_ring.
  */
 static int rxe_query_emit_image(struct uverbs_attr_bundle *attrs,
 				u16 attr_id, const void *data, u32 len)
@@ -83,6 +84,47 @@ static int rxe_query_emit_image(struct uverbs_attr_bundle *attrs,
 		return -ENOSPC;
 
 	return uverbs_copy_to(attrs, attr_id, data, len);
+}
+
+/*
+ * Emit one optional CQE/WQE ring image attr, shipping only the in-flight
+ * [consumer, producer) subspan rather than the whole ring. @producer /
+ * @consumer are the caller's coherent cursor snapshot; the emitted image
+ * agrees byte-for-byte with the cursors carried in the resp blob. A level
+ * ring (or a dumper that didn't ask for the attr) is a no-op; a
+ * provided-but-too-small buffer is a hard error. Linearizing the live
+ * subspan is what keeps a default ib_send_bw ring (rx_depth 512 ->
+ * 128 KiB) under the u16 uverbs attr length that the whole-ring blit used
+ * to overflow with -ENOSPC.
+ */
+static int rxe_query_emit_ring(struct uverbs_attr_bundle *attrs, u16 attr_id,
+			       const struct rxe_queue *q,
+			       u32 producer, u32 consumer)
+{
+	u32 count = (producer - consumer) & q->index_mask;
+	size_t bytes = (size_t)count << q->log2_elem_size;
+	int user_len, ret;
+	void *tmp;
+
+	if (!uverbs_attr_is_valid(attrs, attr_id) || bytes == 0)
+		return 0;
+
+	user_len = uverbs_attr_get_len(attrs, attr_id);
+	if (user_len < 0)
+		return 0;
+	if ((u32)user_len < bytes)
+		return -ENOSPC;
+
+	tmp = kmalloc(bytes, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+
+	ret = queue_inflight_capture(q, producer, consumer, tmp, bytes);
+	if (ret >= 0)
+		ret = uverbs_copy_to(attrs, attr_id, tmp, bytes);
+
+	kfree(tmp);
+	return ret;
 }
 
 /* v0 QP type gate: the IBTA types rxe_restore_qp accepts. */
@@ -260,19 +302,24 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	 * B1 in-flight state (design/rxe_inflight_qp_restore.md). The QP is
 	 * frozen (rxe_qp_pause) before this verb, so the rings and responder
 	 * resources are quiescent; we read the shared-page cursors and report
-	 * the slot-region / resource-array byte lengths, then emit the raw
-	 * images below. The dumper hands these straight back on RESTORE_QP.
+	 * the in-flight [consumer, producer) subspan byte length (SQ/RQ) and
+	 * the resource-array byte length, then emit the raw images below. The
+	 * dumper hands these straight back on RESTORE_QP.
 	 */
 	blob.sq_producer = queue_get_producer(qp->sq.queue, qp->sq.queue->type);
 	blob.sq_consumer = queue_get_consumer(qp->sq.queue, qp->sq.queue->type);
-	blob.sq_image_bytes = queue_data_size(qp->sq.queue);
+	blob.sq_image_bytes = ((blob.sq_producer - blob.sq_consumer) &
+			       qp->sq.queue->index_mask)
+			      << qp->sq.queue->log2_elem_size;
 
 	if (qp->rq.queue && !qp->srq) {
 		blob.rq_producer = queue_get_producer(qp->rq.queue,
 						      qp->rq.queue->type);
 		blob.rq_consumer = queue_get_consumer(qp->rq.queue,
 						      qp->rq.queue->type);
-		blob.rq_image_bytes = queue_data_size(qp->rq.queue);
+		blob.rq_image_bytes = ((blob.rq_producer - blob.rq_consumer) &
+				       qp->rq.queue->index_mask)
+				      << qp->rq.queue->log2_elem_size;
 	}
 
 	blob.resp_ack_psn	= qp->resp.ack_psn;
@@ -302,17 +349,17 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	if (err)
 		return err;
 
-	err = rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
-				      qp->sq.queue->buf->data,
-				      blob.sq_image_bytes);
+	err = rxe_query_emit_ring(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+				  qp->sq.queue, blob.sq_producer,
+				  blob.sq_consumer);
 	if (err)
 		return err;
 
-	if (blob.rq_image_bytes) {
-		err = rxe_query_emit_image(attrs,
-					      RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
-					      qp->rq.queue->buf->data,
-					      blob.rq_image_bytes);
+	if (qp->rq.queue && !qp->srq) {
+		err = rxe_query_emit_ring(attrs,
+					  RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+					  qp->rq.queue, blob.rq_producer,
+					  blob.rq_consumer);
 		if (err)
 			return err;
 	}
@@ -361,20 +408,27 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	 * under it. In the real CRIU flow the dumpee is stopped and all its
 	 * feeding QPs are frozen, so the ring is quiescent and the post-drop
 	 * image read is stable; the lock just closes the cross-context race.
+	 *
+	 * cqe_image_bytes is the in-flight [consumer, producer) subspan
+	 * (unreaped completions), not queue_data_size(): the whole ring
+	 * overflows the u16 uverbs attr length for any non-trivial CQ.
 	 */
-	blob.cqe_image_bytes = queue_data_size(cq->queue);
 	spin_lock_irq(&cq->cq_lock);
 	blob.producer = queue_get_producer(cq->queue, cq->queue->type);
 	blob.consumer = queue_get_consumer(cq->queue, cq->queue->type);
 	spin_unlock_irq(&cq->cq_lock);
+
+	blob.cqe_image_bytes = ((blob.producer - blob.consumer) &
+				cq->queue->index_mask)
+			       << cq->queue->log2_elem_size;
 
 	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
 			     &blob, sizeof(blob));
 	if (err)
 		return err;
 
-	return rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE,
-				    cq->queue->buf->data, blob.cqe_image_bytes);
+	return rxe_query_emit_ring(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE,
+				   cq->queue, blob.producer, blob.consumer);
 }
 
 DECLARE_UVERBS_NAMED_METHOD(

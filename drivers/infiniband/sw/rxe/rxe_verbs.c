@@ -727,13 +727,17 @@ out:
 }
 
 /*
- * CRIU in-flight CQ restore: blit the captured CQE ring image into the
- * freshly-created ring. Mirrors rxe_restore_qp_inflight, but a CQ has a
- * single ring so there is one image. The image geometry must match what
- * rxe_cq_from_init just built; a mismatch is rejected rather than silently
- * corrupting the ring. The caller seeds the cursors (rxe_cq_seed_ring) once
- * this returns -- the producer/consumer live in the ring header, disjoint
- * from buf->data, so blit order does not matter.
+ * CRIU in-flight CQ restore: scatter the captured in-flight CQE image
+ * (the [consumer, producer) subspan QUERY_CQ emitted, in logical order)
+ * back into the freshly-created ring, landing each entry at its source
+ * slot so the resumed client's cached consumer index still points at the
+ * right CQEs. Mirrors rxe_restore_qp_inflight, but a CQ has a single ring
+ * so there is one image. The image geometry must match what rxe_cq_from_init
+ * just built (validated by queue_inflight_restore against the cursors); a
+ * mismatch is rejected rather than silently corrupting the ring. The caller
+ * seeds the cursors (rxe_cq_seed_ring) once this returns -- the producer/
+ * consumer live in the ring header, disjoint from buf->data, so order does
+ * not matter.
  */
 static int rxe_restore_cq_inflight(struct rxe_cq *cq,
 				   const struct rxe_restore_cq_req *req,
@@ -743,8 +747,6 @@ static int rxe_restore_cq_inflight(struct rxe_cq *cq,
 	void *buf;
 	int err;
 
-	if (queue_data_size(cq->queue) != req->cqe_image_bytes)
-		return -EINVAL;
 	if (udata->inlen != hdr + req->cqe_image_bytes)
 		return -EINVAL;
 
@@ -756,7 +758,8 @@ static int rxe_restore_cq_inflight(struct rxe_cq *cq,
 	if (err)
 		goto out;
 
-	memcpy(cq->queue->buf->data, buf + hdr, req->cqe_image_bytes);
+	err = queue_inflight_restore(cq->queue, req->producer, req->consumer,
+				     buf + hdr, req->cqe_image_bytes);
 out:
 	kvfree(buf);
 	return err;
