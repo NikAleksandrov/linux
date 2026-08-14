@@ -1751,6 +1751,35 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 	err = mlx5_ib_init_dmabuf_mr(mr);
 	if (err)
 		goto err_dereg_mr;
+
+	/*
+	 * retag the dma buf IOVA as (KIND_MR, mkey_index) so that
+	 * SAVE_VHCA_STATE emits HOST_USER_PAGE records and
+	 * LOAD_VHCA_STATE creates an awaiting_bind placeholder for
+	 * RESTORE_MR
+	 */
+	if (dev->mdev->cmd.vfmig_iova_dom) {
+		struct ib_umem_dmabuf *ud = to_ib_umem_dmabuf(mr->umem);
+
+		if (ud->sgt && ud->sgt->sgl) {
+			size_t retag_len = ALIGN(mr->umem->length, PAGE_SIZE);
+			u32 mkey_index = mr->mmkey.key >> 8;
+			dma_addr_t iova_base;
+			int retag_err;
+
+			iova_base = sg_dma_address(ud->sgt->sgl) & PAGE_MASK;
+			retag_err = mlx5_vfmig_retag_user_mr(dev->mdev,
+							     mkey_index,
+							     iova_base,
+							     retag_len);
+			if (retag_err)
+				mlx5_ib_warn(dev,
+					     "vfmig: dmabuf MR retag failed: mkey=0x%x iova=0x%llx len=0x%zx err=%d -- MR usable but not CRIU-restorable\n",
+					     mkey_index, (u64)iova_base,
+					     retag_len, retag_err);
+		}
+	}
+
 	return &mr->ibmr;
 
 err_dereg_mr:
