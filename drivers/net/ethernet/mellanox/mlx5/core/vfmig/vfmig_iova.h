@@ -211,6 +211,7 @@ enum vfmig_iova_slot {
 	VFMIG_SLOT_FRAG_BUF	= 5,
 	VFMIG_SLOT_DB_PAGE	= 6,
 	VFMIG_SLOT_USER_PAGE	= 7,
+	VFMIG_SLOT_USER_MMIO	= 8,
 	VFMIG_SLOT_NR,	/* count, must stay <= VFMIG_IOVA_NR_SLOTS */
 };
 
@@ -415,34 +416,75 @@ enum vfmig_huobj_kind {
 #define VFMIG_IOVA_KCOHERENT_BYTES	(1ULL << 30)	/* 1 GiB */
 
 /*
+ * USER_MMIO sub-window: a fixed VFMIG_IOVA_USER_MMIO_BYTES carve
+ * reserved for peer/MMIO (GPU BAR) dma-buf MRs -- see
+ * VFMIG_SLOT_USER_MMIO. Unlike kcoherent (carved from the BOTTOM of
+ * USER_PAGE's window), this is carved from the TOP of the
+ * deterministic range, immediately below the transient arena, and
+ * given its own slot number rather than living inside USER_PAGE's
+ * window: MMIO entries need their own wire record type (a source-host
+ * BAR phys address is meaningless on the destination) and their own
+ * (kind, fw_id) retag/bind semantics, which is cleaner as a distinct
+ * slot than as an unretaggable sub-arena like kcoherent.
+ *
+ * Sizing: 2 GiB is deliberately generous relative to expected GPU
+ * dma-buf MR *count* (far fewer, larger allocations than typical CPU
+ * umem MRs), not a hard requirement -- revisit if real workloads need
+ * more concurrent GPU dma-buf MRs than this comfortably holds.
+ *
+ * This shrinks VFMIG_SLOT_USER_PAGE's effective expand-to-fill budget
+ * by VFMIG_IOVA_USER_MMIO_BYTES (see vfmig_iova_slot_end()). That is
+ * a wire-incompatible shift for USER_PAGE, same as the KCOHERENT
+ * carve was when introduced -- acceptable for the same reason: no
+ * in-the-wild SAVE blob relies on USER_PAGE's exact window today
+ * (replay isn't wired up yet).
+ */
+#define VFMIG_IOVA_USER_MMIO_BYTES	(2ULL << 30)	/* 2 GiB */
+
+/*
  * Per-VF slot fan-out for the deterministic allocator.
  *
- * Asymmetric layout (introduced when VFMIG_SLOT_USER_PAGE was added):
+ * Asymmetric layout (introduced when VFMIG_SLOT_USER_PAGE was added;
+ * extended when VFMIG_SLOT_USER_MMIO was added):
  *
- *   - Slots 0..6 (VFMIG_IOVA_KERNEL_NR_SLOTS == NR_SLOTS - 1) are
- *     fixed-size kernel slots, each VFMIG_IOVA_SLOT_BYTES (510 MiB)
- *     wide. Slot N occupies
+ *   - Slots 0..6 (VFMIG_IOVA_KERNEL_NR_SLOTS == 7 slot-widths,
+ *     counting the unused reserved slot 0) are fixed-size kernel
+ *     slots, each VFMIG_IOVA_SLOT_BYTES (510 MiB) wide. Slot N
+ *     occupies
  *       [base + N * SLOT_BYTES, base + (N+1) * SLOT_BYTES).
  *     Slot 0 is reserved for VFMIG_SLOT_INVALID and is never
- *     allocated from; real kernel allocations live in slots 1..6.
+ *     allocated from; real kernel allocations live in slots 1..6
+ *     (6 of them). VFMIG_IOVA_KERNEL_NR_SLOTS is a fixed constant
+ *     (not derived from NR_SLOTS - 1 any more) now that two
+ *     non-kernel slots (USER_PAGE, USER_MMIO) exist -- it stays 7
+ *     because USER_PAGE's base is fixed at slot-index 7 regardless
+ *     of how many total slots exist.
  *
  *   - Slot 7 (VFMIG_SLOT_USER_PAGE) is "expand-to-fill", with
  *     the bottom VFMIG_IOVA_KCOHERENT_BYTES of its window
- *     reserved for the non-migrated kcoherent sub-arena. The
- *     user-MR sub-window therefore occupies
- *       [base + 7 * SLOT_BYTES + KCOHERENT_BYTES, transient.base),
+ *     reserved for the non-migrated kcoherent sub-arena, and the
+ *     top VFMIG_IOVA_USER_MMIO_BYTES carved out for slot 8
+ *     (VFMIG_SLOT_USER_MMIO, see below). The user-MR sub-window
+ *     therefore occupies
+ *       [base + 7 * SLOT_BYTES + KCOHERENT_BYTES,
+ *        transient.base - USER_MMIO_BYTES),
  *     which is exactly
  *       VFMIG_IOVA_PER_VF
  *         - VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES
  *         - VFMIG_IOVA_KCOHERENT_BYTES
+ *         - VFMIG_IOVA_USER_MMIO_BYTES
  *         - VFMIG_IOVA_TRANSIENT_BYTES
  *     bytes wide. At higher PER_VF values USER_PAGE absorbs the
- *     entire excess. Concretely (KCOHERENT = 256 MiB):
+ *     entire excess. Concretely (KCOHERENT = 1 GiB, USER_MMIO = 2 GiB):
  *
  *       PER_VF (GiB)   USER_PAGE budget
- *       4              ~254 MiB
- *       16             ~12.25 GiB
- *       128 (default)  ~124.25 GiB
+ *       128 (default)  ~121.25 GiB
+ *
+ *   - Slot 8 (VFMIG_SLOT_USER_MMIO) is fixed-size,
+ *     [transient.base - USER_MMIO_BYTES, transient.base). Unlike the
+ *     kernel slots it is NOT at base + 8 * SLOT_BYTES -- that would
+ *     land inside USER_PAGE's much larger window. It has no lower
+ *     sub-arena carve of its own (no kcoherent-style split).
  *
  * Why kernel slots are pinned at 510 MiB rather than scaling with
  * PER_VF: the kernel call-site footprint (cmd ring, FW pages, EQs,
@@ -451,25 +493,27 @@ enum vfmig_huobj_kind {
  * elastically. Pinning the kernel slot size also makes a SAVE blob
  * captured on a PER_VF=N kernel still replayable on a PER_VF=M >= N
  * kernel for the kernel-slot wire records: kernel-slot IOVAs are
- * PER_VF-independent, only USER_PAGE records have a PER_VF-dependent
- * upper bound (and only when the destination's PER_VF is smaller
- * than the source's).
+ * PER_VF-independent, only USER_PAGE/USER_MMIO records have a
+ * PER_VF-dependent upper bound (and only when the destination's
+ * PER_VF is smaller than the source's).
  *
- * The 8-slot fan-out is fixed: USER_PAGE pinned at index 7 means
- * any future kernel-slot additions must reuse one of slots 1..6 or
- * find a different way to grow (e.g. wide vs. narrow slot encoding)
- * because renumbering existing slots would change every deployed
- * kernel-slot IOVA -- a wire-incompatible change.
+ * The 9-slot fan-out is fixed: USER_PAGE pinned at index 7 and
+ * USER_MMIO at index 8 means any future kernel-slot additions must
+ * reuse one of slots 1..6 or find a different way to grow (e.g. wide
+ * vs. narrow slot encoding) because renumbering existing slots would
+ * change every deployed kernel-slot IOVA -- a wire-incompatible
+ * change.
  */
-#define VFMIG_IOVA_NR_SLOTS		8U
-#define VFMIG_IOVA_KERNEL_NR_SLOTS	(VFMIG_IOVA_NR_SLOTS - 1U)
+#define VFMIG_IOVA_NR_SLOTS		9U
+#define VFMIG_IOVA_KERNEL_NR_SLOTS	7U
 #define VFMIG_IOVA_SLOT_BYTES		(510ULL << 20)	/* 510 MiB, fixed */
 
 static_assert(VFMIG_IOVA_PER_VF >
 	      (u64)VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES +
 	      VFMIG_IOVA_KCOHERENT_BYTES +
+	      VFMIG_IOVA_USER_MMIO_BYTES +
 	      VFMIG_IOVA_TRANSIENT_BYTES,
-	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit 7 fixed 510-MiB kernel slots + KCOHERENT + 16 MiB transient + at least one user-MR IOVA");
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit 6 fixed 510-MiB kernel slots + KCOHERENT + USER_MMIO + 16 MiB transient + at least one user-MR IOVA");
 static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
 
@@ -693,6 +737,31 @@ int  vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
 				   phys_addr_t phys, size_t len, gfp_t gfp,
 				   dma_addr_t *iova_out);
 int  vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
+				     dma_addr_t iova, size_t len);
+
+/*
+ * vfmig_iova_user_mmio_map_phys / _unmap_phys: same contract as
+ * vfmig_iova_user_page_map_phys / _unmap_phys above, but for
+ * VFMIG_SLOT_USER_MMIO instead of VFMIG_SLOT_USER_PAGE, and the
+ * iommu_map() call uses IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO
+ * (no IOMMU_CACHE -- this is peer/BAR memory, not cacheable system
+ * memory) instead of READ | WRITE | CACHE.
+ *
+ * Called from vfmig_dma_ops_map_phys() / _unmap_phys() when the
+ * caller passed DMA_ATTR_MMIO (see vfmig_dma_ops.c). @phys need NOT
+ * be backed by a struct page -- it may be a GPU BAR physical address
+ * with no kernel-visible page structure at all.
+ *
+ * Retag (vfmig_iova_retag_external_range()) and the existing
+ * (kind, fw_id) secondary index work unmodified on USER_MMIO entries
+ * -- they key off @external and @instance_key, not @slot. Restore-
+ * side binding (vfmig_iova_bind_user_object()) does NOT yet support
+ * USER_MMIO siblings; see its doc comment.
+ */
+int  vfmig_iova_user_mmio_map_phys(struct vfmig_iova_domain *dom,
+				   phys_addr_t phys, size_t len, gfp_t gfp,
+				   dma_addr_t *iova_out);
+int  vfmig_iova_user_mmio_unmap_phys(struct vfmig_iova_domain *dom,
 				     dma_addr_t iova, size_t len);
 
 /*
@@ -1186,6 +1255,18 @@ static inline int vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
 	return -EOPNOTSUPP;
 }
 static inline int vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
+						  dma_addr_t iova, size_t len)
+{
+	return -EOPNOTSUPP;
+}
+static inline int vfmig_iova_user_mmio_map_phys(struct vfmig_iova_domain *dom,
+						phys_addr_t phys, size_t len,
+						gfp_t gfp,
+						dma_addr_t *iova_out)
+{
+	return -EOPNOTSUPP;
+}
+static inline int vfmig_iova_user_mmio_unmap_phys(struct vfmig_iova_domain *dom,
 						  dma_addr_t iova, size_t len)
 {
 	return -EOPNOTSUPP;

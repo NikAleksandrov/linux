@@ -407,12 +407,32 @@ vfmig_iova_user_page_start(const struct vfmig_iova_domain *dom)
 }
 
 /*
+ * USER_MMIO's starting IOVA. Fixed-size window carved from the TOP
+ * of the deterministic range (immediately below the transient arena),
+ * NOT at the uniform base + 8 * SLOT_BYTES position -- that would
+ * land inside USER_PAGE's much larger expand-to-fill window. See the
+ * VFMIG_IOVA_USER_MMIO_BYTES doc comment in vfmig_iova.h.
+ *
+ * Like vfmig_iova_slot_end() for USER_PAGE, this depends on
+ * dom->transient.base, which vfmig_iova_domain_create() must compute
+ * before initializing per-slot cursors.
+ */
+static inline u64
+vfmig_iova_user_mmio_start(const struct vfmig_iova_domain *dom)
+{
+	return dom->transient.base - VFMIG_IOVA_USER_MMIO_BYTES;
+}
+
+/*
  * The deterministic IOVA range has an asymmetric layout: kernel slots
- * 0..6 are each VFMIG_IOVA_SLOT_BYTES (510 MiB) wide, and slot 7
+ * 0..6 are each VFMIG_IOVA_SLOT_BYTES (510 MiB) wide, slot 7
  * (VFMIG_SLOT_USER_PAGE) absorbs everything between
- * slot_base(USER_PAGE) and the transient arena's base. That makes
- * "slot end" trivial for kernel slots and a separate lookup for
- * USER_PAGE: dom->transient.base is the inclusive upper bound.
+ * slot_base(USER_PAGE) and the start of the USER_MMIO carve, and
+ * slot 8 (VFMIG_SLOT_USER_MMIO) is the fixed-size carve immediately
+ * below the transient arena's base. That makes "slot end" trivial
+ * for kernel slots and a separate lookup for USER_PAGE/USER_MMIO:
+ * dom->transient.base (offset by USER_MMIO_BYTES for USER_PAGE) is
+ * the inclusive upper bound.
  *
  * Note: vfmig_iova_domain_create() computes dom->transient.base
  * directly (PER_VF - TRANSIENT_BYTES from base), not via this helper,
@@ -424,6 +444,8 @@ vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
 		    enum vfmig_iova_slot slot)
 {
 	if (slot == VFMIG_SLOT_USER_PAGE)
+		return vfmig_iova_user_mmio_start(dom);
+	if (slot == VFMIG_SLOT_USER_MMIO)
 		return dom->transient.base;
 	return dom->base + (u64)(slot + 1) * VFMIG_IOVA_SLOT_BYTES;
 }
@@ -446,7 +468,8 @@ vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
  *     is rejected with -ERANGE -- which is exactly the right
  *     behaviour: kcoherent IOVAs must never be re-installed via
  *     replay.
- *   - Anything in [user_page_start, transient.base) is USER_PAGE.
+ *   - Anything in [user_page_start, user_mmio_start) is USER_PAGE.
+ *   - Anything in [user_mmio_start, transient.base) is USER_MMIO.
  *   - Anything >= transient.base belongs to the transient arena (or
  *     is out of range entirely) -- not a deterministic slot.
  */
@@ -459,6 +482,8 @@ vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
 		return VFMIG_SLOT_INVALID;
 	if (iova >= dom->transient.base)
 		return VFMIG_SLOT_INVALID;
+	if (iova >= vfmig_iova_user_mmio_start(dom))
+		return VFMIG_SLOT_USER_MMIO;
 	off = iova - dom->base;
 	idx = off / VFMIG_IOVA_SLOT_BYTES;
 	if (idx >= VFMIG_SLOT_USER_PAGE) {
@@ -609,7 +634,7 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 					enum vfmig_iova_slot slot,
 					u64 instance_key, u64 iova,
 					phys_addr_t phys, size_t len,
-					gfp_t gfp,
+					int iommu_prot, gfp_t gfp,
 					struct vfmig_iova_page **out_p)
 {
 	struct vfmig_iova_page *p;
@@ -623,9 +648,14 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR)
 		return -EINVAL;
 	{
-		u64 lo = (slot == VFMIG_SLOT_USER_PAGE)
-			? vfmig_iova_user_page_start(dom)
-			: vfmig_iova_slot_base(dom, slot);
+		u64 lo;
+
+		if (slot == VFMIG_SLOT_USER_PAGE)
+			lo = vfmig_iova_user_page_start(dom);
+		else if (slot == VFMIG_SLOT_USER_MMIO)
+			lo = vfmig_iova_user_mmio_start(dom);
+		else
+			lo = vfmig_iova_slot_base(dom, slot);
 		if (iova < lo ||
 		    iova + len > vfmig_iova_slot_end(dom, slot))
 			return -ERANGE;
@@ -647,8 +677,7 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 	p->awaiting_bind = false;
 	RB_CLEAR_NODE(&p->user_index_node);
 
-	err = iommu_map(dom->iommu_dom, iova, phys, len,
-			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp);
+	err = iommu_map(dom->iommu_dom, iova, phys, len, iommu_prot, gfp);
 	if (err) {
 		kfree(p);
 		return err;
@@ -726,16 +755,30 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	dom->vf_id  = vf_id;
 	dom->base   = base;
 	/*
+	 * dom->transient.base must be set before the cursor-init loop
+	 * below: vfmig_iova_slot_end(USER_PAGE) and
+	 * vfmig_iova_user_mmio_start() both read it back (the USER_MMIO
+	 * carve sits immediately below the transient arena). Only @base
+	 * is needed this early; @end/@cursor/@max_pages/@slots are set
+	 * in the full transient-arena setup further down (re-setting
+	 * @base there too is harmless).
+	 */
+	dom->transient.base = base + VFMIG_IOVA_PER_VF -
+			      VFMIG_IOVA_TRANSIENT_BYTES;
+	/*
 	 * Per-slot bump cursors: each starts at its slot's window base.
 	 * Slot 0 (VFMIG_SLOT_INVALID) gets a cursor too, to keep the
 	 * indexing trivial -- alloc_slot rejects SLOT_INVALID before it
 	 * ever touches cursor[0]. next_auto_key[] is zero-initialized
 	 * by kzalloc above; first auto-assignment yields key 1.
 	 *
-	 * USER_PAGE is special-cased: its cursor starts at the
-	 * effective user-MR base, i.e. past the kcoherent sub-arena
-	 * (which lives in the bottom KCOHERENT_BYTES of slot 7's
-	 * window). The kcoherent arena maintains its own independent
+	 * USER_PAGE and USER_MMIO are special-cased: their cursors start
+	 * past their windows' fixed carves (kcoherent at the bottom of
+	 * USER_PAGE's window; USER_MMIO has no such carve of its own,
+	 * so vfmig_iova_slot_base()'s uniform base+8*SLOT_BYTES formula
+	 * would be wrong -- USER_MMIO's real window is the fixed carve
+	 * immediately below the transient arena, not at that uniform
+	 * offset). The kcoherent arena maintains its own independent
 	 * cursor in dom->kcoherent.cursor.
 	 */
 	{
@@ -746,6 +789,8 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 					(enum vfmig_iova_slot)s);
 		dom->cursor[VFMIG_SLOT_USER_PAGE] =
 			vfmig_iova_user_page_start(dom);
+		dom->cursor[VFMIG_SLOT_USER_MMIO] =
+			vfmig_iova_user_mmio_start(dom);
 	}
 
 	/*
@@ -1481,6 +1526,16 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 	dom->cursor[VFMIG_SLOT_USER_PAGE] =
 		max_t(u64, user_page_hwm,
 		      vfmig_iova_user_page_start(dom));
+	/*
+	 * USER_MMIO: same slot_base-uniform-formula mismatch as
+	 * USER_PAGE (its real window is the fixed carve immediately
+	 * below the transient arena, not base + 8 * SLOT_BYTES), but no
+	 * replay high-water mark to preserve yet -- USER_MMIO has no
+	 * stage-2 replay wired (see vfmig_iova_user_mmio_map_phys()
+	 * doc comment). Revisit with the same max_t() pattern as
+	 * USER_PAGE above once that lands.
+	 */
+	dom->cursor[VFMIG_SLOT_USER_MMIO] = vfmig_iova_user_mmio_start(dom);
 	/*
 	 * The kcoherent arena is NOT reset on replay: it has no
 	 * SAVE-side records so there's nothing for replay to land in,
@@ -2232,7 +2287,8 @@ int vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
 	err = vfmig_iova_install_external_phys_locked(dom,
 			VFMIG_SLOT_USER_PAGE,
 			++dom->next_auto_key[VFMIG_SLOT_USER_PAGE],
-			iova, phys, aligned, gfp, &p);
+			iova, phys, aligned,
+			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp, &p);
 	if (err)
 		goto out_unlock;
 
@@ -2285,6 +2341,139 @@ int vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
 	if (p->len != aligned) {
 		dev_warn_ratelimited(&dom->vf_pdev->dev,
 				     "vfmig_iova: vf %u USER_PAGE unmap size mismatch at IOVA 0x%llx: have %zu, asked %zu\n",
+				     dom->vf_id, (u64)iova, p->len, aligned);
+		/* still proceed: the entry is what it is */
+	}
+	list_del(&p->node);
+	dom->n_pages--;
+	vfmig_iova_destroy_page_locked(dom, p);
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+/*
+ * vfmig_iova_user_mmio_map_phys / _unmap_phys: USER_MMIO counterparts
+ * of vfmig_iova_user_page_map_phys / _unmap_phys above. Called from
+ * vfmig_dma_ops_map_phys() / _unmap_phys() (vfmig_dma_ops.c) when the
+ * caller passed DMA_ATTR_MMIO -- i.e. a peer/BAR physical address
+ * (e.g. a GPU dma-buf export) rather than system memory.
+ *
+ * Differs from the USER_PAGE path in two ways:
+ *   - Targets the VFMIG_SLOT_USER_MMIO cursor/window instead of
+ *     USER_PAGE's.
+ *   - iommu_map() uses IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO (no
+ *     IOMMU_CACHE): this is peer/BAR memory, not cacheable system
+ *     memory, and IOMMU_MMIO is the flag dma_map_resource-style
+ *     MMIO mappings are expected to carry.
+ *
+ * Same stage-1 semantics as USER_PAGE: never a HIT (no awaiting_bind
+ * support yet), no IOVA reuse on unmap, auto-numbered instance_key
+ * (retag via vfmig_iova_retag_external_range() works unmodified --
+ * see that function's doc comment). Unlike USER_PAGE, there is no
+ * SAVE-side wire record type for USER_MMIO entries yet (no
+ * VFMIG_WIRE_TAG_HOST_USER_MMIO), and vfmig_iova_bind_user_object()
+ * does not accept USER_MMIO siblings -- both are follow-up work, not
+ * needed to unblock local MR registration.
+ */
+int vfmig_iova_user_mmio_map_phys(struct vfmig_iova_domain *dom,
+				  phys_addr_t phys, size_t len, gfp_t gfp,
+				  dma_addr_t *iova_out)
+{
+	struct vfmig_iova_page *p;
+	size_t aligned;
+	u64 iova, slot_end;
+	int err;
+
+	if (!dom || !iova_out || len == 0)
+		return -EINVAL;
+	if (!IS_ALIGNED(phys, VFMIG_IOVA_GRANULE))
+		return -EINVAL;
+
+	aligned = ALIGN(len, VFMIG_IOVA_GRANULE);
+
+	mutex_lock(&dom->lock);
+
+	iova = dom->cursor[VFMIG_SLOT_USER_MMIO];
+	slot_end = vfmig_iova_slot_end(dom, VFMIG_SLOT_USER_MMIO);
+	if (iova + aligned > slot_end) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_MMIO slot exhausted at cursor 0x%llx (slot_end 0x%llx, asked %zu)\n",
+				     dom->vf_id, iova, slot_end, aligned);
+		err = -ENOSPC;
+		goto out_unlock;
+	}
+
+	p = vfmig_iova_find_locked(dom, iova);
+	if (p) {
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u USER_MMIO: cursor 0x%llx already has a registry entry (slot %u key 0x%llx len %zu); refusing to overwrite\n",
+				    dom->vf_id, iova, p->slot,
+				    (unsigned long long)p->instance_key,
+				    p->len);
+		err = -EEXIST;
+		goto out_unlock;
+	}
+
+	err = vfmig_iova_install_external_phys_locked(dom,
+			VFMIG_SLOT_USER_MMIO,
+			++dom->next_auto_key[VFMIG_SLOT_USER_MMIO],
+			iova, phys, aligned,
+			IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO, gfp, &p);
+	if (err)
+		goto out_unlock;
+
+	dom->cursor[VFMIG_SLOT_USER_MMIO] = iova + aligned;
+	dom->alloc_count[VFMIG_SLOT_USER_MMIO]++;
+	*iova_out = iova;
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+int vfmig_iova_user_mmio_unmap_phys(struct vfmig_iova_domain *dom,
+				    dma_addr_t iova, size_t len)
+{
+	struct vfmig_iova_page *p;
+	size_t aligned;
+	int err;
+
+	if (!dom)
+		return -EINVAL;
+
+	aligned = ALIGN(len, VFMIG_IOVA_GRANULE);
+
+	mutex_lock(&dom->lock);
+
+	p = vfmig_iova_find_locked(dom, (u64)iova);
+	if (!p) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_MMIO unmap: no registry entry at IOVA 0x%llx (asked %zu)\n",
+				     dom->vf_id, (u64)iova, aligned);
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	if (p->slot != VFMIG_SLOT_USER_MMIO) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_MMIO unmap: IOVA 0x%llx belongs to slot %u (expected USER_MMIO)\n",
+				     dom->vf_id, (u64)iova, p->slot);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	if (!p->external) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_MMIO unmap: IOVA 0x%llx is not an external entry\n",
+				     dom->vf_id, (u64)iova);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	if (p->len != aligned) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u USER_MMIO unmap size mismatch at IOVA 0x%llx: have %zu, asked %zu\n",
 				     dom->vf_id, (u64)iova, p->len, aligned);
 		/* still proceed: the entry is what it is */
 	}

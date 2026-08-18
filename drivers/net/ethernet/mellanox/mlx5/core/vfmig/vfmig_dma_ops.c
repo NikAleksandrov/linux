@@ -55,21 +55,33 @@
  * SAVE/LOAD with stable IOVAs, which is what USER_PAGE's
  * registry + replay machinery provides.
  *
- * .map_phys / .unmap_phys route to the non-migrated kcoherent
- * sub-arena instead. The canonical callers are mlx5e RX
- * (page_pool dma_map_page) and TX (dma_map_single per skb
- * fragment), both of which are streaming-rate and would exhibit
- * O(n^2) behaviour through the USER_PAGE registry list (see the
- * detailed comment on vfmig_dma_ops_map_phys below). kcoherent's
- * O(1) bump-cursor path is mandatory for these callers.
+ * .map_phys / .unmap_phys fork further on DMA_ATTR_MMIO:
+ *   - Without DMA_ATTR_MMIO: route to the non-migrated kcoherent
+ *     sub-arena. The canonical callers are mlx5e RX (page_pool
+ *     dma_map_page) and TX (dma_map_single per skb fragment), both
+ *     streaming-rate and would exhibit O(n^2) behaviour through a
+ *     registry list (see the detailed comment on
+ *     vfmig_dma_ops_map_phys below). kcoherent's O(1) bump-cursor
+ *     path is mandatory for these callers.
+ *   - With DMA_ATTR_MMIO: route to the migration-tracked USER_MMIO
+ *     slot (registry list, install_external_phys, same machinery as
+ *     USER_PAGE but a distinct slot/window and no page-content
+ *     concept -- this is peer/BAR memory, e.g. a GPU dma-buf export
+ *     via ib_umem_dmabuf_get -> dma_buf_map_attachment ->
+ *     dma_map_resource-style call with DMA_ATTR_MMIO set). Retag
+ *     (vfmig_iova_retag_external_range) works unmodified; SAVE-side
+ *     wire emission and restore-side bind do not exist yet for this
+ *     slot -- see vfmig_iova_user_mmio_map_phys()'s doc comment.
  *
  * Heuristic: today's exact distinction is
- *   - ib_umem_get -> dma_map_sgtable -> .map_sg     (USER_PAGE)
- *   - mlx5e       -> dma_map_page/single -> .map_phys (kcoherent)
+ *   - ib_umem_get (CPU memory)    -> dma_map_sgtable -> .map_sg      (USER_PAGE)
+ *   - ib_umem_dmabuf_get (MMIO)   -> dma_map_resource -> .map_phys, DMA_ATTR_MMIO (USER_MMIO)
+ *   - mlx5e                       -> dma_map_page/single -> .map_phys (kcoherent)
  * If a future caller breaks this (e.g. an ib_umem path that
- * goes through .map_phys, or an mlx5e path that emits sgtables),
- * the routing will need a more explicit signal -- a custom
- * DMA_ATTR_VFMIG_USER_MR bit, or a separate API entry point.
+ * goes through .map_phys without DMA_ATTR_MMIO, or an mlx5e path
+ * that emits sgtables), the routing will need a more explicit
+ * signal -- a custom DMA_ATTR_VFMIG_USER_MR bit, or a separate API
+ * entry point.
  *
  * Stage 2 (next PR) extends the (iova, len, phys) registry tracking
  * with awaiting_bind support so a destination's .map_sg can consume
@@ -292,14 +304,18 @@ static void vfmig_dma_ops_unmap_sg(struct device *dev, struct scatterlist *sg,
  *   - mlx5e dma_map_page / dma_map_single -> .map_phys
  *
  * DMA_ATTR_MMIO indicates a peer-to-peer mapping of MMIO BAR space
- * rather than system memory. Our iommu_map call would still create
- * a mapping, but the resulting IOVA isn't deterministic across
- * SAVE/LOAD (BAR base addresses differ between source and
- * destination) and we'd need to coordinate with the peer driver to
- * reconstruct the correct phys on LOAD. Stage 1 rejects MMIO with
- * DMA_MAPPING_ERROR; future work will add a "peer dma-buf" wire
- * record type that carries the peer device identity rather than
- * phys.
+ * rather than system memory (e.g. a GPU dma-buf export). Routed to
+ * the VFMIG_SLOT_USER_MMIO registry (vfmig_iova_user_mmio_map_phys),
+ * NOT the kcoherent sub-arena: unlike mlx5e's RX/TX buffers, an MMIO
+ * dma-buf backs a user MR that needs the same migration-tracked
+ * (kind, fw_id) retag semantics as USER_PAGE entries (see
+ * vfmig_iova_retag_external_range(), unchanged for MMIO). What's
+ * still missing (tracked as follow-up, not needed to register an MR
+ * locally): a SAVE-side wire record type for USER_MMIO entries (no
+ * VFMIG_WIRE_TAG_HOST_USER_MMIO yet -- a source-host BAR phys address
+ * is meaningless on the destination, unlike USER_PAGE's phys), and
+ * restore-side binding support in vfmig_iova_bind_user_object()
+ * (currently USER_PAGE-only).
  */
 static dma_addr_t vfmig_dma_ops_map_phys(struct device *dev, phys_addr_t phys,
 					 size_t size,
@@ -314,13 +330,21 @@ static dma_addr_t vfmig_dma_ops_map_phys(struct device *dev, phys_addr_t phys,
 	if (unlikely(!dom))
 		return DMA_MAPPING_ERROR;
 
+	off = phys & ~PAGE_MASK;
+
 	if (attrs & DMA_ATTR_MMIO) {
-		dev_warn_ratelimited(dev,
-				     "vfmig_dma_ops: map_phys with DMA_ATTR_MMIO not supported (peer-to-peer dma-buf is stage-1 out-of-scope); use cpu-memory dma-buf or wait for stage-2\n");
-		return DMA_MAPPING_ERROR;
+		err = vfmig_iova_user_mmio_map_phys(dom, phys & PAGE_MASK,
+						    PAGE_ALIGN(size + off),
+						    GFP_ATOMIC, &iova);
+		if (err) {
+			dev_warn_ratelimited(dev,
+					     "vfmig_dma_ops: map_phys(0x%llx, %zu, MMIO) failed: %d\n",
+					     (u64)phys, size, err);
+			return DMA_MAPPING_ERROR;
+		}
+		return iova + off;
 	}
 
-	off = phys & ~PAGE_MASK;
 	err = vfmig_iova_kcoherent_map_phys(dom, phys & PAGE_MASK,
 					    PAGE_ALIGN(size + off),
 					    GFP_ATOMIC, &iova);
@@ -343,10 +367,15 @@ static void vfmig_dma_ops_unmap_phys(struct device *dev, dma_addr_t handle,
 
 	if (unlikely(!dom))
 		return;
-	if (attrs & DMA_ATTR_MMIO)
-		return;	/* never mapped, see map_phys */
 
 	off = handle & ~PAGE_MASK;
+
+	if (attrs & DMA_ATTR_MMIO) {
+		vfmig_iova_user_mmio_unmap_phys(dom, handle - off,
+						PAGE_ALIGN(size + off));
+		return;
+	}
+
 	vfmig_iova_kcoherent_unmap_phys(dom, handle - off,
 					PAGE_ALIGN(size + off));
 }
