@@ -5804,6 +5804,35 @@ int mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 EXPORT_SYMBOL(mlx5_vfmig_bind_user_mr);
 
 /*
+ * Public entry point for the mlx5_ib RESTORE_MR_DMABUF verb body.
+ * Header docstring lives in include/linux/mlx5/driver.h.
+ *
+ * Like mlx5_vfmig_bind_user_mr, a NULL vfmig_iova_dom surfaces as
+ * -ENODEV rather than silently no-op'ing: a caller reaching this
+ * entry point has already gated on vfmig_restore_mode + a tracked-VF
+ * ucontext and needs the relocate to land.
+ */
+int mlx5_vfmig_relocate_dmabuf_mr(struct mlx5_core_dev *vf_dev,
+				  u32 mkey_index, dma_addr_t fresh_iova,
+				  dma_addr_t *final_iova_out)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !final_iova_out)
+		return -EINVAL;
+	if (mkey_index == 0 || (mkey_index & ~0xffffffU))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_relocate_dmabuf_mr(dom, mkey_index, fresh_iova,
+					     final_iova_out);
+}
+EXPORT_SYMBOL(mlx5_vfmig_relocate_dmabuf_mr);
+
+/*
  * Public Stage-3 D3 destination-side bind entry point for the mlx5_ib
  * RESTORE_CQ verb body. Header docstring lives in
  * include/linux/mlx5/driver.h.

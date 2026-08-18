@@ -2155,6 +2155,112 @@ out_rollback:
 }
 EXPORT_SYMBOL(vfmig_iova_bind_user_object);
 
+int vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
+				  u32 mkey_index, dma_addr_t fresh_iova,
+				  dma_addr_t *final_iova_out)
+{
+	struct vfmig_iova_page *placeholder, *fresh;
+	u64 instance_key;
+	phys_addr_t phys;
+	int err;
+
+	if (!dom || !final_iova_out)
+		return -EINVAL;
+	if (mkey_index == 0 || (mkey_index & ~0xffffffU))
+		return -EINVAL;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_MR, mkey_index);
+
+	mutex_lock(&dom->lock);
+
+	placeholder = vfmig_iova_user_index_lookup_locked(dom, instance_key);
+	if (!placeholder) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	if (!placeholder->external ||
+	    placeholder->slot != VFMIG_SLOT_USER_MMIO) {
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u relocate_dmabuf_mr: mkey_index=0x%x placeholder hit non-USER_MMIO entry (slot=%u external=%d)\n",
+				    dom->vf_id, mkey_index, placeholder->slot,
+				    placeholder->external);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	if (!placeholder->awaiting_bind) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
+	fresh = vfmig_iova_find_locked(dom, (u64)fresh_iova);
+	if (!fresh) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	if (!fresh->external || fresh->slot != VFMIG_SLOT_USER_MMIO ||
+	    VFMIG_HUOBJ_KIND(fresh->instance_key) != VFMIG_HUOBJ_KIND_NONE) {
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u relocate_dmabuf_mr: mkey_index=0x%x fresh entry at iova=0x%llx is not an auto-numbered USER_MMIO entry (slot=%u external=%d key=0x%llx)\n",
+				    dom->vf_id, mkey_index,
+				    (unsigned long long)fresh_iova,
+				    fresh->slot, fresh->external,
+				    (unsigned long long)fresh->instance_key);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	if (fresh->len != placeholder->len) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u relocate_dmabuf_mr: mkey_index=0x%x fresh len %zu != placeholder len %zu\n",
+				     dom->vf_id, mkey_index, fresh->len,
+				     placeholder->len);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+
+	/*
+	 * Recover the phys the fresh dma-buf import mapped at fresh_iova.
+	 * Same technique as the (not-yet-wired) SAVE-time external-entry
+	 * readback path -- see @external's doc comment on struct
+	 * vfmig_iova_page.
+	 */
+	phys = iommu_iova_to_phys(dom->iommu_dom, fresh_iova);
+	if (!phys) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	/*
+	 * Establish the new mapping at the placeholder's IOVA BEFORE
+	 * tearing down the fresh one: if this iommu_map fails, @fresh
+	 * is left completely untouched and the caller's normal dma-buf
+	 * release path (ib_umem_release -> vfmig_dma_ops_unmap_phys)
+	 * can still unwind it correctly.
+	 */
+	err = iommu_map(dom->iommu_dom, placeholder->iova, phys,
+			placeholder->len, IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO,
+			GFP_KERNEL);
+	if (err)
+		goto out_unlock;
+
+	/*
+	 * Now redundant: the same phys is live at both fresh->iova and
+	 * placeholder->iova for an instant. Tear down the fresh mapping;
+	 * destroy_page_locked does the iommu_unmap.
+	 */
+	list_del(&fresh->node);
+	dom->n_pages--;
+	vfmig_iova_destroy_page_locked(dom, fresh);
+
+	placeholder->awaiting_bind = false;
+	*final_iova_out = placeholder->iova;
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+EXPORT_SYMBOL(vfmig_iova_relocate_dmabuf_mr);
+
 int vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
 				 vfmig_iova_for_each_external_fn cb,
 				 void *ctx)

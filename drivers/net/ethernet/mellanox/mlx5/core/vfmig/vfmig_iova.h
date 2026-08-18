@@ -1185,6 +1185,76 @@ int  vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 				 struct sg_table *sgt);
 
 /*
+ * GPU/peer dma-buf restore-side bind: relocate a freshly-imported
+ * VFMIG_SLOT_USER_MMIO entry to the awaiting_bind=true placeholder
+ * previously installed by vfmig_iova_replay_external() at
+ * VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_MR, @mkey_index).
+ *
+ * Unlike vfmig_iova_bind_user_object() (which binds a NOT-yet-mapped
+ * umem sg_table directly at the placeholder's IOVA), a GPU dma-buf
+ * import has no such two-phase pin-then-map split: by the time this
+ * function is called, mlx5_ib_init_dmabuf_mr() has already completed
+ * -> dma_buf_map_attachment() -> nvidia's .map_dma_buf ->
+ * vfmig_dma_ops_map_phys(DMA_ATTR_MMIO) -> vfmig_iova_user_mmio_map_phys(),
+ * which has ALREADY iommu_map()'d the fresh GPU phys at a
+ * freshly-bump-allocated USER_MMIO IOVA (@fresh_iova) -- not the
+ * placeholder's IOVA. There is no way to intercept that call with
+ * restore context (the generic dma_map_ops.map_phys callback carries
+ * none).
+ *
+ * So instead of binding directly, this function relocates: recovers
+ * the phys mapped at @fresh_iova via iommu_iova_to_phys(), iommu_maps
+ * that SAME phys at the placeholder's IOVA instead, and only then
+ * unmaps + removes the now-redundant @fresh_iova entry. Ordering is
+ * deliberate: the new mapping is established BEFORE the old one is
+ * torn down, so a failure on the new iommu_map() leaves @fresh_iova's
+ * entry completely untouched and the caller's normal dma-buf release
+ * path (ib_umem_release() -> vfmig_dma_ops_unmap_phys()) can still
+ * unwind it correctly.
+ *
+ * Verb-driven entry point used by mlx5_ib_restore_mr_dmabuf():
+ *
+ *   mlx5_ib_restore_mr_dmabuf
+ *     -> mlx5_ib_umem_restore_mr_dmabuf
+ *          -> ib_umem_dmabuf_get + mlx5_ib_init_dmabuf_mr
+ *               (fresh GPU dma-buf import, lands at @fresh_iova)
+ *          -> mlx5_vfmig_relocate_dmabuf_mr    (this function)
+ *
+ * On success, @final_iova_out is the placeholder's IOVA (== the
+ * source's recorded IOVA for this mkey) -- the caller must fix up
+ * mr->umem's sgt (sg_dma_address) to this value before the mkey/ibmr
+ * is committed, since it no longer matches what the dma-buf import
+ * itself returned.
+ *
+ * Pre-conditions:
+ *   - @dom non-NULL, @mkey_index a valid 24-bit FW mkey index
+ *   - a registry entry exists at @fresh_iova: external, slot ==
+ *     VFMIG_SLOT_USER_MMIO, auto-numbered (kind == KIND_NONE) -- the
+ *     one vfmig_iova_user_mmio_map_phys() just installed
+ *   - a placeholder exists at VFMIG_HUOBJ_KEY(KIND_MR, mkey_index):
+ *     external, slot == VFMIG_SLOT_USER_MMIO, awaiting_bind == true,
+ *     len matching @fresh_iova's entry
+ *
+ * Returns:
+ *   0        on success; *@final_iova_out set to the placeholder's IOVA
+ *   -ENOENT  no placeholder at (KIND_MR, mkey_index), or no registry
+ *            entry at @fresh_iova (caller passed the wrong IOVA)
+ *   -EBUSY   placeholder already bound (awaiting_bind == false) --
+ *            same double-RESTORE_MR_DMABUF-call class of bug as
+ *            vfmig_iova_bind_user_object()'s -EBUSY
+ *   -EINVAL  slot/length mismatch, or the @fresh_iova entry is not
+ *            auto-numbered (already retagged -- caller bug, a dma-buf
+ *            import never goes through the normal retag call)
+ *   <0       iommu_map failure at the placeholder's IOVA; @fresh_iova's
+ *            entry is left completely untouched (see ordering above),
+ *            placeholder stays awaiting_bind=true so the caller may
+ *            retry after diagnosing the IOMMU error
+ */
+int  vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
+				   u32 mkey_index, dma_addr_t fresh_iova,
+				   dma_addr_t *final_iova_out);
+
+/*
  * Stage-2 validation accessor: count @awaiting_bind = true external
  * registry entries on @dom, with per-kind breakdown.
  *
@@ -1333,6 +1403,13 @@ vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 static inline int
 vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 			    u8 kind, u64 fw_id, struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+static inline int
+vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
+			      u32 mkey_index, dma_addr_t fresh_iova,
+			      dma_addr_t *final_iova_out)
 {
 	return -EOPNOTSUPP;
 }

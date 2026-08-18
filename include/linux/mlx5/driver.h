@@ -1684,6 +1684,44 @@ mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 #endif
 
 /*
+ * GPU/peer dma-buf restore-side bind for a freshly-imported MR (e.g.
+ * a CUDA dma-buf export). Unlike mlx5_vfmig_bind_user_mr(), which
+ * binds a not-yet-DMA-mapped umem sg_table directly at the
+ * placeholder's IOVA, a dma-buf import has no such two-phase split --
+ * dma_buf_map_attachment() DMA-maps eagerly as part of the import
+ * (see vfmig_iova_relocate_dmabuf_mr()'s doc comment in
+ * vfmig_iova.h for the full explanation). This entry point instead
+ * relocates the already-mapped fresh entry to the placeholder's IOVA.
+ *
+ * Caller: mlx5_ib_umem_restore_mr_dmabuf(), AFTER
+ * mlx5_ib_init_dmabuf_mr() has completed the dma-buf import (so
+ * @fresh_iova is known -- read back from the resulting umem's sgt).
+ *
+ * @final_iova_out: on success, the placeholder's IOVA. The caller
+ * must fix up the umem's sgt (sg_dma_address) to this value before
+ * the mkey/ibmr is committed.
+ *
+ * Same return-code semantics as mlx5_vfmig_bind_user_mr, plus:
+ *   -ENOENT   also returned if no registry entry exists at
+ *             @fresh_iova (caller passed the wrong IOVA -- should not
+ *             happen if called immediately after a successful
+ *             mlx5_ib_init_dmabuf_mr()).
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_relocate_dmabuf_mr(struct mlx5_core_dev *vf_dev,
+				  u32 mkey_index, dma_addr_t fresh_iova,
+				  dma_addr_t *final_iova_out);
+#else
+static inline int
+mlx5_vfmig_relocate_dmabuf_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			      dma_addr_t fresh_iova,
+			      dma_addr_t *final_iova_out)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+/*
  * Stage-3 D3: destination-side bind for a freshly-pinned user CQ
  * CQE-buffer umem inside the per-VF vfmig deterministic IOVA domain.
  *
