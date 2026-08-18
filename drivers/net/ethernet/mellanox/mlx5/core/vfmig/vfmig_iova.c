@@ -798,7 +798,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	}
 	dom->iommu_dom = idom;
 
-	err = iommu_attach_device(dom->iommu_dom, &vf_pdev->dev);
+	err = iommu_attach_group(dom->iommu_dom, vf_pdev->dev.iommu_group);
 	if (err) {
 		dev_warn(&vf_pdev->dev,
 			 "vfmig_iova: attach failed: %d\n", err);
@@ -872,7 +872,7 @@ err_pci_put:
 	pci_dev_put(dom->vf_pdev);
 	dom->vf_pdev = NULL;
 err_detach:
-	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
+	iommu_detach_group(dom->iommu_dom, vf_pdev->dev.iommu_group);
 
 err_free_idom:
 	iommu_domain_free(dom->iommu_dom);
@@ -992,7 +992,7 @@ void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom)
 	 * mlx5_pci_close() has drained the cmd ring + EQs.
 	 */
 	vfmig_dma_ops_detach(vf_pdev);
-	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
+	iommu_detach_group(dom->iommu_dom, vf_pdev->dev.iommu_group);
 	dom->dev_detached = true;
 
 	dev_info(&vf_pdev->dev,
@@ -1051,7 +1051,7 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 		 */
 		if (!dom->dev_detached) {
 			vfmig_dma_ops_detach(vf_pdev);
-			iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
+			iommu_detach_group(dom->iommu_dom, vf_pdev->dev.iommu_group);
 			dom->dev_detached = true;
 		}
 		dev_info(&vf_pdev->dev,
