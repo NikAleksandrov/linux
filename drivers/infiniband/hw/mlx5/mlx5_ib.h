@@ -1412,6 +1412,10 @@ u64 mlx5_ib_db_user_virt(const struct mlx5_db *db);
 struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
 					u32 mkey_index, unsigned long addr,
 					size_t size, int access);
+struct ib_umem *mlx5_ib_umem_restore_mr_dmabuf(struct mlx5_ib_dev *dev,
+					       struct mlx5_ib_mr *mr,
+					       u32 mkey_index, u64 offset,
+					       u64 length, int fd, int access);
 struct ib_umem *mlx5_ib_umem_restore_cq(struct mlx5_ib_dev *dev, u32 cqn,
 					unsigned long addr, size_t size);
 struct ib_umem *mlx5_ib_umem_restore_qp(struct mlx5_ib_dev *dev, u32 qpn,

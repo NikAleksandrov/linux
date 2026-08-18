@@ -3403,6 +3403,113 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 }
 
 /*
+ * mlx5_ib_restore_mr_dmabuf: CRIU-managed GPU/peer dma-buf MR
+ * restore, sibling of mlx5_ib_restore_mr above (same Model A FW mkey
+ * adoption), differing only in how the backing memory is acquired:
+ * a fresh dma-buf import + relocate (mlx5_ib_umem_restore_mr_dmabuf,
+ * mr.c) instead of ib_umem_pin + bind (mlx5_ib_umem_restore_mr,
+ * mem.c). See gpu-dmabuf-criu-plan.md §3a/§3b for why the two can't
+ * share one code path, and §3c for the relocate mechanism.
+ *
+ * The dispatcher (UVERBS_HANDLER(UVERBS_METHOD_RESTORE_MR_DMABUF),
+ * uverbs_std_types_restore.c) has done the same pre-work as
+ * UVERBS_METHOD_RESTORE_MR's: gated on vfmig_restore_mode, resolved
+ * @ibpd, reserved @target_handle. @dmabuf_fd is a FRESH dma-buf the
+ * CRIU restore userspace allocated and exported on THIS host (see
+ * §3f) -- not the source's dma-buf fd.
+ *
+ * v0 simplifications and invariants are identical to mlx5_ib_restore_mr:
+ * no mkey-cache/ODP/UMR participation for the adopted mkey, same
+ * lkey/rkey/mkey_index cross-check, same dealloc-ordering and
+ * abnormal-exit-path behaviour (DESTROY_MKEY succeeds even with live
+ * dependents; see that function's doc comment for the full empirical
+ * chain -- it applies unchanged here since both restore adopted FW
+ * mkey state the same way).
+ */
+static struct ib_mr *mlx5_ib_restore_mr_dmabuf(struct ib_pd *ibpd,
+					       u32 target_handle,
+					       int dmabuf_fd, u64 offset,
+					       u64 length, u64 iova,
+					       int access, u32 lkey_hint,
+					       u32 rkey_hint,
+					       struct ib_udata *udata)
+{
+	struct mlx5_ib_dev *dev = to_mdev(ibpd->device);
+	struct mlx5_ib_pd *mpd = to_mpd(ibpd);
+	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
+		udata, struct mlx5_ib_ucontext, ibucontext);
+	struct mlx5_ib_restore_mr_dmabuf_req req = {};
+	struct mlx5_ib_mr *mr;
+	struct ib_umem *umem;
+	int err;
+
+	if (!context)
+		return ERR_PTR(-EINVAL);
+	if (!context->vfmig_restore_mode)
+		return ERR_PTR(-EPERM);
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return ERR_PTR(-EINVAL);
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return ERR_PTR(err);
+	if (req.reserved || req.reserved2)
+		return ERR_PTR(-EINVAL);
+	if (req.mkey_index & ~0xffffffU || req.mkey_index == 0)
+		return ERR_PTR(-EINVAL);
+
+	if (lkey_hint != rkey_hint)
+		return ERR_PTR(-EINVAL);
+	if ((lkey_hint >> 8) != req.mkey_index)
+		return ERR_PTR(-EINVAL);
+
+	(void)iova;		/* dispatcher populates mr->ibmr.iova */
+	(void)target_handle;	/* dispatcher reserved this in the ufile idr */
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (!mr)
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * Stage-3 D3 dma-buf destination-side import + relocate. Run
+	 * before mmkey-state population so a failure doesn't leave
+	 * behind a half-initialised mr->mmkey, same ordering as
+	 * mlx5_ib_restore_mr.
+	 */
+	umem = mlx5_ib_umem_restore_mr_dmabuf(dev, mr, req.mkey_index, offset,
+					      length, dmabuf_fd, access);
+	if (IS_ERR(umem)) {
+		err = PTR_ERR(umem);
+		kfree(mr);
+		return ERR_PTR(err);
+	}
+
+	mr->mmkey.key = lkey_hint;
+	mr->mmkey.type = MLX5_MKEY_MR;
+	mr->mmkey.ndescs = 0;
+	init_waitqueue_head(&mr->mmkey.wait);
+	refcount_set(&mr->mmkey.usecount, 0);
+	mr->mmkey.cache_ent = NULL;
+	mr->mmkey.cacheable = 0;
+
+	mr->access_flags = access;
+	mr->page_shift = PAGE_SHIFT;
+
+	mr->ibmr.lkey = lkey_hint;
+	mr->ibmr.rkey = rkey_hint;
+
+	atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
+
+	mlx5_ib_dbg(dev,
+		    "vfmig_mr_dbg: restore_mr_dmabuf ibdev=%s mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x umem_npages=%zu\n",
+		    dev_name(&ibpd->device->dev), req.mkey_index, lkey_hint,
+		    mpd->pdn, mpd->uid, target_handle,
+		    ib_umem_num_pages(umem));
+
+	return &mr->ibmr;
+}
+
+/*
  * mlx5_ib_restore_cq: CRIU-managed CQ restore, Model A (FW cqn
  * adoption). The destination VHCA inherits the source's user-mode
  * CQ context across LOAD_VHCA_STATE; this handler builds a fresh
@@ -5801,6 +5908,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.resize_cq = mlx5_ib_resize_cq,
 	.restore_cq = mlx5_ib_restore_cq,
 	.restore_mr = mlx5_ib_restore_mr,
+	.restore_mr_dmabuf = mlx5_ib_restore_mr_dmabuf,
 	.restore_pd = mlx5_ib_restore_pd,
 	.restore_qp = mlx5_ib_restore_qp,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,

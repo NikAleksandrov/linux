@@ -1787,6 +1787,93 @@ err_dereg_mr:
 	return ERR_PTR(err);
 }
 
+/*
+ * Stage-3 D3 dma-buf variant: import a FRESH GPU/peer dma-buf on the
+ * destination host and relocate it to the Stage-2 placeholder that
+ * LOAD_VHCA_STATE-replayed HOST_USER_MMIO records installed for the
+ * source's (KIND_MR, mkey_index) tuple.
+ *
+ * Composition (gpu-dmabuf-criu-plan.md §3c/§3d):
+ *
+ *   1. ib_umem_dmabuf_get(...) -- imports @fd, triggering
+ *      dma_buf_map_attachment() -> the exporter's .map_dma_buf ->
+ *      (for a GPU exporter) vfmig_dma_ops_map_phys(DMA_ATTR_MMIO) ->
+ *      vfmig_iova_user_mmio_map_phys(). Unlike ib_umem_pin(), this
+ *      has NO pin-without-mapping phase -- the fresh phys is already
+ *      iommu_map()'d at a freshly bump-allocated USER_MMIO IOVA by
+ *      the time this call returns.
+ *   2. mlx5_vfmig_relocate_dmabuf_mr(dev->mdev, mkey_index,
+ *      fresh_iova, &final_iova) -- moves that mapping to the
+ *      placeholder's recorded IOVA (see its own doc comment in
+ *      include/linux/mlx5/driver.h for why relocate rather than
+ *      bind-directly).
+ *   3. Fix up the umem's sgt sg_dma_address to @final_iova, since it
+ *      no longer matches what the dma-buf import itself returned.
+ *
+ * @mr must be caller-allocated (kzalloc'd, zeroed) but otherwise
+ * empty -- this function sets @mr->umem on success. On failure,
+ * @mr->umem is left NULL (whatever partial umem_dmabuf state existed
+ * is released here); the caller retains ownership of @mr itself (no
+ * kfree(mr) here, mirroring mlx5_ib_umem_restore_mr's contract for
+ * the plain-umem case).
+ *
+ * Caller (mlx5_ib_restore_mr_dmabuf) responsibilities: same
+ * vfmig_restore_mode + tracked-VF ucontext gating as the plain
+ * mlx5_ib_umem_restore_mr caller. @mkey_index must match what the
+ * SAVE-side retag emitted as the HOST_USER_MMIO record's fw_id (==
+ * source mkey_index).
+ *
+ * Returns the populated struct ib_umem on success (same as
+ * &umem_dmabuf->umem -- the caller stores it in mr->umem, which this
+ * function has already done); ERR_PTR on any failure with all
+ * resources released.
+ */
+struct ib_umem *mlx5_ib_umem_restore_mr_dmabuf(struct mlx5_ib_dev *dev,
+					       struct mlx5_ib_mr *mr,
+					       u32 mkey_index, u64 offset,
+					       u64 length, int fd, int access)
+{
+	struct ib_umem_dmabuf *umem_dmabuf;
+	dma_addr_t fresh_iova, final_iova;
+	struct scatterlist *sgl;
+	unsigned int page_off;
+	int err;
+
+	umem_dmabuf = ib_umem_dmabuf_get(&dev->ib_dev, offset, length, fd,
+					 access, &mlx5_ib_dmabuf_attach_ops);
+	if (IS_ERR(umem_dmabuf))
+		return ERR_CAST(umem_dmabuf);
+
+	mr->umem = &umem_dmabuf->umem;
+	umem_dmabuf->private = mr;
+
+	err = mlx5_ib_init_dmabuf_mr(mr);
+	if (err)
+		goto err_release;
+
+	if (!umem_dmabuf->sgt || !umem_dmabuf->sgt->sgl) {
+		err = -EIO;
+		goto err_release;
+	}
+	sgl = umem_dmabuf->sgt->sgl;
+	page_off = sg_dma_address(sgl) & ~PAGE_MASK;
+	fresh_iova = sg_dma_address(sgl) & PAGE_MASK;
+
+	err = mlx5_vfmig_relocate_dmabuf_mr(dev->mdev, mkey_index,
+					    fresh_iova, &final_iova);
+	if (err)
+		goto err_release;
+
+	sg_dma_address(sgl) = final_iova | page_off;
+
+	return &umem_dmabuf->umem;
+
+err_release:
+	mr->umem = NULL;
+	ib_umem_release(&umem_dmabuf->umem);
+	return ERR_PTR(err);
+}
+
 static struct ib_mr *
 reg_user_mr_dmabuf_by_data_direct(struct ib_pd *pd, u64 offset,
 				  u64 length, u64 virt_addr,

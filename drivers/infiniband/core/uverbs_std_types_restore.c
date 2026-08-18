@@ -260,6 +260,151 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
 	UVERBS_ATTR_UHW());
 
+/*
+ * GPU/peer dma-buf sibling of UVERBS_HANDLER(UVERBS_METHOD_RESTORE_MR)
+ * above -- same shape throughout, differing only in how the source
+ * memory is identified: a dma-buf fd + offset instead of a host
+ * virtual address. See UVERBS_METHOD_RESTORE_MR_DMABUF's doc comment
+ * in ib_user_ioctl_cmds.h for why this is a separate method rather
+ * than an extension of RESTORE_MR.
+ */
+static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_MR_DMABUF)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_ucontext *ctx;
+	struct ib_device *ib_dev;
+	struct ib_uobject *uobj;
+	struct ib_pd *pd;
+	struct ib_mr *mr;
+	u32 target_handle, lkey_hint, rkey_hint, access_flags;
+	u32 dmabuf_fd;
+	u64 offset, length, iova;
+	int ret;
+
+	ret = restore_check_ucontext(attrs, &ctx);
+	if (ret)
+		return ret;
+	ib_dev = ctx->device;
+	if (!ib_dev->ops.restore_mr_dmabuf)
+		return -EOPNOTSUPP;
+
+	pd = uverbs_attr_get_obj(attrs, UVERBS_ATTR_RESTORE_MR_DMABUF_PD_HANDLE);
+	if (IS_ERR(pd))
+		return PTR_ERR(pd);
+	if (pd->device != ib_dev)
+		return -EINVAL;
+
+	ret = uverbs_copy_from(&target_handle, attrs,
+			       UVERBS_ATTR_RESTORE_MR_DMABUF_HANDLE);
+	if (ret)
+		return ret;
+
+	ret = uverbs_copy_from(&dmabuf_fd, attrs,
+			       UVERBS_ATTR_RESTORE_MR_DMABUF_FD);
+	if (ret)
+		return ret;
+
+	ret = uverbs_copy_from(&offset, attrs,
+			       UVERBS_ATTR_RESTORE_MR_DMABUF_OFFSET);
+	if (ret)
+		return ret;
+	ret = uverbs_copy_from(&length, attrs,
+			       UVERBS_ATTR_RESTORE_MR_DMABUF_LENGTH);
+	if (ret)
+		return ret;
+	ret = uverbs_copy_from(&iova, attrs,
+			       UVERBS_ATTR_RESTORE_MR_DMABUF_IOVA);
+	if (ret)
+		return ret;
+	ret = uverbs_get_flags32(&access_flags, attrs,
+				 UVERBS_ATTR_RESTORE_MR_DMABUF_ACCESS_FLAGS,
+				 IB_ACCESS_SUPPORTED);
+	if (ret)
+		return ret;
+	ret = ib_check_mr_access(ib_dev, access_flags);
+	if (ret)
+		return ret;
+	ret = uverbs_copy_from(&lkey_hint, attrs,
+			       UVERBS_ATTR_RESTORE_MR_DMABUF_LKEY_HINT);
+	if (ret)
+		return ret;
+	ret = uverbs_copy_from(&rkey_hint, attrs,
+			       UVERBS_ATTR_RESTORE_MR_DMABUF_RKEY_HINT);
+	if (ret)
+		return ret;
+
+	uobj = rdma_alloc_begin_uobject_at_handle(attrs, UVERBS_OBJECT_MR,
+						  target_handle);
+	if (IS_ERR(uobj))
+		return PTR_ERR(uobj);
+
+	mr = ib_dev->ops.restore_mr_dmabuf(pd, target_handle, dmabuf_fd,
+					   offset, length, iova, access_flags,
+					   lkey_hint, rkey_hint,
+					   &attrs->driver_udata);
+	if (IS_ERR(mr)) {
+		ret = PTR_ERR(mr);
+		goto err_uobj;
+	}
+
+	mr->device = ib_dev;
+	mr->pd = pd;
+	mr->type = IB_MR_TYPE_USER;
+	mr->uobject = uobj;
+	mr->iova = iova;
+	mr->length = length;
+	mr->access_flags = access_flags;
+	atomic_inc(&pd->usecnt);
+
+	rdma_restrack_new(&mr->res, RDMA_RESTRACK_MR);
+	rdma_restrack_set_name(&mr->res, NULL);
+	rdma_restrack_add(&mr->res);
+
+	uobj->object = mr;
+	rdma_alloc_commit_uobject(uobj, attrs);
+
+	ret = uverbs_copy_to(attrs, UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_LKEY,
+			     &mr->lkey, sizeof(mr->lkey));
+	if (ret)
+		return ret;
+	ret = uverbs_copy_to(attrs, UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_RKEY,
+			     &mr->rkey, sizeof(mr->rkey));
+	return ret;
+
+err_uobj:
+	rdma_alloc_abort_uobject(uobj, attrs, false);
+	return ret;
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_RESTORE_MR_DMABUF,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_HANDLE,
+			   UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_IDR(UVERBS_ATTR_RESTORE_MR_DMABUF_PD_HANDLE,
+			UVERBS_OBJECT_PD,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_FD,
+			   UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_OFFSET,
+			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_LENGTH,
+			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_IOVA,
+			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
+	UVERBS_ATTR_FLAGS_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_ACCESS_FLAGS,
+			     enum ib_access_flags,
+			     UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_LKEY_HINT,
+			   UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_DMABUF_RKEY_HINT,
+			   UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_LKEY,
+			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_RKEY,
+			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_UHW());
+
 static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)(
 	struct uverbs_attr_bundle *attrs)
 {
@@ -655,7 +800,8 @@ DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_RESTORE,
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_PD),
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_MR),
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_CQ),
-			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_QP));
+			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_QP),
+			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_MR_DMABUF));
 
 const struct uapi_definition uverbs_def_obj_restore[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_RESTORE),

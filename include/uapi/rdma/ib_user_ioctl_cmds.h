@@ -99,6 +99,7 @@ enum uverbs_methods_restore {
 	UVERBS_METHOD_RESTORE_MR,
 	UVERBS_METHOD_RESTORE_CQ,
 	UVERBS_METHOD_RESTORE_QP,
+	UVERBS_METHOD_RESTORE_MR_DMABUF,
 };
 
 enum uverbs_attrs_restore_pd {
@@ -164,6 +165,71 @@ enum uverbs_attrs_restore_mr {
 	 */
 	UVERBS_ATTR_RESTORE_MR_RESP_LKEY,
 	UVERBS_ATTR_RESTORE_MR_RESP_RKEY,
+};
+
+/*
+ * UVERBS_METHOD_RESTORE_MR_DMABUF attributes.
+ *
+ * Separate method from UVERBS_METHOD_RESTORE_MR, not an extension of
+ * it: a GPU/peer dma-buf MR restore takes a dma-buf fd (+ offset)
+ * instead of a host virtual address (UVERBS_ATTR_RESTORE_MR_ADDR),
+ * and the mlx5 driver-side handling genuinely differs (see
+ * gpu-dmabuf-criu-plan.md §3b for why the regular RESTORE_MR
+ * ib_umem_pin-then-bind trick doesn't apply to dma-buf). Kept as its
+ * own method rather than adding an optional dmabuf_fd attr to the
+ * existing one so the generic core dispatcher's mandatory-ADDR
+ * semantics for RESTORE_MR are untouched for every other driver
+ * (rxe) and every existing caller.
+ *
+ * Otherwise mirrors UVERBS_METHOD_RESTORE_MR closely: same
+ * lkey/rkey-hint contract, same driver-private-state-via-UHW pattern
+ * (struct mlx5_ib_restore_mr_dmabuf_req, carrying mkey_index -- same
+ * shape as struct mlx5_ib_restore_mr_req).
+ */
+enum uverbs_attrs_restore_mr_dmabuf {
+	/*
+	 * Mandatory u32 input. Target ufile handle the restored MR
+	 * uobject must occupy. Same semantics as
+	 * UVERBS_ATTR_RESTORE_MR_HANDLE.
+	 */
+	UVERBS_ATTR_RESTORE_MR_DMABUF_HANDLE,
+	/*
+	 * Mandatory IDR input. Parent PD's ufile handle. Same semantics
+	 * as UVERBS_ATTR_RESTORE_MR_PD_HANDLE.
+	 */
+	UVERBS_ATTR_RESTORE_MR_DMABUF_PD_HANDLE,
+	/*
+	 * Mandatory FD input. The dma-buf file descriptor for a FRESH
+	 * GPU/peer memory allocation the caller made on the destination
+	 * host (CRIU restore userspace allocates + exports this before
+	 * issuing the restore verb -- see gpu-dmabuf-criu-plan.md §3f).
+	 * NOT the source's dma-buf fd, which is meaningless on this
+	 * host.
+	 */
+	UVERBS_ATTR_RESTORE_MR_DMABUF_FD,
+	/*
+	 * Mandatory u64 inputs: offset into the dma-buf + length + the
+	 * RDMA-visible iova (same meaning as UVERBS_ATTR_RESTORE_MR_IOVA
+	 * -- the virtual address userspace uses in RDMA ops against this
+	 * MR, independent of the vfmig-internal IOVA the kernel binds
+	 * the dma-buf's phys pages at).
+	 */
+	UVERBS_ATTR_RESTORE_MR_DMABUF_OFFSET,
+	UVERBS_ATTR_RESTORE_MR_DMABUF_LENGTH,
+	UVERBS_ATTR_RESTORE_MR_DMABUF_IOVA,
+	/* Mandatory enum ib_access_flags input. */
+	UVERBS_ATTR_RESTORE_MR_DMABUF_ACCESS_FLAGS,
+	/*
+	 * Mandatory u32 inputs. Wire-visible identity hints; same
+	 * contract as UVERBS_ATTR_RESTORE_MR_LKEY_HINT/_RKEY_HINT.
+	 */
+	UVERBS_ATTR_RESTORE_MR_DMABUF_LKEY_HINT,
+	UVERBS_ATTR_RESTORE_MR_DMABUF_RKEY_HINT,
+	/*
+	 * Mandatory u32 outputs. Actual lkey/rkey the kernel installed.
+	 */
+	UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_LKEY,
+	UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_RKEY,
 };
 
 /*

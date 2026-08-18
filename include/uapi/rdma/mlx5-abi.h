@@ -317,6 +317,30 @@ struct mlx5_ib_restore_mr_req {
 };
 
 /*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_MR_DMABUF on
+ * mlx5. Same shape and purpose as struct mlx5_ib_restore_mr_req --
+ * carries the source's FW mkey_index so mlx5_ib_restore_mr_dmabuf can
+ * adopt the existing destination-side mkey (preserved across
+ * LOAD_VHCA_STATE) into a fresh kernel-side mlx5_ib_mr wrapping a
+ * freshly-imported GPU/peer dma-buf, without re-issuing FW
+ * CREATE_MKEY.
+ *
+ * A separate struct rather than reusing mlx5_ib_restore_mr_req
+ * verbatim so the two restore verbs' UHW payloads can diverge
+ * independently later (e.g. a future per-MR DEVX-uid hint that only
+ * makes sense for one of the two) without a wire-format entanglement.
+ * Identical layout today; see gpu-dmabuf-criu-plan.md §3d.
+ */
+struct mlx5_ib_restore_mr_dmabuf_req {
+	__u32	mkey_index;	/* FW mkey index to adopt
+				 * (24 bits significant). */
+	__u32	reserved;	/* must be 0 */
+	__aligned_u64 reserved2; /* must be 0; pads above inline-UHW
+				  * threshold and reserves room for
+				  * future DEVX-uid / flags. */
+};
+
+/*
  * Driver-private UHW payload for UVERBS_METHOD_RESTORE_CQ on
  * mlx5. CRIU-managed restore passes the source's FW cqn here so
  * mlx5_ib_restore_cq can adopt the existing destination-side CQ
