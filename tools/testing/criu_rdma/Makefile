@@ -19,6 +19,8 @@ PROBE_BINARIES :=						\
 	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig	\
 	uobject_restore/mr_restore/mr_restore_probe_rxe	\
 	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig		\
+	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig_dmabuf	\
+	uobject_restore/mr_restore/gpu_dmabuf_mr_source_probe		\
 	uobject_restore/cq_restore/cq_restore_probe_rxe		\
 	uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig	\
 	uobject_restore/cq_query/cq_query_probe_mlx5_vfmig	\
@@ -118,6 +120,29 @@ uobject_restore/mr_restore/mr_restore_probe_rxe: \
 uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig: \
 		uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# RESTORE_MR_DMABUF + mlx5_ib_restore_mr_dmabuf end-to-end probe
+# (gpu-dmabuf-criu-plan.md §3c/§3d). Sibling of
+# mr_restore_probe_mlx5_vfmig: same libibverbs-only / raw-uverbs
+# pattern, but drives a FRESH CUDA VMM dma-buf allocation as the
+# destination-side backing memory instead of an anonymous mmap
+# (ib_umem_dmabuf_get needs a real dma-buf fd). CUDA_HOME lets a
+# non-default install location override the include/lib paths.
+CUDA_HOME ?= /usr/local/cuda
+uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig_dmabuf: \
+		uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig_dmabuf.c
+	$(CC) $(CFLAGS) -I$(CUDA_HOME)/include -o $@ $< -lcuda -libverbs
+
+# Source-side half of the SAVE/LOAD test cycle for
+# mr_restore_probe_mlx5_vfmig_dmabuf (gpu-dmabuf-criu-plan.md §1A):
+# registers a GPU dma-buf MR and holds it alive across SAVE, printing
+# the READY-line (pdn, mkey_index, lkey, mr_length, access_flags)
+# dictionary the driver script feeds to the dest-side probe above.
+# Needs libmlx5 (mlx5dv_init_obj) to extract pdn, same as
+# fw_id_continuity_probe.
+uobject_restore/mr_restore/gpu_dmabuf_mr_source_probe: \
+		uobject_restore/mr_restore/gpu_dmabuf_mr_source_probe.c
+	$(CC) $(CFLAGS) -I$(CUDA_HOME)/include -o $@ $< -lcuda -libverbs -lmlx5
 
 # RESTORE_CQ + rxe_restore_cq S5a probe (design/uobject_restore.md §9.7).
 # Same libibverbs-only / raw-uverbs pattern as pd_restore_probe_rxe:
