@@ -1038,8 +1038,14 @@ int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
  *
  * @cb may not modify the registry. Returning a non-zero value
  * stops iteration and is propagated as the return value.
+ *
+ * @slot lets the callback distinguish which sub-window (USER_PAGE
+ * vs. USER_MMIO) the entry belongs to, so SAVE-side wire emission
+ * can pick the right wire tag (HOST_USER_PAGE vs. HOST_USER_MMIO)
+ * per entry -- see vfmig.c's vfmig_save_hup_count_cb/emit_cb.
  */
-typedef int (*vfmig_iova_for_each_external_fn)(u8 kind, u64 fw_id,
+typedef int (*vfmig_iova_for_each_external_fn)(enum vfmig_iova_slot slot,
+					       u8 kind, u64 fw_id,
 					       dma_addr_t iova,
 					       size_t len,
 					       bool awaiting_bind,
@@ -1049,8 +1055,8 @@ int  vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
 				  void *ctx);
 
 /*
- * LOAD-side replay-as-placeholder for an external (USER_PAGE)
- * registry entry. Allocates a vfmig_iova_page with
+ * LOAD-side replay-as-placeholder for an external (USER_PAGE or
+ * USER_MMIO) registry entry. Allocates a vfmig_iova_page with
  * @external = true, @awaiting_bind = true, @page = NULL, inserts
  * it both in the primary IOVA list and in the secondary
  * (kind, fw_id) rb-tree index. Does NOT call iommu_map -- the
@@ -1061,23 +1067,24 @@ int  vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
  * (kind != KIND_NONE) on the wire, so the replay path here mirrors
  * that contract and rejects KIND_NONE keys with -EINVAL.
  *
- * Bumps the USER_PAGE slot cursor past @iova + @length so any
- * subsequent fresh registration on the destination starts above
- * the source's high-water IOVA.
+ * Bumps @slot's cursor past @iova + @length so any subsequent fresh
+ * registration on the destination starts above the source's
+ * high-water IOVA in that slot.
  *
  * Pre-conditions:
- *   - @slot == VFMIG_SLOT_USER_PAGE
+ *   - @slot == VFMIG_SLOT_USER_PAGE or VFMIG_SLOT_USER_MMIO
  *   - VFMIG_HUOBJ_KIND(@instance_key) != KIND_NONE
  *   - @iova, @length PAGE-aligned, @length nonzero
- *   - [@iova, @iova + @length) inside the USER_PAGE sub-window
- *     (above the kcoherent carve, below the transient arena)
+ *   - [@iova, @iova + @length) inside @slot's sub-window (for
+ *     USER_PAGE: above the kcoherent carve; for USER_MMIO: within
+ *     its fixed carve below the transient arena)
  *   - No existing registry entry at @iova
  *   - No existing rb-tree entry at @instance_key
  *
  * Returns:
  *   0           on success
  *   -EINVAL     bad arguments / wrong slot / KIND_NONE key
- *   -ERANGE     @iova outside USER_PAGE sub-window
+ *   -ERANGE     @iova outside @slot's sub-window
  *   -EEXIST     @iova already in registry, or @instance_key
  *               already in secondary index
  *   -ENOMEM     allocation failure
@@ -1298,7 +1305,8 @@ vfmig_iova_kcoherent_fallback_hits(struct vfmig_iova_domain *dom) { return 0; }
 static inline void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom) { }
 static inline void
 vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom) { }
-typedef int (*vfmig_iova_for_each_external_fn)(u8 kind, u64 fw_id,
+typedef int (*vfmig_iova_for_each_external_fn)(enum vfmig_iova_slot slot,
+					       u8 kind, u64 fw_id,
 					       dma_addr_t iova, size_t len,
 					       bool awaiting_bind, void *ctx);
 static inline int

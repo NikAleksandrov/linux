@@ -1470,30 +1470,32 @@ out_unlock:
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 {
 	unsigned int s;
-	u64 user_page_hwm;
+	u64 user_page_hwm, user_mmio_hwm;
 
 	if (!dom)
 		return;
 	mutex_lock(&dom->lock);
 	/*
-	 * Snapshot the USER_PAGE cursor BEFORE the per-slot reset.
-	 * Stage-2 replay (vfmig_iova_replay_external) bumps this
-	 * cursor monotonically to (highest_replayed_iova + length) so
-	 * fresh post-restore user_page_map_phys() calls land above
+	 * Snapshot the USER_PAGE and USER_MMIO cursors BEFORE the
+	 * per-slot reset. Stage-2 replay (vfmig_iova_replay_external)
+	 * bumps each slot's cursor monotonically to
+	 * (highest_replayed_iova + length) so fresh post-restore
+	 * user_page_map_phys()/user_mmio_map_phys() calls land above
 	 * source-side replayed placeholders. The for-loop below would
 	 * otherwise clobber that high-water mark with slot_base, and
-	 * the post-loop adjustment only lifts up to user_page_start
-	 * -- which is exactly the bottom of the replay region, where
-	 * the lowest-IOVA placeholder lives. The first fresh
-	 * post-restore user_page allocation would then collide at
-	 * user_page_start with the replayed placeholder there and
-	 * return -EEXIST. Snapshot + max_t() with user_page_start
-	 * preserves the replayed high-water mark on LOAD probe arcs
-	 * AND still ratchets up to user_page_start on first-time /
-	 * non-replay probe arcs (where the pre-loop value is
-	 * slot_base, below user_page_start).
+	 * the post-loop adjustment only lifts up to
+	 * user_page_start/user_mmio_start -- which is exactly the
+	 * bottom of the replay region, where the lowest-IOVA
+	 * placeholder lives. The first fresh post-restore allocation
+	 * would then collide at that start with the replayed
+	 * placeholder there and return -EEXIST. Snapshot + max_t()
+	 * preserves the replayed high-water mark on LOAD probe arcs AND
+	 * still ratchets up to the slot's start on first-time /
+	 * non-replay probe arcs (where the pre-loop value is slot_base,
+	 * below the slot's start).
 	 */
 	user_page_hwm = dom->cursor[VFMIG_SLOT_USER_PAGE];
+	user_mmio_hwm = dom->cursor[VFMIG_SLOT_USER_MMIO];
 
 	for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++) {
 		dom->cursor[s] = vfmig_iova_slot_base(dom,
@@ -1527,15 +1529,13 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 		max_t(u64, user_page_hwm,
 		      vfmig_iova_user_page_start(dom));
 	/*
-	 * USER_MMIO: same slot_base-uniform-formula mismatch as
-	 * USER_PAGE (its real window is the fixed carve immediately
-	 * below the transient arena, not base + 8 * SLOT_BYTES), but no
-	 * replay high-water mark to preserve yet -- USER_MMIO has no
-	 * stage-2 replay wired (see vfmig_iova_user_mmio_map_phys()
-	 * doc comment). Revisit with the same max_t() pattern as
-	 * USER_PAGE above once that lands.
+	 * USER_MMIO: same high-water-mark preservation as USER_PAGE
+	 * above, now that vfmig_iova_replay_external() accepts
+	 * VFMIG_SLOT_USER_MMIO too.
 	 */
-	dom->cursor[VFMIG_SLOT_USER_MMIO] = vfmig_iova_user_mmio_start(dom);
+	dom->cursor[VFMIG_SLOT_USER_MMIO] =
+		max_t(u64, user_mmio_hwm,
+		      vfmig_iova_user_mmio_start(dom));
 	/*
 	 * The kcoherent arena is NOT reset on replay: it has no
 	 * SAVE-side records so there's nothing for replay to land in,
@@ -1711,9 +1711,11 @@ vfmig_iova_user_index_next_sibling_locked(struct vfmig_iova_page *p)
  * rejected with -EINVAL: replay records only get emitted for
  * retagged entries.
  *
+ * @slot must be VFMIG_SLOT_USER_PAGE or VFMIG_SLOT_USER_MMIO.
+ *
  * Same window/alignment validation as install_external_phys_locked:
  *   -EINVAL  bad alignment / wrong slot / KIND_NONE key
- *   -ERANGE  IOVA outside USER_PAGE sub-window
+ *   -ERANGE  IOVA outside @slot's sub-window
  *   -EEXIST  duplicate IOVA (the secondary index uses composite
  *            (instance_key, iova) ordering, so multi-page replays
  *            sharing one instance_key across N distinct iovas no
@@ -1734,12 +1736,14 @@ vfmig_iova_install_external_placeholder_locked(struct vfmig_iova_domain *dom,
 	    !IS_ALIGNED(len, VFMIG_IOVA_GRANULE) ||
 	    len == 0)
 		return -EINVAL;
-	if (slot != VFMIG_SLOT_USER_PAGE)
+	if (slot != VFMIG_SLOT_USER_PAGE && slot != VFMIG_SLOT_USER_MMIO)
 		return -EINVAL;
 	if (VFMIG_HUOBJ_KIND(instance_key) == VFMIG_HUOBJ_KIND_NONE)
 		return -EINVAL;
 	{
-		u64 lo = vfmig_iova_user_page_start(dom);
+		u64 lo = (slot == VFMIG_SLOT_USER_PAGE)
+			? vfmig_iova_user_page_start(dom)
+			: vfmig_iova_user_mmio_start(dom);
 
 		if (iova < lo ||
 		    iova + len > vfmig_iova_slot_end(dom, slot))
@@ -1795,23 +1799,25 @@ int vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
 		goto out_unlock;
 
 	/*
-	 * Push the per-slot bump cursor above this placeholder so any
-	 * later post-restore user_page_map_phys() lands above the
-	 * source's high-water IOVA. See the docstring on reset_cursor
-	 * for why USER_PAGE's cursor is preserved across reset_cursor.
+	 * Push @slot's bump cursor above this placeholder so any later
+	 * post-restore user_page_map_phys()/user_mmio_map_phys() call
+	 * lands above the source's high-water IOVA in that slot. See
+	 * the docstring on reset_cursor for why USER_PAGE's (and, since
+	 * this generalization, USER_MMIO's) cursor is preserved across
+	 * reset_cursor.
 	 */
 	above = (u64)iova + length;
-	if (above > dom->cursor[VFMIG_SLOT_USER_PAGE])
-		dom->cursor[VFMIG_SLOT_USER_PAGE] = above;
+	if (above > dom->cursor[slot])
+		dom->cursor[slot] = above;
 
 	/*
-	 * Charge the replay to the slot's expected_count so the
+	 * Charge the replay to @slot's expected_count so the
 	 * drift-detection arming pass at the end of LOAD doesn't
-	 * conclude USER_PAGE saw zero replays and skip the
-	 * drift-armed code path. Mirrors what vfmig_iova_replay_page()
-	 * does for kernel slots.
+	 * conclude the slot saw zero replays and skip the drift-armed
+	 * code path. Mirrors what vfmig_iova_replay_page() does for
+	 * kernel slots.
 	 */
-	dom->expected_count[VFMIG_SLOT_USER_PAGE]++;
+	dom->expected_count[slot]++;
 	err = 0;
 
 out_unlock:
@@ -2163,7 +2169,7 @@ int vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
 	list_for_each_entry(p, &dom->pages, node) {
 		if (!p->external)
 			continue;
-		ret = cb(VFMIG_HUOBJ_KIND(p->instance_key),
+		ret = cb(p->slot, VFMIG_HUOBJ_KIND(p->instance_key),
 			 VFMIG_HUOBJ_FWID(p->instance_key),
 			 p->iova, p->len, p->awaiting_bind, ctx);
 		if (ret)

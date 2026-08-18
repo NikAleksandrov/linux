@@ -230,12 +230,36 @@ struct vfmig_wire_header {
  *
  * @flags is reserved-must-be-zero (future per-record metadata
  * gating); @reserved completes 8-byte alignment of @instance_key.
+ *
+ * VFMIG_WIRE_TAG_HOST_USER_MMIO
+ * -----------------------------
+ * Sibling of VFMIG_WIRE_TAG_HOST_USER_PAGE for VFMIG_SLOT_USER_MMIO
+ * (peer/BAR dma-buf MRs, e.g. GPU dma-buf) instead of VFMIG_SLOT_USER_PAGE.
+ * Same record layout (struct vfmig_host_user_page_record), same
+ * identity-only semantics, same vfmig_iova_replay_external() call --
+ * just with VFMIG_SLOT_USER_MMIO instead of VFMIG_SLOT_USER_PAGE.
+ *
+ * Deliberately does NOT carry a source-host physical/BAR address:
+ * unlike USER_PAGE (where the destination's ib_umem_pin() + bind
+ * re-maps the SAME kind of memory -- host pages -- at the recorded
+ * IOVA), a GPU dma-buf MR's restore-side mlx5_ib_restore_mr_dmabuf()
+ * imports a FRESH dma-buf on the destination host and then relocates
+ * that fresh mapping to this record's IOVA (see
+ * mlx5_vfmig_relocate_dmabuf_mr()). The source's BAR address would be
+ * meaningless on the destination host, so identity + target IOVA is
+ * all this record needs to carry -- same as HOST_USER_PAGE.
+ *
+ * Tag value 0x484D is "HM" (host-mmio). NOT marked OPTIONAL, same
+ * rationale as HOST_USER_PAGE: silently dropping these records would
+ * leave the destination with FW state referencing GPU buffers the
+ * IOMMU does not know about.
  */
 #define VFMIG_WIRE_MAGIC		0x564D4947 /* "VMIG" little-endian */
 #define VFMIG_STREAM_VERSION		1
 #define VFMIG_WIRE_TAG_STREAM_HEADER	0x4853
 #define VFMIG_WIRE_TAG_HOST_PAGE	0x4842
 #define VFMIG_WIRE_TAG_HOST_USER_PAGE	0x4855
+#define VFMIG_WIRE_TAG_HOST_USER_MMIO	0x484D
 #define VFMIG_HOST_PAGE_MAX_LEN		(16ULL << 20)
 
 struct vfmig_stream_header {
@@ -513,14 +537,18 @@ struct mlx5_vfmig_load_ctx {
 	 *                        skips KIND_NONE entries) -- enforced
 	 *                        at the end of HUP_READ_SUBHDR.
 	 *   hup_iova / hup_len -- parsed from @hup_subhdr_buf.
-	 * Slot is always VFMIG_SLOT_USER_PAGE for HOST_USER_PAGE
-	 * records (the tag itself encodes that).
+	 * Slot is VFMIG_SLOT_USER_PAGE for HOST_USER_PAGE records and
+	 * VFMIG_SLOT_USER_MMIO for HOST_USER_MMIO records -- both tags
+	 * share this same sub-state machine (identical record layout),
+	 * so @hup_slot records which one dispatch_header saw, set when
+	 * entering VFMIG_LS_HUP_READ_SUBHDR and consumed by HUP_REPLAY.
 	 */
 	u8  hup_subhdr_buf[sizeof(struct vfmig_host_user_page_record)];
 	u32 hup_subhdr_filled;
 	u64 hup_instance_key;
 	u64 hup_iova;
 	u64 hup_len;
+	enum vfmig_iova_slot hup_slot;
 
 	/*
 	 * Stream header bookkeeping. Set by VFMIG_LS_STREAM_HDR_READ;
@@ -3228,10 +3256,13 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 		ctx->state = VFMIG_LS_HP_READ_SUBHDR;
 		return 0;
 	case VFMIG_WIRE_TAG_HOST_USER_PAGE:
+	case VFMIG_WIRE_TAG_HOST_USER_MMIO:
 		/*
-		 * HOST_USER_PAGE replays into the per-VF IOVA domain as
-		 * awaiting_bind=true placeholders. Same SET_TRACKED
-		 * precondition as HOST_PAGE: a HOST_USER_PAGE record in
+		 * HOST_USER_PAGE/HOST_USER_MMIO replay into the per-VF
+		 * IOVA domain as awaiting_bind=true placeholders, in
+		 * VFMIG_SLOT_USER_PAGE or VFMIG_SLOT_USER_MMIO
+		 * respectively (same sub-state machine, see @hup_slot).
+		 * Same SET_TRACKED precondition as HOST_PAGE: a record in
 		 * an untracked-destination LOAD is a userspace ordering
 		 * bug, not something we can paper over.
 		 *
@@ -3241,7 +3272,7 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 		 */
 		if (!ctx->iova_dom) {
 			mlx5_core_warn(ctx->vfmig->pf_mdev,
-				       "vfmig: vf %u: HOST_USER_PAGE record in blob but destination not SET_TRACKED'd; aborting LOAD\n",
+				       "vfmig: vf %u: HOST_USER_PAGE/HOST_USER_MMIO record in blob but destination not SET_TRACKED'd; aborting LOAD\n",
 				       ctx->vf_id);
 			return -EINVAL;
 		}
@@ -3249,11 +3280,13 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 			return -EINVAL;
 		if (ctx->hup_seen >= ctx->hup_expected) {
 			mlx5_core_warn(ctx->vfmig->pf_mdev,
-				       "vfmig: vf %u: HOST_USER_PAGE record beyond declared num_user_pages=%llu\n",
+				       "vfmig: vf %u: HOST_USER_PAGE/HOST_USER_MMIO record beyond declared num_user_pages=%llu\n",
 				       ctx->vf_id,
 				       (unsigned long long)ctx->hup_expected);
 			return -EPROTO;
 		}
+		ctx->hup_slot = (tag == VFMIG_WIRE_TAG_HOST_USER_MMIO)
+			? VFMIG_SLOT_USER_MMIO : VFMIG_SLOT_USER_PAGE;
 		ctx->hup_subhdr_filled = 0;
 		ctx->state = VFMIG_LS_HUP_READ_SUBHDR;
 		return 0;
@@ -3728,15 +3761,17 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 		struct vfmig_host_user_page_record subhdr;
 
 		err = vfmig_iova_replay_external(ctx->iova_dom,
-						 VFMIG_SLOT_USER_PAGE,
+						 ctx->hup_slot,
 						 ctx->hup_instance_key,
 						 ctx->hup_iova,
 						 ctx->hup_len,
 						 GFP_KERNEL);
 		if (err) {
 			mlx5_core_warn(ctx->vfmig->pf_mdev,
-				       "vfmig: vf %u: replay_external(slot=USER_PAGE key=0x%llx iova=0x%llx len=%llu) failed: %d\n",
+				       "vfmig: vf %u: replay_external(slot=%s key=0x%llx iova=0x%llx len=%llu) failed: %d\n",
 				       ctx->vf_id,
+				       ctx->hup_slot == VFMIG_SLOT_USER_MMIO ?
+						"USER_MMIO" : "USER_PAGE",
 				       (unsigned long long)ctx->hup_instance_key,
 				       (unsigned long long)ctx->hup_iova,
 				       (unsigned long long)ctx->hup_len, err);
@@ -4435,8 +4470,9 @@ static int vfmig_save_hp_emit_cb(enum vfmig_iova_slot slot, u64 instance_key,
  * Pass-1 callback for vfmig_iova_for_each_external: sum each
  * external entry's on-wire footprint and count entries into @ctx
  * so vfmig_save_build_host_pages_buf can grow the kvmalloc by the
- * HOST_USER_PAGE footprint and stash the num_user_pages count for
- * the STREAM_HEADER.
+ * HOST_USER_PAGE/HOST_USER_MMIO footprint and stash the combined
+ * count (num_user_pages carries the total across both tags -- see
+ * VFMIG_WIRE_TAG_HOST_USER_MMIO's doc comment) for the STREAM_HEADER.
  *
  * Skip entries with VFMIG_HUOBJ_KIND_NONE: those are stage-1
  * auto-numbered placeholders installed by vfmig_dma_ops.map_sg
@@ -4447,18 +4483,23 @@ static int vfmig_save_hp_emit_cb(enum vfmig_iova_slot slot, u64 instance_key,
  * C6..C10 of stage 2 landed, every external entry is KIND_NONE,
  * the count comes out 0, and the blob stays byte-equal to the
  * pre-stage-2 wire format.
+ *
+ * @slot is unused here (both HOST_USER_PAGE and HOST_USER_MMIO
+ * records are the same size, so the byte-footprint math doesn't
+ * depend on it) -- only the emit pass needs it, to pick the tag.
  */
 struct vfmig_save_hup_size_ctx {
 	u64 total;
 	u64 count;
 };
 
-static int vfmig_save_hup_count_cb(u8 kind, u64 fw_id,
-				   dma_addr_t iova, size_t len,
+static int vfmig_save_hup_count_cb(enum vfmig_iova_slot slot, u8 kind,
+				   u64 fw_id, dma_addr_t iova, size_t len,
 				   bool awaiting_bind, void *ctx)
 {
 	struct vfmig_save_hup_size_ctx *sc = ctx;
 
+	(void)slot;
 	(void)fw_id;
 	(void)iova;
 	(void)len;
@@ -4472,12 +4513,12 @@ static int vfmig_save_hup_count_cb(u8 kind, u64 fw_id,
 }
 
 /*
- * Pass-2 callback: serialize one HOST_USER_PAGE record into the
- * buffer pointed to by @ctx->cursor, fold the record's identity
- * tuple into the running manifest CRC (which has already absorbed
- * the HOST_PAGE identities), and advance the cursor. Identity-only
- * record -- no contents tail. Skip KIND_NONE entries for the same
- * reason the count pass does.
+ * Pass-2 callback: serialize one HOST_USER_PAGE or HOST_USER_MMIO
+ * record (tag picked by @slot) into the buffer pointed to by
+ * @ctx->cursor, fold the record's identity tuple into the running
+ * manifest CRC (which has already absorbed the HOST_PAGE identities),
+ * and advance the cursor. Identity-only record -- no contents tail.
+ * Skip KIND_NONE entries for the same reason the count pass does.
  */
 struct vfmig_save_hup_emit_ctx {
 	u8 *buf;
@@ -4486,8 +4527,8 @@ struct vfmig_save_hup_emit_ctx {
 	u32 crc;
 };
 
-static int vfmig_save_hup_emit_cb(u8 kind, u64 fw_id,
-				  dma_addr_t iova, size_t len,
+static int vfmig_save_hup_emit_cb(enum vfmig_iova_slot slot, u8 kind,
+				  u64 fw_id, dma_addr_t iova, size_t len,
 				  bool awaiting_bind, void *ctx)
 {
 	struct vfmig_save_hup_emit_ctx *ec = ctx;
@@ -4495,6 +4536,9 @@ static int vfmig_save_hup_emit_cb(u8 kind, u64 fw_id,
 	struct vfmig_host_user_page_record sub;
 	u64 record_size = sizeof(sub);
 	u64 need = sizeof(hdr) + record_size;
+	u32 tag = (slot == VFMIG_SLOT_USER_MMIO)
+		? VFMIG_WIRE_TAG_HOST_USER_MMIO
+		: VFMIG_WIRE_TAG_HOST_USER_PAGE;
 
 	(void)awaiting_bind;
 	if (kind == VFMIG_HUOBJ_KIND_NONE)
@@ -4505,7 +4549,7 @@ static int vfmig_save_hup_emit_cb(u8 kind, u64 fw_id,
 
 	hdr.record_size = cpu_to_le64(record_size);
 	hdr.flags	= 0;
-	hdr.tag		= cpu_to_le32(VFMIG_WIRE_TAG_HOST_USER_PAGE);
+	hdr.tag		= cpu_to_le32(tag);
 	memcpy(ec->buf + ec->cursor, &hdr, sizeof(hdr));
 	ec->cursor += sizeof(hdr);
 
