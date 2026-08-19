@@ -45,6 +45,16 @@ DST_PROBE=${DST_PROBE:-$SCRIPT_DIR/mr_restore_probe_mlx5_vfmig_dmabuf}
 BLOB=${BLOB:-/tmp/vf_mr_adopt_dmabuf.blob}
 META=${META:-${BLOB}.meta}
 GPU_ORD=${GPU_ORD:-0}
+# gpu-dmabuf-criu-3f-restore-injection-design.md Phase 3: when set,
+# route Phase F through DST_PROBE's HIJACK_INJECT_TEST=1 mode (prints
+# inject_* values + blocks) and drive HIJACKER against it externally,
+# instead of DST_PROBE performing RESTORE_MR_DMABUF in-process.
+# Default (unset) behavior is completely unchanged.
+HIJACK_INJECT_TEST=${HIJACK_INJECT_TEST:-}
+# Lives in a completely separate tree (~/scripts, built ad hoc on
+# /opt/builds) from this file's own kernel tree -- not a relative
+# path, override via env if built somewhere else.
+HIJACKER=${HIJACKER:-/opt/builds/hijack_rdma_restore_mr_dmabuf}
 
 CDEV="/dev/mlx5_vfmig/$PF"
 [ -x "$TOOL" ]      || { echo "build $TOOL first: make -C $ROOT_DIR";      exit 1; }
@@ -239,10 +249,66 @@ echo
 
 sudo dmesg -C 2>/dev/null || true
 set +e
-sudo "$DST_PROBE" "$DST_IBDEV" "$src_pdn" "$src_mkey_index" "$src_lkey" \
-    "$src_mr_length" "$src_access_flags" 0x4242 0x4241 "$GPU_ORD" \
-    <<< "quit"
-DST_RC=$?
+if [ -n "$HIJACK_INJECT_TEST" ]; then
+    [ -x "$HIJACKER" ] || { echo "FAIL: HIJACKER not found/executable: $HIJACKER"; exit 1; }
+    echo "=== Phase F (injection mode): DST_PROBE will block for external RESTORE_MR_DMABUF ==="
+
+    dfifo_in="$WORKDIR/dst.in"
+    dfifo_out="$WORKDIR/dst.out"
+    mkfifo "$dfifo_in" "$dfifo_out"
+    sudo env HIJACK_INJECT_TEST=1 "$DST_PROBE" "$DST_IBDEV" "$src_pdn" "$src_mkey_index" \
+        "$src_lkey" "$src_mr_length" "$src_access_flags" 0x4242 0x4241 "$GPU_ORD" \
+        < "$dfifo_in" > "$dfifo_out" 2>&1 &
+    DST_PROBE_PID=$!
+    exec 8> "$dfifo_in"
+
+    line=""
+    while IFS= read -r line < "$dfifo_out"; do
+        echo "  [dst probe] $line"
+        case "$line" in
+            INJECT_READY) break ;;
+            inject_*=*)
+                k="${line%%=*}"
+                v="${line#*=}"
+                eval "dst_${k}=\"\$v\""
+                ;;
+        esac
+    done
+    if [ "$line" != "INJECT_READY" ]; then
+        echo "FAIL: DST_PROBE never printed INJECT_READY"
+        exec 8>&-
+        wait "$DST_PROBE_PID" 2>/dev/null || true
+        exit 1
+    fi
+
+    echo "=== running external hijacker against pid $DST_PROBE_PID ==="
+    sudo "$HIJACKER" "$DST_PROBE_PID" "$dst_inject_fd" "$dst_inject_mr_target_handle" \
+        "$dst_inject_pd_target_handle" "$dst_inject_dmabuf_fd" "$dst_inject_offset" \
+        "$dst_inject_length" "$dst_inject_iova" "$dst_inject_access_flags" \
+        "$dst_inject_lkey_hint" "$dst_inject_rkey_hint" "$dst_inject_mkey_index"
+    HIJACKER_RC=$?
+    echo "hijacker rc=$HIJACKER_RC"
+
+    echo "go" >&8
+
+    while IFS= read -r line < "$dfifo_out"; do
+        echo "  [dst probe] $line"
+        [ "$line" = "READY" ] && break
+    done
+
+    echo "quit" >&8
+    exec 8>&-
+    wait "$DST_PROBE_PID"
+    DST_RC=$?
+    if [ "$HIJACKER_RC" -ne 0 ]; then
+        DST_RC=1
+    fi
+else
+    sudo "$DST_PROBE" "$DST_IBDEV" "$src_pdn" "$src_mkey_index" "$src_lkey" \
+        "$src_mr_length" "$src_access_flags" 0x4242 0x4241 "$GPU_ORD" \
+        <<< "quit"
+    DST_RC=$?
+fi
 set -e
 
 overall_rc=$DST_RC
