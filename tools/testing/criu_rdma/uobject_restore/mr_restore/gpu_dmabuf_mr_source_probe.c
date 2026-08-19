@@ -212,6 +212,19 @@ int main(int argc, char **argv)
 		perror("gpu_dmabuf_mr_source_probe: ibv_reg_dmabuf_mr");
 		return 1;
 	}
+	/*
+	 * ibv_reg_dmabuf_mr() takes its own dma_buf_attach() reference;
+	 * this fd isn't needed after registration succeeds. Close it
+	 * here rather than holding it open until final cleanup --
+	 * criu's generic file-dump code has no handler for a bare
+	 * dma-buf fd ("Can't dump file N of that type [600] (unknown
+	 * /dmabuf:)", confirmed 2026-08-19 exercising a real `criu
+	 * dump` against this probe), so an application that means to
+	 * stay criu-dumpable while holding a dma-buf MR shouldn't keep
+	 * the fd open past registration anyway.
+	 */
+	close(dmabuf_fd);
+	dmabuf_fd = -1;
 
 	/*
 	 * mlx5 invariant: lkey == rkey == (mkey_index << 8) | variant.
@@ -244,7 +257,6 @@ int main(int argc, char **argv)
 	ibv_dereg_mr(mr);
 	ibv_dealloc_pd(pd);
 	ibv_close_device(ibctx);
-	close(dmabuf_fd);
 	cuMemUnmap(ptr, size);
 	cuMemAddressFree(ptr, size);
 	cuMemRelease(handle);
