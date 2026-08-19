@@ -3466,24 +3466,41 @@ static struct ib_mr *mlx5_ib_restore_mr_dmabuf(struct ib_pd *ibpd,
 	(void)iova;		/* dispatcher populates mr->ibmr.iova */
 	(void)target_handle;	/* dispatcher reserved this in the ufile idr */
 
+	/*
+	 * Unlike mlx5_ib_restore_mr (see its doc comment: "No UMR
+	 * resource init; we never run UMR on this mr"), this sibling
+	 * DOES run UMR -- mlx5_ib_umem_restore_mr_dmabuf() below calls
+	 * mlx5_ib_init_dmabuf_mr(), which posts a UMR WQE via
+	 * dev->umrc.qp/cq. Those are lazily created on first use;
+	 * mirror reg_user_mr_dmabuf's ordering (mr.c) and ensure them
+	 * before anything else runs.
+	 */
+	err = mlx5r_umr_resource_init(dev);
+	if (err)
+		return ERR_PTR(err);
+
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
 	/*
-	 * Stage-3 D3 dma-buf destination-side import + relocate. Run
-	 * before mmkey-state population so a failure doesn't leave
-	 * behind a half-initialised mr->mmkey, same ordering as
-	 * mlx5_ib_restore_mr.
+	 * Unlike mlx5_ib_restore_mr, this mmkey/ibmr population MUST
+	 * happen before mlx5_ib_umem_restore_mr_dmabuf(), not after:
+	 * that call runs mlx5_ib_init_dmabuf_mr() synchronously (via
+	 * ib_umem_dmabuf_get()'s move-notify callback -> pagefault
+	 * -> mlx5r_umr_update_mr_pas()), which dereferences
+	 * mr_to_mdev(mr) (i.e. mr->ibmr.device) and posts a UMR WQE
+	 * addressed by mr->mmkey.key. A kzalloc'd mr has both as
+	 * NULL/0 -- leaving this population for afterwards (as
+	 * mlx5_ib_restore_mr does, safely, since its umem helper never
+	 * touches the dmabuf pagefault path) crashes with a NULL
+	 * pointer dereference the first time this verb is actually
+	 * exercised (confirmed on 2026-08-19: mr_to_mdev(mr) returning
+	 * NULL, then dev->mdev read as NULL + offsetof(struct
+	 * mlx5_ib_dev, mdev)).
 	 */
-	umem = mlx5_ib_umem_restore_mr_dmabuf(dev, mr, req.mkey_index, offset,
-					      length, dmabuf_fd, access);
-	if (IS_ERR(umem)) {
-		err = PTR_ERR(umem);
-		kfree(mr);
-		return ERR_PTR(err);
-	}
-
+	mr->ibmr.device = &dev->ib_dev;
+	mr->ibmr.pd = ibpd;
 	mr->mmkey.key = lkey_hint;
 	mr->mmkey.type = MLX5_MKEY_MR;
 	mr->mmkey.ndescs = 0;
@@ -3497,6 +3514,22 @@ static struct ib_mr *mlx5_ib_restore_mr_dmabuf(struct ib_pd *ibpd,
 
 	mr->ibmr.lkey = lkey_hint;
 	mr->ibmr.rkey = rkey_hint;
+
+	/*
+	 * Stage-3 D3 dma-buf destination-side import + relocate. On
+	 * failure, mr->umem is left NULL by the callee but mr itself
+	 * (with the mmkey/ibmr state just populated above) is still
+	 * ours to free -- same half-initialised-mr-on-failure contract
+	 * as mlx5_ib_restore_mr, just with the population order
+	 * flipped for the reason above.
+	 */
+	umem = mlx5_ib_umem_restore_mr_dmabuf(dev, mr, req.mkey_index, offset,
+					      length, dmabuf_fd, access);
+	if (IS_ERR(umem)) {
+		err = PTR_ERR(umem);
+		kfree(mr);
+		return ERR_PTR(err);
+	}
 
 	atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
 
