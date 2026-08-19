@@ -2175,6 +2175,10 @@ int vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
 
 	placeholder = vfmig_iova_user_index_lookup_locked(dom, instance_key);
 	if (!placeholder) {
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u relocate_dmabuf_mr: mkey_index=0x%x no placeholder at key=0x%llx (KIND_MR) -- LOAD_VHCA_STATE never installed a HOST_USER_MMIO placeholder for this mkey\n",
+				    dom->vf_id, mkey_index,
+				    (unsigned long long)instance_key);
 		err = -ENOENT;
 		goto out_unlock;
 	}
@@ -2194,6 +2198,10 @@ int vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
 
 	fresh = vfmig_iova_find_locked(dom, (u64)fresh_iova);
 	if (!fresh) {
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u relocate_dmabuf_mr: mkey_index=0x%x no registry entry at fresh_iova=0x%llx -- caller passed the wrong IOVA (dma-buf import didn't land where expected)\n",
+				    dom->vf_id, mkey_index,
+				    (unsigned long long)fresh_iova);
 		err = -ENOENT;
 		goto out_unlock;
 	}
@@ -2225,6 +2233,10 @@ int vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
 	 */
 	phys = iommu_iova_to_phys(dom->iommu_dom, fresh_iova);
 	if (!phys) {
+		dev_err_ratelimited(&dom->vf_pdev->dev,
+				    "vfmig_iova: vf %u relocate_dmabuf_mr: mkey_index=0x%x iommu_iova_to_phys(fresh_iova=0x%llx) returned 0 -- registry entry exists but IOMMU has no mapping there\n",
+				    dom->vf_id, mkey_index,
+				    (unsigned long long)fresh_iova);
 		err = -ENOENT;
 		goto out_unlock;
 	}
