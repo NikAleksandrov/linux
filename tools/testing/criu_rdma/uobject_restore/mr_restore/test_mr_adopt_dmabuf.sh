@@ -311,6 +311,16 @@ if [ -n "$HIJACK_INJECT_TEST" ]; then
 
     echo "quit" >&8
     exec 8>&-
+    # Keep draining dfifo_out until DST_PROBE actually exits (closing
+    # its stdout) -- subtest_v0_dealloc + the final verdict line still
+    # get written AFTER "READY". Stopping the reader early (as an
+    # earlier version of this script did) leaves the fifo with no
+    # reader for those later writes, which kills the writer with
+    # SIGPIPE (confirmed the hard way: wait reported rc=141 = 128+13
+    # despite every individual subtest having actually passed).
+    while IFS= read -r line < "$dfifo_out"; do
+        echo "  [dst probe] $line"
+    done
     wait "$DST_PROBE_PID"
     DST_RC=$?
     if [ "$HIJACKER_RC" -ne 0 ]; then
