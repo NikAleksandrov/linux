@@ -2569,34 +2569,6 @@ struct ib_device_ops {
 				    u32 lkey_hint, u32 rkey_hint,
 				    struct ib_udata *udata);
 	/*
-	 * CRIU-restore variant of reg_user_mr_dmabuf. Sibling of
-	 * restore_mr, not an overload of it -- see
-	 * UVERBS_METHOD_RESTORE_MR_DMABUF's doc comment in
-	 * ib_user_ioctl_cmds.h for why a GPU/peer dma-buf MR restore
-	 * needs its own verb rather than an optional attr on RESTORE_MR.
-	 *
-	 * The generic UVERBS_METHOD_RESTORE_MR_DMABUF dispatcher has
-	 * already done the same pre-work as restore_mr (gated on
-	 * ucontext_is_restore_mode(), resolved @pd, reserved
-	 * @target_handle). @dmabuf_fd is a FRESH dma-buf the caller
-	 * (CRIU restore userspace) allocated and exported on THIS host
-	 * -- not the source's dma-buf fd, which is meaningless here.
-	 *
-	 * Driver-private FW state travels through @udata via
-	 * UVERBS_ATTR_UHW() exactly as for restore_mr (mlx5:
-	 * struct mlx5_ib_restore_mr_dmabuf_req, same shape as
-	 * struct mlx5_ib_restore_mr_req).
-	 *
-	 * Returns a valid struct ib_mr * on success, ERR_PTR on
-	 * failure (failure aborts the uobject install).
-	 */
-	struct ib_mr *(*restore_mr_dmabuf)(struct ib_pd *pd,
-					   u32 target_handle, int dmabuf_fd,
-					   u64 offset, u64 length, u64 iova,
-					   int access_flags,
-					   u32 lkey_hint, u32 rkey_hint,
-					   struct ib_udata *udata);
-	/*
 	 * CRIU-restore variant of create_cq. The generic
 	 * UVERBS_METHOD_RESTORE_CQ dispatcher has already:
 	 *   - gated on ucontext_is_restore_mode(),
@@ -2940,6 +2912,35 @@ struct ib_device_ops {
 	 */
 	void (*report_port_event)(struct ib_device *ibdev,
 				  struct net_device *ndev, unsigned long event);
+
+	/*
+	 * CRIU-restore variant of reg_user_mr_dmabuf. Sibling of
+	 * restore_mr, not an overload of it -- see
+	 * UVERBS_METHOD_RESTORE_MR_DMABUF's doc comment in
+	 * ib_user_ioctl_cmds.h for why a GPU/peer dma-buf MR restore
+	 * needs its own verb rather than an optional attr on RESTORE_MR.
+	 *
+	 * The generic UVERBS_METHOD_RESTORE_MR_DMABUF dispatcher has
+	 * already done the same pre-work as restore_mr (gated on
+	 * ucontext_is_restore_mode(), resolved @pd, reserved
+	 * @target_handle). @dmabuf_fd is a FRESH dma-buf the caller
+	 * (CRIU restore userspace) allocated and exported on THIS host
+	 * -- not the source's dma-buf fd, which is meaningless here.
+	 *
+	 * Driver-private FW state travels through @udata via
+	 * UVERBS_ATTR_UHW() exactly as for restore_mr (mlx5:
+	 * struct mlx5_ib_restore_mr_dmabuf_req, same shape as
+	 * struct mlx5_ib_restore_mr_req).
+	 *
+	 * Returns a valid struct ib_mr * on success, ERR_PTR on
+	 * failure (failure aborts the uobject install).
+	 */
+	struct ib_mr *(*restore_mr_dmabuf)(struct ib_pd *pd,
+					   u32 target_handle, int dmabuf_fd,
+					   u64 offset, u64 length, u64 iova,
+					   int access_flags,
+					   u32 lkey_hint, u32 rkey_hint,
+					   struct ib_udata *udata);
 
 	DECLARE_RDMA_OBJ_SIZE(ib_ah);
 	DECLARE_RDMA_OBJ_SIZE(ib_counters);
