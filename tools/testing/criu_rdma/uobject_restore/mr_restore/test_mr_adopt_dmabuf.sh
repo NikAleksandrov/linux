@@ -55,6 +55,22 @@ HIJACK_INJECT_TEST=${HIJACK_INJECT_TEST:-}
 # /opt/builds) from this file's own kernel tree -- not a relative
 # path, override via env if built somewhere else.
 HIJACKER=${HIJACKER:-/opt/builds/hijack_rdma_restore_mr_dmabuf}
+# gpu-dmabuf-criu-3f-restore-injection-design.md Phase 4: when set,
+# route Phase F through the SAME DST_PROBE HIJACK_INJECT_TEST=1 setup
+# as above, but drive test_restore_gpu_dmabuf_mrs (~/scripts) instead
+# of HIJACKER -- exercises the REAL cuda_dmabuf_inject.c functions
+# restore_gpu_dmabuf_mrs() (plugins/cuda/cuda_plugin.c) actually calls,
+# including the size-based VMA lookup and a freshly hijacked dma-buf
+# export, rather than reusing DST_PROBE's own already-open dma-buf fd
+# the way HIJACKER does. Mutually exclusive with HIJACK_INJECT_TEST
+# (both drive the same DST_PROBE injection-mode setup; only one
+# external tool can consume a given DST_PROBE run).
+RESTORE_GPU_MRS_TEST=${RESTORE_GPU_MRS_TEST:-}
+RESTORE_GPU_MRS_HARNESS=${RESTORE_GPU_MRS_HARNESS:-/opt/builds/test_restore_gpu_dmabuf_mrs}
+if [ -n "$HIJACK_INJECT_TEST" ] && [ -n "$RESTORE_GPU_MRS_TEST" ]; then
+    echo "FAIL: HIJACK_INJECT_TEST and RESTORE_GPU_MRS_TEST are mutually exclusive"
+    exit 1
+fi
 
 CDEV="/dev/mlx5_vfmig/$PF"
 [ -x "$TOOL" ]      || { echo "build $TOOL first: make -C $ROOT_DIR";      exit 1; }
@@ -249,14 +265,59 @@ echo
 
 sudo dmesg -C 2>/dev/null || true
 set +e
-if [ -n "$HIJACK_INJECT_TEST" ]; then
-    [ -x "$HIJACKER" ] || { echo "FAIL: HIJACKER not found/executable: $HIJACKER"; exit 1; }
+# TEMPORARY diagnostic (gpu-dmabuf-criu-3f-restore-injection-design.md
+# Phase 4 investigation, 2026-08-19): isolate whether the hijacked
+# cuMemGetHandleForAddressRange failure seen under RESTORE_GPU_MRS_TEST
+# is specific to RDMA cdev/ioctl activity having happened in DST_PROBE
+# first, by driving DST_PROBE's RESTORE_GPU_MRS_TEST_EARLY mode (blocks
+# right after the CUDA allocation, before ANY RDMA activity) and only
+# exercising the harness's export step against it.
+if [ -n "${RESTORE_GPU_MRS_TEST_EARLY:-}" ]; then
+    [ -x "$RESTORE_GPU_MRS_HARNESS" ] || { echo "FAIL: RESTORE_GPU_MRS_HARNESS not found/executable: $RESTORE_GPU_MRS_HARNESS"; exit 1; }
+    dfifo_in="$WORKDIR/dst.in"
+    dfifo_out="$WORKDIR/dst.out"
+    mkfifo "$dfifo_in" "$dfifo_out"
+    sudo env RESTORE_GPU_MRS_TEST_EARLY=1 "$DST_PROBE" "$DST_IBDEV" "$src_pdn" "$src_mkey_index" \
+        "$src_lkey" "$src_mr_length" "$src_access_flags" 0x4242 0x4241 "$GPU_ORD" \
+        < "$dfifo_in" > "$dfifo_out" 2>&1 &
+    DST_PROBE_PID=$!
+    exec 8> "$dfifo_in"
+    line=""
+    while IFS= read -r line < "$dfifo_out"; do
+        echo "  [dst probe] $line"
+        [ "$line" = "INJECT_READY" ] && break
+    done
+    DST_PROBE_REAL_PID=$(pgrep -x mr_restore_prob | head -1)
+    [ -n "$DST_PROBE_REAL_PID" ] || { echo "FAIL: couldn't resolve real DST_PROBE pid"; exit 1; }
+    echo "=== running test_restore_gpu_dmabuf_mrs (export step only, fd=0 dummy) against real pid $DST_PROBE_REAL_PID ==="
+    sudo "$RESTORE_GPU_MRS_HARNESS" "$DST_PROBE_REAL_PID" 0 0x4242 0x4241 0 "$src_mr_length" \
+        "$src_access_flags" "$src_lkey" "$src_lkey" "$src_mkey_index"
+    echo "harness rc=$?"
+    echo "quit" >&8
+    exec 8>&-
+    while IFS= read -r line < "$dfifo_out"; do
+        echo "  [dst probe] $line"
+    done
+    wait "$DST_PROBE_PID"
+    exit 0
+fi
+if [ -n "$HIJACK_INJECT_TEST" ] || [ -n "$RESTORE_GPU_MRS_TEST" ]; then
+    if [ -n "$RESTORE_GPU_MRS_TEST" ]; then
+        [ -x "$RESTORE_GPU_MRS_HARNESS" ] || { echo "FAIL: RESTORE_GPU_MRS_HARNESS not found/executable: $RESTORE_GPU_MRS_HARNESS"; exit 1; }
+    else
+        [ -x "$HIJACKER" ] || { echo "FAIL: HIJACKER not found/executable: $HIJACKER"; exit 1; }
+    fi
     echo "=== Phase F (injection mode): DST_PROBE will block for external RESTORE_MR_DMABUF ==="
 
     dfifo_in="$WORKDIR/dst.in"
     dfifo_out="$WORKDIR/dst.out"
     mkfifo "$dfifo_in" "$dfifo_out"
-    sudo env HIJACK_INJECT_TEST=1 "$DST_PROBE" "$DST_IBDEV" "$src_pdn" "$src_mkey_index" \
+    if [ -n "$RESTORE_GPU_MRS_TEST" ]; then
+        dst_probe_env="RESTORE_GPU_MRS_TEST=1"
+    else
+        dst_probe_env="HIJACK_INJECT_TEST=1"
+    fi
+    sudo env $dst_probe_env "$DST_PROBE" "$DST_IBDEV" "$src_pdn" "$src_mkey_index" \
         "$src_lkey" "$src_mr_length" "$src_access_flags" 0x4242 0x4241 "$GPU_ORD" \
         < "$dfifo_in" > "$dfifo_out" 2>&1 &
     # $! here is `sudo`'s own pid, NOT the real DST_PROBE binary's --
@@ -294,11 +355,19 @@ if [ -n "$HIJACK_INJECT_TEST" ]; then
 
     DST_PROBE_REAL_PID=$(pgrep -x mr_restore_prob | head -1)
     [ -n "$DST_PROBE_REAL_PID" ] || { echo "FAIL: couldn't resolve real DST_PROBE pid via pgrep"; exit 1; }
-    echo "=== running external hijacker against real pid $DST_PROBE_REAL_PID (sudo wrapper pid was $DST_PROBE_PID) ==="
-    sudo "$HIJACKER" "$DST_PROBE_REAL_PID" "$dst_inject_fd" "$dst_inject_mr_target_handle" \
-        "$dst_inject_pd_target_handle" "$dst_inject_dmabuf_fd" "$dst_inject_offset" \
-        "$dst_inject_length" "$dst_inject_iova" "$dst_inject_access_flags" \
-        "$dst_inject_lkey_hint" "$dst_inject_rkey_hint" "$dst_inject_mkey_index"
+    if [ -n "$RESTORE_GPU_MRS_TEST" ]; then
+        echo "=== running test_restore_gpu_dmabuf_mrs against real pid $DST_PROBE_REAL_PID (sudo wrapper pid was $DST_PROBE_PID) ==="
+        sudo "$RESTORE_GPU_MRS_HARNESS" "$DST_PROBE_REAL_PID" "$dst_inject_fd" "$dst_inject_mr_target_handle" \
+            "$dst_inject_pd_target_handle" "$dst_inject_offset" "$dst_inject_length" \
+            "$dst_inject_access_flags" "$dst_inject_lkey_hint" "$dst_inject_rkey_hint" \
+            "$dst_inject_mkey_index"
+    else
+        echo "=== running external hijacker against real pid $DST_PROBE_REAL_PID (sudo wrapper pid was $DST_PROBE_PID) ==="
+        sudo "$HIJACKER" "$DST_PROBE_REAL_PID" "$dst_inject_fd" "$dst_inject_mr_target_handle" \
+            "$dst_inject_pd_target_handle" "$dst_inject_dmabuf_fd" "$dst_inject_offset" \
+            "$dst_inject_length" "$dst_inject_iova" "$dst_inject_access_flags" \
+            "$dst_inject_lkey_hint" "$dst_inject_rkey_hint" "$dst_inject_mkey_index"
+    fi
     HIJACKER_RC=$?
     echo "hijacker rc=$HIJACKER_RC"
 

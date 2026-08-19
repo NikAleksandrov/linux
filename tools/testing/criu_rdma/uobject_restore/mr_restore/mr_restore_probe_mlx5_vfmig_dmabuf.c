@@ -600,11 +600,35 @@ static int alloc_gpu_dmabuf(int gpu_ordinal, uint64_t requested_size,
 	access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 	CHECK_CU(cuMemSetAccess(ptr, size, &access_desc, 1));
 
-	CHECK_CU(cuMemGetHandleForAddressRange(
-		&dmabuf_fd, ptr, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0));
+	/*
+	 * gpu-dmabuf-criu-3f-restore-injection-design.md Phase 4:
+	 * RESTORE_GPU_MRS_TEST=1 (test_restore_gpu_dmabuf_mrs,
+	 * ~/scripts) exercises cuda_dmabuf_inject_export() -- the
+	 * SAME cuMemGetHandleForAddressRange call below, hijacked into
+	 * this process externally -- against this VA range itself. A
+	 * real CRIU restore always calls it exactly ONCE per range (the
+	 * range is freshly created by cuda-checkpoint's ACTION_RESTORE,
+	 * never exported before). Confirmed empirically (2026-08-19,
+	 * viking0004) that calling it a SECOND time on a range already
+	 * exported once here returns CUDA_ERROR_INVALID_VALUE (1) --
+	 * skip the in-process export in that mode so the range is
+	 * still unexported (matching the real scenario) when the
+	 * external hijack runs. inject_dmabuf_fd (used only by the
+	 * OLDER HIJACK_INJECT_TEST mode, which reuses this fd directly
+	 * instead of deriving its own) is simply -1 in this mode --
+	 * unused by RESTORE_GPU_MRS_TEST's harness.
+	 */
+	if (getenv("RESTORE_GPU_MRS_TEST") || getenv("RESTORE_GPU_MRS_TEST_EARLY")) {
+		printf("mr_restore_dmabuf: allocated fresh GPU buffer, %zu bytes, "
+		       "export skipped (RESTORE_GPU_MRS_TEST=1)\n",
+		       size);
+	} else {
+		CHECK_CU(cuMemGetHandleForAddressRange(
+			&dmabuf_fd, ptr, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0));
 
-	printf("mr_restore_dmabuf: allocated fresh GPU buffer, %zu bytes, dma-buf fd=%d\n",
-	       size, dmabuf_fd);
+		printf("mr_restore_dmabuf: allocated fresh GPU buffer, %zu bytes, dma-buf fd=%d\n",
+		       size, dmabuf_fd);
+	}
 
 	*dmabuf_fd_out = dmabuf_fd;
 	*aligned_size_out = (uint64_t)size;
@@ -1105,6 +1129,25 @@ int main(int argc, char **argv)
 	if (mr_args_alloc_dmabuf(&a) != 0)
 		return 2;
 
+	/*
+	 * TEMPORARY diagnostic (gpu-dmabuf-criu-3f-restore-injection-
+	 * design.md Phase 4 investigation, 2026-08-19): isolate whether
+	 * the RDMA cdev open + ioctls below interfere with a LATER
+	 * hijacked cuMemGetHandleForAddressRange call, by blocking here,
+	 * before any RDMA activity at all, if this env var is set.
+	 */
+	if (getenv("RESTORE_GPU_MRS_TEST_EARLY")) {
+		printf("inject_early_va=0x0\n");
+		printf("INJECT_READY\n");
+		fflush(stdout);
+		char line[64];
+		while (fgets(line, sizeof(line), stdin)) {
+			if (!strncmp(line, "quit", 4))
+				break;
+		}
+		return 0;
+	}
+
 	/* Subtest 1 uses its own short-lived non-restore-mode ucontext. */
 	fails += subtest_gate_negative(cdev_path, &a);
 
@@ -1135,7 +1178,7 @@ int main(int argc, char **argv)
 	fails += subtest_uapi_reject_reserved(fd_restore, &a);
 	fails += subtest_uapi_reject_lkey_neq_rkey(fd_restore, &a);
 	fails += subtest_uapi_reject_lkey_mismatch_mkey(fd_restore, &a);
-	if (getenv("HIJACK_INJECT_TEST"))
+	if (getenv("HIJACK_INJECT_TEST") || getenv("RESTORE_GPU_MRS_TEST"))
 		fails += subtest_happy_path_wait_for_external_ioctl(fd_restore, &a);
 	else
 		fails += subtest_happy_path(fd_restore, &a);
