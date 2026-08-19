@@ -3443,25 +3443,74 @@ static struct ib_mr *mlx5_ib_restore_mr_dmabuf(struct ib_pd *ibpd,
 	struct ib_umem *umem;
 	int err;
 
-	if (!context)
+	/*
+	 * vfmig_mr_dbg tracing, 2026-08-19: unconditional (mlx5_ib_warn,
+	 * not dyndbg-gated mlx5_ib_dbg) so a single kernel build captures
+	 * full step-by-step visibility into this path without needing to
+	 * separately enable dynamic debug before every test run --
+	 * cross-host rebuild+reload+test cycles are expensive, so batch
+	 * every diagnostic that might be needed into one build rather
+	 * than iterating one at a time. Safe to leave in place afterward
+	 * (low volume, only fires on GPU_DMABUF MR restore).
+	 */
+	mlx5_ib_warn(dev,
+		     "vfmig_mr_dbg: restore_mr_dmabuf ENTRY target_handle=0x%x dmabuf_fd=%d offset=0x%llx length=0x%llx iova=0x%llx access=0x%x lkey_hint=0x%x rkey_hint=0x%x\n",
+		     target_handle, dmabuf_fd, offset, length, iova, access,
+		     lkey_hint, rkey_hint);
+
+	if (!context) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: no ucontext (udata not from a ucontext-bound ioctl?)\n");
 		return ERR_PTR(-EINVAL);
-	if (!context->vfmig_restore_mode)
+	}
+	if (!context->vfmig_restore_mode) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: ucontext not in vfmig_restore_mode\n");
 		return ERR_PTR(-EPERM);
+	}
 
-	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+	if (udata->inlen < sizeof(req) || udata->outlen != 0) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: bad udata size inlen=%zu outlen=%zu (want inlen>=%zu, outlen==0)\n",
+			     udata->inlen, udata->outlen, sizeof(req));
 		return ERR_PTR(-EINVAL);
+	}
 	err = ib_copy_from_udata(&req, udata, sizeof(req));
-	if (err)
+	if (err) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: ib_copy_from_udata err=%d\n",
+			     err);
 		return ERR_PTR(err);
-	if (req.reserved || req.reserved2)
+	}
+	if (req.reserved || req.reserved2) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: nonzero reserved fields reserved=0x%x reserved2=0x%x\n",
+			     req.reserved, req.reserved2);
 		return ERR_PTR(-EINVAL);
-	if (req.mkey_index & ~0xffffffU || req.mkey_index == 0)
+	}
+	if (req.mkey_index & ~0xffffffU || req.mkey_index == 0) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: bad mkey_index=0x%x\n",
+			     req.mkey_index);
 		return ERR_PTR(-EINVAL);
+	}
 
-	if (lkey_hint != rkey_hint)
+	if (lkey_hint != rkey_hint) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: lkey_hint=0x%x != rkey_hint=0x%x\n",
+			     lkey_hint, rkey_hint);
 		return ERR_PTR(-EINVAL);
-	if ((lkey_hint >> 8) != req.mkey_index)
+	}
+	if ((lkey_hint >> 8) != req.mkey_index) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: lkey_hint>>8=0x%x != mkey_index=0x%x\n",
+			     lkey_hint >> 8, req.mkey_index);
 		return ERR_PTR(-EINVAL);
+	}
+
+	mlx5_ib_warn(dev,
+		     "vfmig_mr_dbg: restore_mr_dmabuf udata OK mkey_index=0x%x lkey_hint=0x%x rkey_hint=0x%x, calling mlx5r_umr_resource_init\n",
+		     req.mkey_index, lkey_hint, rkey_hint);
 
 	(void)iova;		/* dispatcher populates mr->ibmr.iova */
 	(void)target_handle;	/* dispatcher reserved this in the ufile idr */
@@ -3476,8 +3525,14 @@ static struct ib_mr *mlx5_ib_restore_mr_dmabuf(struct ib_pd *ibpd,
 	 * before anything else runs.
 	 */
 	err = mlx5r_umr_resource_init(dev);
-	if (err)
+	if (err) {
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: mlx5r_umr_resource_init err=%d\n",
+			     err);
 		return ERR_PTR(err);
+	}
+	mlx5_ib_warn(dev,
+		     "vfmig_mr_dbg: restore_mr_dmabuf mlx5r_umr_resource_init OK, allocating mr\n");
 
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
@@ -3523,18 +3578,24 @@ static struct ib_mr *mlx5_ib_restore_mr_dmabuf(struct ib_pd *ibpd,
 	 * as mlx5_ib_restore_mr, just with the population order
 	 * flipped for the reason above.
 	 */
+	mlx5_ib_warn(dev,
+		     "vfmig_mr_dbg: restore_mr_dmabuf calling mlx5_ib_umem_restore_mr_dmabuf mkey_index=0x%x offset=0x%llx length=0x%llx dmabuf_fd=%d access=0x%x (this posts a UMR WQE on dev->umrc.qp/cq)\n",
+		     req.mkey_index, offset, length, dmabuf_fd, access);
 	umem = mlx5_ib_umem_restore_mr_dmabuf(dev, mr, req.mkey_index, offset,
 					      length, dmabuf_fd, access);
 	if (IS_ERR(umem)) {
 		err = PTR_ERR(umem);
+		mlx5_ib_warn(dev,
+			     "vfmig_mr_dbg: restore_mr_dmabuf FAIL: mlx5_ib_umem_restore_mr_dmabuf err=%d\n",
+			     err);
 		kfree(mr);
 		return ERR_PTR(err);
 	}
 
 	atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
 
-	mlx5_ib_dbg(dev,
-		    "vfmig_mr_dbg: restore_mr_dmabuf ibdev=%s mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x umem_npages=%zu\n",
+	mlx5_ib_warn(dev,
+		    "vfmig_mr_dbg: restore_mr_dmabuf SUCCESS ibdev=%s mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x umem_npages=%zu\n",
 		    dev_name(&ibpd->device->dev), req.mkey_index, lkey_hint,
 		    mpd->pdn, mpd->uid, target_handle,
 		    ib_umem_num_pages(umem));

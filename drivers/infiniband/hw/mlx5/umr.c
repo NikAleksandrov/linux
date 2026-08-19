@@ -387,7 +387,64 @@ static int mlx5r_umr_post_send_wait(struct mlx5_ib_dev *dev, u32 mkey,
 			break;
 		}
 
-		wait_for_completion(&umr_context.done);
+		/*
+		 * vfmig experimental workaround, 2026-08-19: on a restored
+		 * VF, the UMR CQ's completion EVENT notification may never
+		 * fire even though the WQE itself completes -- same class
+		 * of issue as the cmd_eq "ghost EQE"/lost-notification
+		 * problem documented in main.c's
+		 * vfmig_load_skip_cmd_use_events comment (a regular per-QP
+		 * CQ instead of the special cmd_eq; not previously confirmed
+		 * to share the exact same root cause, but the same "EQ
+		 * delivery isn't reconstituted coherently post-LOAD_VHCA_STATE"
+		 * category -- see tools/testing/criu_rdma/design/datapath_pause_resume.md's
+		 * "Known limitation (PARKED): post-restore reg_mr hangs in
+		 * UMR on mlx5 VFs"). Without this, wait_for_completion()
+		 * here is untimed and hangs the caller in D state forever,
+		 * eventually tripping poll_health "Fatal error 3"
+		 * (MLX5_SENSOR_NIC_DISABLED). Bound the wait on a restored
+		 * VF and, on timeout, poll the CQ directly: ib_poll_cq()
+		 * reads the hardware-written CQE from the CQ buffer in
+		 * memory, independent of whether the event/interrupt
+		 * notification path actually fired. If the WQE genuinely
+		 * completed and only the notification was lost, this
+		 * recovers a real success instead of a spurious failure.
+		 *
+		 * NB: only safe as written for the single-waiter case (no
+		 * other UMR post concurrently in flight on this shared
+		 * umrc.qp/cq) -- a direct ib_poll_cq() here could otherwise
+		 * steal a CQE belonging to a different concurrent waiter's
+		 * still-pending completion, since it bypasses the normal
+		 * IB_POLL_SOFTIRQ dispatch that would route it to the right
+		 * mlx5r_umr_context. Fine for this experiment (GPU_DMABUF MR
+		 * restore has exactly one in-flight UMR post per VF); NOT
+		 * safe to land as-is for general use.
+		 */
+		if (mlx5_vf_is_restored(dev->mdev)) {
+			if (!wait_for_completion_timeout(&umr_context.done,
+							 msecs_to_jiffies(2000))) {
+				struct ib_wc wc;
+				int n;
+
+				mlx5_ib_warn(dev,
+					     "vfmig: UMR completion event did not fire on restored VF within 2000ms; polling CQ directly\n");
+				n = ib_poll_cq(umrc->cq, 1, &wc);
+				if (n == 1 && wc.wr_cqe == &umr_context.cqe) {
+					mlx5_ib_warn(dev,
+						     "vfmig: direct CQ poll recovered the completion (wc.status=%d) -- event notification was lost, WQE itself completed\n",
+						     wc.status);
+					umr_context.status = wc.status;
+				} else {
+					mlx5_ib_err(dev,
+						    "vfmig: direct CQ poll found nothing for our WQE (n=%d) -- WQE itself did not complete, not just the notification\n",
+						    n);
+					err = -ETIMEDOUT;
+					break;
+				}
+			}
+		} else {
+			wait_for_completion(&umr_context.done);
+		}
 
 		if (umr_context.status == IB_WC_SUCCESS)
 			break;
