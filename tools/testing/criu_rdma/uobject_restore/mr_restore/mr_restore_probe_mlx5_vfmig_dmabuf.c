@@ -861,6 +861,72 @@ static int subtest_happy_path(int fd, const struct mr_args *a)
 	return fails;
 }
 
+/*
+ * Phase 3 of gpu-dmabuf-criu-3f-restore-injection-design.md: instead
+ * of calling do_restore_mr_dmabuf() in-process (subtest_happy_path
+ * above), print everything an EXTERNAL hijacker process needs and
+ * block, so it can perform the RESTORE_MR_DMABUF ioctl itself via
+ * ptrace call-injection against this already-set-up process -- the
+ * same shape of thing cuda_plugin.c's resume_device() will eventually
+ * need to do for real (Phase 4), but still standalone/not wired into
+ * criu here. Strictly opt-in (HIJACK_INJECT_TEST=1) -- does not
+ * change default behavior at all, so this cannot regress the existing
+ * test_mr_adopt_dmabuf.sh flow.
+ *
+ * Verification split across both sides on purpose: the external
+ * hijacker independently reads back the resp lkey/rkey from the
+ * target scratch memory it wrote (same pattern as its dma-buf-fd
+ * readback in Phase 2); THIS process verifies via INFO_HANDLES(MR)
+ * after resuming, entirely through its own normal fd -- an
+ * independent confirmation from a different code path than whatever
+ * the hijacker itself believes happened.
+ */
+static int subtest_happy_path_wait_for_external_ioctl(int fd, const struct mr_args *a)
+{
+	uint32_t list[64] = {};
+	uint32_t total = 0;
+	int ret;
+
+	printf("[6-inject] waiting for external RESTORE_MR_DMABUF injection\n");
+	printf("inject_fd=%d\n", fd);
+	printf("inject_mr_target_handle=0x%x\n", a->mr_target_handle);
+	printf("inject_pd_target_handle=0x%x\n", a->pd_target_handle);
+	printf("inject_dmabuf_fd=%d\n", a->dmabuf_fd);
+	printf("inject_offset=0\n");
+	printf("inject_length=%llu\n", (unsigned long long)a->src_length);
+	printf("inject_iova=0\n");
+	printf("inject_access_flags=%u\n", a->src_access_flags);
+	printf("inject_lkey_hint=0x%x\n", a->src_lkey);
+	printf("inject_rkey_hint=0x%x\n", a->src_lkey);
+	printf("inject_mkey_index=%u\n", a->src_mkey_index);
+	printf("INJECT_READY\n");
+	fflush(stdout);
+
+	{
+		char line[64];
+		while (fgets(line, sizeof(line), stdin)) {
+			if (!strncmp(line, "go", 2))
+				break;
+		}
+	}
+
+	ret = do_info_handles_mr(fd, list, 64, &total);
+	if (ret) {
+		fprintf(stderr, "  FAIL INFO_HANDLES(MR): %s\n", strerror(-ret));
+		return 1;
+	}
+	if (!handle_present(list, total, a->mr_target_handle)) {
+		fprintf(stderr,
+			"  FAIL INFO_HANDLES(MR): handle 0x%x not in list (total=%u) after "
+			"external injection -- injection did not land\n",
+			a->mr_target_handle, total);
+		return 1;
+	}
+	printf("  PASS INFO_HANDLES(MR) returned 0x%x among %u entries after external "
+	       "injection\n", a->mr_target_handle, total);
+	return 0;
+}
+
 static int subtest_collision(int fd, const struct mr_args *a)
 {
 	struct mlx5_ib_restore_mr_dmabuf_req uhw = {
@@ -1069,7 +1135,10 @@ int main(int argc, char **argv)
 	fails += subtest_uapi_reject_reserved(fd_restore, &a);
 	fails += subtest_uapi_reject_lkey_neq_rkey(fd_restore, &a);
 	fails += subtest_uapi_reject_lkey_mismatch_mkey(fd_restore, &a);
-	fails += subtest_happy_path(fd_restore, &a);
+	if (getenv("HIJACK_INJECT_TEST"))
+		fails += subtest_happy_path_wait_for_external_ioctl(fd_restore, &a);
+	else
+		fails += subtest_happy_path(fd_restore, &a);
 	fails += subtest_collision(fd_restore, &a);
 
 	if (fails) {
