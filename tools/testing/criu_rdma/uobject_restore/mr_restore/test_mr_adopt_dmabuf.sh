@@ -259,6 +259,17 @@ if [ -n "$HIJACK_INJECT_TEST" ]; then
     sudo env HIJACK_INJECT_TEST=1 "$DST_PROBE" "$DST_IBDEV" "$src_pdn" "$src_mkey_index" \
         "$src_lkey" "$src_mr_length" "$src_access_flags" 0x4242 0x4241 "$GPU_ORD" \
         < "$dfifo_in" > "$dfifo_out" 2>&1 &
+    # $! here is `sudo`'s own pid, NOT the real DST_PROBE binary's --
+    # sudo commonly runs the target as a child of its own
+    # monitor/wrapper process, so a ptrace attach (or anything fd-
+    # table-dependent, like our external hijacker) against $! targets
+    # the WRONG process (confirmed the hard way: readlink on one of
+    # its fds came back "No such file or directory" -- the fd simply
+    # didn't exist in that process at all). Keep $! only for `wait`
+    # (which requires an actual direct child of this shell) and
+    # cleanup()'s bookkeeping; resolve the REAL pid via pgrep once we
+    # know it's alive (i.e. right after it starts talking to us) for
+    # anything that needs to act on the actual process.
     DST_PROBE_PID=$!
     exec 8> "$dfifo_in"
 
@@ -281,8 +292,10 @@ if [ -n "$HIJACK_INJECT_TEST" ]; then
         exit 1
     fi
 
-    echo "=== running external hijacker against pid $DST_PROBE_PID ==="
-    sudo "$HIJACKER" "$DST_PROBE_PID" "$dst_inject_fd" "$dst_inject_mr_target_handle" \
+    DST_PROBE_REAL_PID=$(pgrep -x mr_restore_prob | head -1)
+    [ -n "$DST_PROBE_REAL_PID" ] || { echo "FAIL: couldn't resolve real DST_PROBE pid via pgrep"; exit 1; }
+    echo "=== running external hijacker against real pid $DST_PROBE_REAL_PID (sudo wrapper pid was $DST_PROBE_PID) ==="
+    sudo "$HIJACKER" "$DST_PROBE_REAL_PID" "$dst_inject_fd" "$dst_inject_mr_target_handle" \
         "$dst_inject_pd_target_handle" "$dst_inject_dmabuf_fd" "$dst_inject_offset" \
         "$dst_inject_length" "$dst_inject_iova" "$dst_inject_access_flags" \
         "$dst_inject_lkey_hint" "$dst_inject_rkey_hint" "$dst_inject_mkey_index"
