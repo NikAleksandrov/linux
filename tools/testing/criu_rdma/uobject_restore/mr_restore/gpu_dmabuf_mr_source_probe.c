@@ -32,6 +32,7 @@
  *   ./gpu_dmabuf_mr_source_probe <ibdev> [--size-mb N] [--gpu N]
  */
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +100,26 @@ static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"usage: %s <ibdev> [--size-mb N] [--gpu N]\n", prog);
+}
+
+/*
+ * gpu-dmabuf-criu-3f-restore-injection-design.md Phase 4: REAL_CRIU_TEST=1
+ * mode blocks on a signal instead of stdin, so a REAL `criu dump`/`criu
+ * restore` cycle (unlike every other test in this file, which drives
+ * this probe via a FIFO held open by an external, non-dumped shell
+ * process) has nothing external to reconnect -- a named-pipe fd with
+ * its writer held by a process outside the dumped tree is exactly the
+ * kind of external resource criu needs `--external pipe:[inode]` (or
+ * similar) for, and reopening a FIFO for read after restore blocks
+ * until a writer attaches, a real hang risk this sidesteps entirely.
+ * `kill -TERM <pid>` cleanly wakes it for exit (used instead of the
+ * normal "quit\n" stdin line).
+ */
+static volatile sig_atomic_t g_got_term;
+static void term_handler(int sig)
+{
+	(void)sig;
+	g_got_term = 1;
 }
 
 int main(int argc, char **argv)
@@ -208,7 +229,11 @@ int main(int argc, char **argv)
 	printf("READY\n");
 	fflush(stdout);
 
-	{
+	if (getenv("REAL_CRIU_TEST")) {
+		signal(SIGTERM, term_handler);
+		while (!g_got_term)
+			pause();
+	} else {
 		char line[64];
 		while (fgets(line, sizeof(line), stdin)) {
 			if (!strncmp(line, "quit", 4))
