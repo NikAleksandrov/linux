@@ -1795,13 +1795,34 @@ err_dereg_mr:
  *
  * Composition (gpu-dmabuf-criu-plan.md §3c/§3d):
  *
- *   1. ib_umem_dmabuf_get(...) -- imports @fd, triggering
- *      dma_buf_map_attachment() -> the exporter's .map_dma_buf ->
- *      (for a GPU exporter) vfmig_dma_ops_map_phys(DMA_ATTR_MMIO) ->
- *      vfmig_iova_user_mmio_map_phys(). Unlike ib_umem_pin(), this
- *      has NO pin-without-mapping phase -- the fresh phys is already
+ *   1. ib_umem_dmabuf_get_pinned(...) -- imports @fd and immediately
+ *      pins + maps it (dma_buf_pin() + ib_umem_dmabuf_map_pages()),
+ *      triggering dma_buf_map_attachment() -> the exporter's
+ *      .map_dma_buf -> (for a GPU exporter)
+ *      vfmig_dma_ops_map_phys(DMA_ATTR_MMIO) ->
+ *      vfmig_iova_user_mmio_map_phys(). The fresh phys is already
  *      iommu_map()'d at a freshly bump-allocated USER_MMIO IOVA by
  *      the time this call returns.
+ *
+ *      Deliberately NOT the plain (movable/ODP) ib_umem_dmabuf_get():
+ *      that variant leaves the umem's sgt unpopulated until something
+ *      pagefaults it in, and mlx5's only pagefault path
+ *      (mlx5_ib_init_dmabuf_mr -> pagefault_dmabuf_mr ->
+ *      mlx5r_umr_update_mr_pas) populates it by POSTing a UMR WQE
+ *      against the mr's mkey. That is invalid here: this mkey is
+ *      *adopted* FW state (mlx5_ib_restore_mr_dmabuf sets
+ *      mr->mmkey.cache_ent = NULL, cacheable = 0, same as the plain
+ *      restore_mr sibling, whose own doc comment states adopted MRs
+ *      "never participate in ODP/UMR fast paths"). Confirmed on
+ *      hardware: FW rejects the UMR post against an adopted mkey with
+ *      CQE syndrome 6 ("memory bind operation error") --
+ *      mlx5r_umr_post_send_wait "reg umr failed (6)". The pinned
+ *      variant maps pages directly with no UMR/mkey involvement at
+ *      all, which is what we actually want -- we're not relying on
+ *      UMR-programmed translation, we're relocating the IOMMU mapping
+ *      (step 2 below) to the IOVA the adopted mkey's FW state already
+ *      references from the source's CREATE_MKEY (preserved across
+ *      LOAD_VHCA_STATE).
  *   2. mlx5_vfmig_relocate_dmabuf_mr(dev->mdev, mkey_index,
  *      fresh_iova, &final_iova) -- moves that mapping to the
  *      placeholder's recorded IOVA (see its own doc comment in
@@ -1839,17 +1860,13 @@ struct ib_umem *mlx5_ib_umem_restore_mr_dmabuf(struct mlx5_ib_dev *dev,
 	unsigned int page_off;
 	int err;
 
-	umem_dmabuf = ib_umem_dmabuf_get(&dev->ib_dev, offset, length, fd,
-					 access, &mlx5_ib_dmabuf_attach_ops);
+	umem_dmabuf = ib_umem_dmabuf_get_pinned(&dev->ib_dev, offset, length,
+						fd, access);
 	if (IS_ERR(umem_dmabuf))
 		return ERR_CAST(umem_dmabuf);
 
 	mr->umem = &umem_dmabuf->umem;
 	umem_dmabuf->private = mr;
-
-	err = mlx5_ib_init_dmabuf_mr(mr);
-	if (err)
-		goto err_release;
 
 	if (!umem_dmabuf->sgt || !umem_dmabuf->sgt->sgl) {
 		err = -EIO;
