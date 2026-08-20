@@ -447,6 +447,29 @@ candidate for the ib_write_bw ERR (the `0x04/0x11` syndrome branch in
 D.1). The two are distinguished by the CQE syndrome; whichever the
 syndrome points to is the one to pursue.
 
+**Note (2026-08-19, CRIU GPU dma-buf MR restore work,
+`gpu-dmabuf-criu-3f-restore-injection-design.md`):** this exact
+signature (`Fatal error 3`, untimed `wait_for_completion()` in
+`mlx5r_umr_post_send_wait()`) was initially, and WRONGLY, suspected as
+the root cause of a separate cross-host GPU_DMABUF MR restore failure
+-- `mlx5_ib_restore_mr_dmabuf()` is the only other MR-restore path in
+the tree that also posts a UMR WQE, so it looked like a natural match.
+It was not: unconditional kernel-side tracing showed
+`mlx5_ib_restore_mr_dmabuf()` was never even being entered in the
+failing runs. The real cause was unrelated -- a criu userspace
+plugin-dispatch bug (`run_plugins()`'s single-owner hook chain silently
+swallowing `cuda_plugin`'s `RESUME_DEVICES_LATE` hook, see the CRIU doc
+for the fix) that prevented the GPU dma-buf MR restore injection from
+running at all. Once fixed, `mlx5_ib_restore_mr_dmabuf()`'s UMR WQE
+post completed successfully on the first real cross-host attempt that
+actually reached it -- so this PARKED limitation remains open and
+unverified either way by that work; it neither confirms nor
+contradicts anything here, it just wasn't the explanation people
+initially assumed it was. Worth remembering as a cautionary example:
+matching symptom (`Fatal error 3`) does not imply matching cause --
+confirm the suspected code path was actually *entered* before trusting
+a root-cause match based on log signature alone.
+
 ---
 
 ## Appendix A: why the whole uobj-DAG is not hoisted instead
