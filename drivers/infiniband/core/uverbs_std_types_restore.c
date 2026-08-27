@@ -815,12 +815,20 @@ static int UVERBS_HANDLER(UVERBS_METHOD_PROBE_MR_DMABUF)(
 	u8 match_out;
 	int ret;
 
+	pr_warn("probe_mr_dmabuf_dbg: handler ENTRY\n");
+
 	mr = uverbs_attr_get_obj(attrs, UVERBS_ATTR_PROBE_MR_DMABUF_MR_HANDLE);
-	if (IS_ERR(mr))
+	if (IS_ERR(mr)) {
+		pr_warn("probe_mr_dmabuf_dbg: uverbs_attr_get_obj failed: %ld\n", PTR_ERR(mr));
 		return PTR_ERR(mr);
+	}
 	ib_dev = mr->device;
-	if (!ib_dev->ops.probe_mr_dmabuf)
+	if (!ib_dev->ops.probe_mr_dmabuf) {
+		pr_warn("probe_mr_dmabuf_dbg: ib_dev->ops.probe_mr_dmabuf is NULL for ibdev=%s\n",
+			dev_name(&ib_dev->dev));
 		return -EOPNOTSUPP;
+	}
+	pr_warn("probe_mr_dmabuf_dbg: dispatcher ENTRY ok, calling driver callback\n");
 
 	ret = uverbs_copy_from(&dmabuf_fd_u32, attrs,
 			       UVERBS_ATTR_PROBE_MR_DMABUF_FD);

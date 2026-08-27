@@ -3638,10 +3638,16 @@ static int mlx5_ib_probe_mr_dmabuf(struct ib_mr *mr, int dmabuf_fd,
 	*match_out = false;
 	target_mkey_index = to_mmr(mr)->mmkey.key >> 8;
 
+	mlx5_ib_warn(dev, "vfmig_probe_dbg: ENTRY dmabuf_fd=%d offset=0x%llx length=0x%llx access=0x%x "
+		     "target_mkey_index=0x%x\n", dmabuf_fd, offset, length, access, target_mkey_index);
+
 	umem_dmabuf = ib_umem_dmabuf_get_pinned(&dev->ib_dev, offset, length,
 						dmabuf_fd, access);
-	if (IS_ERR(umem_dmabuf))
+	if (IS_ERR(umem_dmabuf)) {
+		mlx5_ib_warn(dev, "vfmig_probe_dbg: ib_umem_dmabuf_get_pinned failed: %ld\n",
+			     PTR_ERR(umem_dmabuf));
 		return PTR_ERR(umem_dmabuf);
+	}
 
 	if (!umem_dmabuf->sgt || !umem_dmabuf->sgt->sgl) {
 		err = -EIO;
@@ -3650,8 +3656,11 @@ static int mlx5_ib_probe_mr_dmabuf(struct ib_mr *mr, int dmabuf_fd,
 	sgl = umem_dmabuf->sgt->sgl;
 	probe_iova = sg_dma_address(sgl) & PAGE_MASK;
 
+	mlx5_ib_warn(dev, "vfmig_probe_dbg: probe_iova=0x%llx, calling mlx5_vfmig_probe_dmabuf_mr\n",
+		     (u64)probe_iova);
 	err = mlx5_vfmig_probe_dmabuf_mr(dev->mdev, target_mkey_index,
 					 probe_iova, match_out);
+	mlx5_ib_warn(dev, "vfmig_probe_dbg: mlx5_vfmig_probe_dmabuf_mr err=%d match=%d\n", err, *match_out);
 
 out_release:
 	ib_umem_release(&umem_dmabuf->umem);
