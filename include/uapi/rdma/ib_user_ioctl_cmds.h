@@ -100,6 +100,7 @@ enum uverbs_methods_restore {
 	UVERBS_METHOD_RESTORE_CQ,
 	UVERBS_METHOD_RESTORE_QP,
 	UVERBS_METHOD_RESTORE_MR_DMABUF,
+	UVERBS_METHOD_PROBE_MR_DMABUF,
 };
 
 enum uverbs_attrs_restore_pd {
@@ -230,6 +231,52 @@ enum uverbs_attrs_restore_mr_dmabuf {
 	 */
 	UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_LKEY,
 	UVERBS_ATTR_RESTORE_MR_DMABUF_RESP_RKEY,
+};
+
+/*
+ * UVERBS_METHOD_PROBE_MR_DMABUF attributes.
+ *
+ * Dump-side VA disambiguation -- NOT a restore-mode operation, no
+ * target_handle/pd_handle (nothing is created), and dispatched
+ * WITHOUT the ucontext_is_restore_mode gate every other method under
+ * UVERBS_OBJECT_RESTORE requires (kept in this namespace only for
+ * locality with its sibling RESTORE_MR_DMABUF, whose driver-side
+ * physical-address lookup machinery it reuses read-only). Runs
+ * against a live, ordinary (dump-side) ucontext instead: the caller
+ * already holds an MR it registered normally, and wants to know
+ * whether a throwaway probe dma-buf (freshly exported, via a
+ * ptrace-hijacked cuMemGetHandleForAddressRange(), for one candidate
+ * VA out of several same-length candidates) resolves to the SAME
+ * physical memory that MR is already backed by. See
+ * gpu-dmabuf-criu-plan.md, "dump-time hijack-probe VA
+ * disambiguation".
+ */
+enum uverbs_attrs_probe_mr_dmabuf {
+	/*
+	 * Mandatory IDR input. The caller's own, already-registered
+	 * GPU dma-buf MR to compare the probe against.
+	 */
+	UVERBS_ATTR_PROBE_MR_DMABUF_MR_HANDLE,
+	/*
+	 * Mandatory FD input. The throwaway probe dma-buf -- freshly
+	 * exported for one candidate VA, not the MR's own dma-buf
+	 * (which no longer exists as a distinct fd by the time this
+	 * runs; see gpu-dmabuf-criu-plan.md §3f on dma-buf fds being
+	 * single-use).
+	 */
+	UVERBS_ATTR_PROBE_MR_DMABUF_FD,
+	/* Mandatory u64 inputs: offset into the probe dma-buf + length. */
+	UVERBS_ATTR_PROBE_MR_DMABUF_OFFSET,
+	UVERBS_ATTR_PROBE_MR_DMABUF_LENGTH,
+	/* Mandatory enum ib_access_flags input. */
+	UVERBS_ATTR_PROBE_MR_DMABUF_ACCESS_FLAGS,
+	/*
+	 * Mandatory u8 output. Nonzero iff the probe dma-buf resolves
+	 * to the same physical memory as UVERBS_ATTR_PROBE_MR_DMABUF_MR_HANDLE.
+	 * A zero result is a normal "wrong candidate" outcome, not an
+	 * error -- the ioctl itself still returns 0.
+	 */
+	UVERBS_ATTR_PROBE_MR_DMABUF_RESP_MATCH,
 };
 
 /*

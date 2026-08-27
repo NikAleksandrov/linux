@@ -2273,6 +2273,61 @@ out_unlock:
 }
 EXPORT_SYMBOL(vfmig_iova_relocate_dmabuf_mr);
 
+int vfmig_iova_probe_dmabuf_mr(struct vfmig_iova_domain *dom,
+			       u32 target_mkey_index, dma_addr_t probe_iova,
+			       bool *match_out)
+{
+	struct vfmig_iova_page *target, *probe;
+	u64 instance_key;
+	phys_addr_t target_phys, probe_phys;
+	int err = 0;
+
+	if (!dom || !match_out)
+		return -EINVAL;
+	if (target_mkey_index == 0 || (target_mkey_index & ~0xffffffU))
+		return -EINVAL;
+
+	*match_out = false;
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_MR, target_mkey_index);
+
+	mutex_lock(&dom->lock);
+
+	target = vfmig_iova_user_index_lookup_locked(dom, instance_key);
+	if (!target) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	if (!target->external || target->slot != VFMIG_SLOT_USER_MMIO) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
+
+	probe = vfmig_iova_find_locked(dom, (u64)probe_iova);
+	if (!probe) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	/*
+	 * Read-only: iommu_iova_to_phys() is a page-table walk, no
+	 * mutation of either registry entry or the IOMMU mapping
+	 * itself. The caller releases the probe umem separately (see
+	 * this function's doc comment in vfmig_iova.h) -- unlike
+	 * vfmig_iova_relocate_dmabuf_mr(), there is nothing here for
+	 * us to unwind on any path, success or failure.
+	 */
+	target_phys = iommu_iova_to_phys(dom->iommu_dom, target->iova);
+	probe_phys = iommu_iova_to_phys(dom->iommu_dom, probe_iova);
+
+	if (target_phys && probe_phys && target_phys == probe_phys)
+		*match_out = true;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+EXPORT_SYMBOL(vfmig_iova_probe_dmabuf_mr);
+
 int vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
 				 vfmig_iova_for_each_external_fn cb,
 				 void *ctx)

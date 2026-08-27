@@ -796,12 +796,91 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
 	UVERBS_ATTR_UHW());
 
+/*
+ * GPU dma-buf VA disambiguation probe. Deliberately does NOT call
+ * restore_check_ucontext() -- unlike every other method in this
+ * file, this one runs against a live, ordinary (dump-side) ucontext,
+ * not a restore one. See UVERBS_METHOD_PROBE_MR_DMABUF's doc comment
+ * in ib_user_ioctl_cmds.h for why it lives in this namespace anyway.
+ */
+static int UVERBS_HANDLER(UVERBS_METHOD_PROBE_MR_DMABUF)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_device *ib_dev;
+	struct ib_mr *mr;
+	u32 dmabuf_fd_u32, access_flags;
+	int dmabuf_fd;
+	u64 offset, length;
+	bool match;
+	u8 match_out;
+	int ret;
+
+	mr = uverbs_attr_get_obj(attrs, UVERBS_ATTR_PROBE_MR_DMABUF_MR_HANDLE);
+	if (IS_ERR(mr))
+		return PTR_ERR(mr);
+	ib_dev = mr->device;
+	if (!ib_dev->ops.probe_mr_dmabuf)
+		return -EOPNOTSUPP;
+
+	ret = uverbs_copy_from(&dmabuf_fd_u32, attrs,
+			       UVERBS_ATTR_PROBE_MR_DMABUF_FD);
+	if (ret)
+		return ret;
+	dmabuf_fd = (int)dmabuf_fd_u32;
+
+	ret = uverbs_copy_from(&offset, attrs,
+			       UVERBS_ATTR_PROBE_MR_DMABUF_OFFSET);
+	if (ret)
+		return ret;
+	ret = uverbs_copy_from(&length, attrs,
+			       UVERBS_ATTR_PROBE_MR_DMABUF_LENGTH);
+	if (ret)
+		return ret;
+	ret = uverbs_get_flags32(&access_flags, attrs,
+				 UVERBS_ATTR_PROBE_MR_DMABUF_ACCESS_FLAGS,
+				 IB_ACCESS_SUPPORTED);
+	if (ret)
+		return ret;
+	ret = ib_check_mr_access(ib_dev, access_flags);
+	if (ret)
+		return ret;
+
+	match = false;
+	ret = ib_dev->ops.probe_mr_dmabuf(mr, dmabuf_fd, offset, length,
+					  access_flags, &match);
+	if (ret)
+		return ret;
+
+	match_out = match ? 1 : 0;
+	return uverbs_copy_to(attrs, UVERBS_ATTR_PROBE_MR_DMABUF_RESP_MATCH,
+			      &match_out, sizeof(match_out));
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_PROBE_MR_DMABUF,
+	UVERBS_ATTR_IDR(UVERBS_ATTR_PROBE_MR_DMABUF_MR_HANDLE,
+			UVERBS_OBJECT_MR,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_PROBE_MR_DMABUF_FD,
+			   UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_PROBE_MR_DMABUF_OFFSET,
+			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_PROBE_MR_DMABUF_LENGTH,
+			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
+	UVERBS_ATTR_FLAGS_IN(UVERBS_ATTR_PROBE_MR_DMABUF_ACCESS_FLAGS,
+			     enum ib_access_flags,
+			     UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_PROBE_MR_DMABUF_RESP_MATCH,
+			    UVERBS_ATTR_TYPE(__u8), UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_RESTORE,
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_PD),
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_MR),
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_CQ),
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_QP),
-			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_MR_DMABUF));
+			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_MR_DMABUF),
+			      &UVERBS_METHOD(UVERBS_METHOD_PROBE_MR_DMABUF));
 
 const struct uapi_definition uverbs_def_obj_restore[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_RESTORE),

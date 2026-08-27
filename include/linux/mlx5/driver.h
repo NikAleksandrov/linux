@@ -1722,6 +1722,33 @@ mlx5_vfmig_relocate_dmabuf_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 #endif
 
 /*
+ * Dump-side VA disambiguation: does @vf_dev's already-live
+ * @target_mkey_index MR resolve to the same physical memory as a
+ * probe dma-buf import that just landed at @probe_iova? See
+ * vfmig_iova_probe_dmabuf_mr()'s doc comment
+ * (drivers/net/ethernet/mellanox/mlx5/core/vfmig/vfmig_iova.h) for
+ * the full contract; this is a thin vf_dev -> vfmig_iova_domain
+ * lookup wrapper, same pattern as mlx5_vfmig_relocate_dmabuf_mr()
+ * above. Read-only -- unlike relocate, a NULL vfmig_iova_dom here
+ * just means "not vfmig-tracked", which the probe caller (mlx5_ib)
+ * surfaces as -ENODEV / -EOPNOTSUPP rather than a hard failure of
+ * anything already in flight.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_probe_dmabuf_mr(struct mlx5_core_dev *vf_dev,
+			       u32 target_mkey_index, dma_addr_t probe_iova,
+			       bool *match_out);
+#else
+static inline int
+mlx5_vfmig_probe_dmabuf_mr(struct mlx5_core_dev *vf_dev,
+			   u32 target_mkey_index, dma_addr_t probe_iova,
+			   bool *match_out)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+/*
  * Stage-3 D3: destination-side bind for a freshly-pinned user CQ
  * CQE-buffer umem inside the per-VF vfmig deterministic IOVA domain.
  *

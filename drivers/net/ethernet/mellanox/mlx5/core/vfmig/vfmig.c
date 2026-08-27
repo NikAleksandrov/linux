@@ -5833,6 +5833,40 @@ int mlx5_vfmig_relocate_dmabuf_mr(struct mlx5_core_dev *vf_dev,
 EXPORT_SYMBOL(mlx5_vfmig_relocate_dmabuf_mr);
 
 /*
+ * Public entry point for the mlx5_ib PROBE_MR_DMABUF verb body.
+ * Header docstring lives in include/linux/mlx5/driver.h.
+ *
+ * Unlike mlx5_vfmig_bind_user_mr / mlx5_vfmig_relocate_dmabuf_mr, a
+ * caller reaching this entry point has NOT gated on
+ * vfmig_restore_mode -- probing runs against a live, ordinary
+ * (dump-side) ucontext, not a restore one. A NULL vfmig_iova_dom
+ * here just means this VF isn't vfmig-tracked at all, which is a
+ * normal "not applicable" outcome for the caller, not an in-flight
+ * failure -- surfaced as -ENODEV same as the other two, but the
+ * mlx5_ib caller is expected to treat that as "fall back to
+ * length-match" rather than aborting the dump.
+ */
+int mlx5_vfmig_probe_dmabuf_mr(struct mlx5_core_dev *vf_dev,
+			       u32 target_mkey_index, dma_addr_t probe_iova,
+			       bool *match_out)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !match_out)
+		return -EINVAL;
+	if (target_mkey_index == 0 || (target_mkey_index & ~0xffffffU))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_probe_dmabuf_mr(dom, target_mkey_index, probe_iova,
+					  match_out);
+}
+EXPORT_SYMBOL(mlx5_vfmig_probe_dmabuf_mr);
+
+/*
  * Public Stage-3 D3 destination-side bind entry point for the mlx5_ib
  * RESTORE_CQ verb body. Header docstring lives in
  * include/linux/mlx5/driver.h.

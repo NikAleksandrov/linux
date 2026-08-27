@@ -1255,6 +1255,46 @@ int  vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
 				   dma_addr_t *final_iova_out);
 
 /*
+ * Dump-side VA disambiguation helper. When a process holds 2+ GPU
+ * allocations of the same length, criu's length-only match against
+ * the drgn/bpftrace VA enumeration is ambiguous. This lets criu
+ * settle the ambiguity by hijacking a probe cuMemGetHandleForAddressRange()
+ * + ibv_reg_dmabuf_mr() call for each candidate VA inside the
+ * (still-running, not-yet-frozen) target process, and asking the
+ * kernel whether the probe's dma-buf resolves to the SAME physical
+ * memory as @target_mkey_index's already-live, already-registered MR
+ * -- entirely in-kernel, without ever handing a raw physical address
+ * to userspace (see gpu-dmabuf-criu-plan.md, "dump-time hijack-probe
+ * VA disambiguation").
+ *
+ * Unlike vfmig_iova_relocate_dmabuf_mr(), this is READ-ONLY: it never
+ * mutates the registry, never iommu_map()s or iommu_unmap()s
+ * anything. @target_mkey_index's entry is whatever the ORIGINAL,
+ * still-live registration installed (awaiting_bind == false, not a
+ * restore-side placeholder); @probe_iova is wherever the probe
+ * dma-buf's fresh import landed (vfmig_iova_user_mmio_map_phys(),
+ * same as @fresh_iova in relocate above). The caller is responsible
+ * for releasing the probe umem (ib_umem_release()) after this
+ * returns, which unwinds the probe's registry entry via the normal
+ * vfmig_dma_ops_unmap_phys() path -- this function does not touch it.
+ *
+ * Returns:
+ *   0        lookup succeeded; *@match_out reports whether the two
+ *            entries' iommu_iova_to_phys() results are equal and
+ *            non-zero. A false result is a normal, expected outcome
+ *            (the probed candidate is not the right one), not an
+ *            error.
+ *   -ENOENT  no entry at (KIND_MR, @target_mkey_index), or no entry
+ *            at @probe_iova
+ *   -EINVAL  @dom/@match_out NULL, bad @target_mkey_index, or the
+ *            target entry isn't an external USER_MMIO entry (i.e.
+ *            not a GPU dma-buf MR at all)
+ */
+int  vfmig_iova_probe_dmabuf_mr(struct vfmig_iova_domain *dom,
+				u32 target_mkey_index, dma_addr_t probe_iova,
+				bool *match_out);
+
+/*
  * Stage-2 validation accessor: count @awaiting_bind = true external
  * registry entries on @dom, with per-kind breakdown.
  *
@@ -1410,6 +1450,13 @@ static inline int
 vfmig_iova_relocate_dmabuf_mr(struct vfmig_iova_domain *dom,
 			      u32 mkey_index, dma_addr_t fresh_iova,
 			      dma_addr_t *final_iova_out)
+{
+	return -EOPNOTSUPP;
+}
+static inline int
+vfmig_iova_probe_dmabuf_mr(struct vfmig_iova_domain *dom,
+			   u32 target_mkey_index, dma_addr_t probe_iova,
+			   bool *match_out)
 {
 	return -EOPNOTSUPP;
 }

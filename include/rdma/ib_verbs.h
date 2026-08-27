@@ -2942,6 +2942,24 @@ struct ib_device_ops {
 					   u32 lkey_hint, u32 rkey_hint,
 					   struct ib_udata *udata);
 
+	/*
+	 * Dump-side VA disambiguation, sibling of restore_mr_dmabuf
+	 * but NOT gated on ucontext_is_restore_mode -- @mr is an
+	 * EXISTING, live MR (resolved by the generic uverbs dispatcher
+	 * from a caller-supplied handle to the caller's own MR
+	 * object), not a target_handle for a new one. See
+	 * UVERBS_METHOD_PROBE_MR_DMABUF's doc comment in
+	 * ib_user_ioctl_cmds.h.
+	 *
+	 * @dmabuf_fd is a throwaway probe dma-buf; @match_out reports
+	 * whether it resolves to the same physical memory @mr is
+	 * already backed by. Missing callback => -EOPNOTSUPP, same
+	 * opt-in-default contract as the rest of this CRIU-restore
+	 * group.
+	 */
+	int (*probe_mr_dmabuf)(struct ib_mr *mr, int dmabuf_fd, u64 offset,
+			       u64 length, int access_flags, bool *match_out);
+
 	DECLARE_RDMA_OBJ_SIZE(ib_ah);
 	DECLARE_RDMA_OBJ_SIZE(ib_counters);
 	DECLARE_RDMA_OBJ_SIZE(ib_cq);

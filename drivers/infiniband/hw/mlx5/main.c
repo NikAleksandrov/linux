@@ -3604,6 +3604,61 @@ static struct ib_mr *mlx5_ib_restore_mr_dmabuf(struct ib_pd *ibpd,
 }
 
 /*
+ * mlx5_ib_probe_mr_dmabuf: dump-side VA disambiguation. @mr is an
+ * EXISTING, live, already-registered GPU dma-buf MR (the one CRIU
+ * dump is trying to find the CUdeviceptr for); @dmabuf_fd is a
+ * THROWAWAY probe dma-buf, freshly exported by a ptrace-hijacked
+ * cuMemGetHandleForAddressRange(candidate_va) call for one candidate
+ * VA from the drgn/bpftrace enumeration. Imports the probe fd just
+ * long enough to get its physical address, asks the vfmig registry
+ * whether that matches @mr's already-live physical address, then
+ * releases the probe umem unconditionally -- this is a pure
+ * read-only check, nothing is left mapped/pinned/bound by it.
+ *
+ * No UMR, no mkey adoption, no relocate: unlike
+ * mlx5_ib_umem_restore_mr_dmabuf(), the probe dma-buf never becomes
+ * a real MR, so ib_umem_dmabuf_get_pinned() + ib_umem_release() is
+ * the entire lifecycle -- no mlx5r_umr_resource_init() needed either.
+ *
+ * *@match_out is only meaningful when this returns 0. A 0 return
+ * with *@match_out == false is the normal "wrong candidate" outcome,
+ * not an error.
+ */
+static int mlx5_ib_probe_mr_dmabuf(struct ib_mr *mr, int dmabuf_fd,
+				   u64 offset, u64 length, int access,
+				   bool *match_out)
+{
+	struct mlx5_ib_dev *dev = to_mdev(mr->device);
+	struct ib_umem_dmabuf *umem_dmabuf;
+	struct scatterlist *sgl;
+	dma_addr_t probe_iova;
+	u32 target_mkey_index;
+	int err;
+
+	*match_out = false;
+	target_mkey_index = to_mmr(mr)->mmkey.key >> 8;
+
+	umem_dmabuf = ib_umem_dmabuf_get_pinned(&dev->ib_dev, offset, length,
+						dmabuf_fd, access);
+	if (IS_ERR(umem_dmabuf))
+		return PTR_ERR(umem_dmabuf);
+
+	if (!umem_dmabuf->sgt || !umem_dmabuf->sgt->sgl) {
+		err = -EIO;
+		goto out_release;
+	}
+	sgl = umem_dmabuf->sgt->sgl;
+	probe_iova = sg_dma_address(sgl) & PAGE_MASK;
+
+	err = mlx5_vfmig_probe_dmabuf_mr(dev->mdev, target_mkey_index,
+					 probe_iova, match_out);
+
+out_release:
+	ib_umem_release(&umem_dmabuf->umem);
+	return err;
+}
+
+/*
  * mlx5_ib_restore_cq: CRIU-managed CQ restore, Model A (FW cqn
  * adoption). The destination VHCA inherits the source's user-mode
  * CQ context across LOAD_VHCA_STATE; this handler builds a fresh
@@ -6003,6 +6058,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.restore_cq = mlx5_ib_restore_cq,
 	.restore_mr = mlx5_ib_restore_mr,
 	.restore_mr_dmabuf = mlx5_ib_restore_mr_dmabuf,
+	.probe_mr_dmabuf = mlx5_ib_probe_mr_dmabuf,
 	.restore_pd = mlx5_ib_restore_pd,
 	.restore_qp = mlx5_ib_restore_qp,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
