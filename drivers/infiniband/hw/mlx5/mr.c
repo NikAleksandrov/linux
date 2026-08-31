@@ -1876,6 +1876,11 @@ struct ib_umem *mlx5_ib_umem_restore_mr_dmabuf(struct mlx5_ib_dev *dev,
 	page_off = sg_dma_address(sgl) & ~PAGE_MASK;
 	fresh_iova = sg_dma_address(sgl) & PAGE_MASK;
 
+	mlx5_ib_warn(dev,
+		     "vfmig_probe_dbg: restore_mr_dmabuf: mkey_index=0x%x len=%llu sgt->nents=%u sgt->orig_nents=%u sgl[0].length=%u\n",
+		     mkey_index, length, umem_dmabuf->sgt->nents,
+		     umem_dmabuf->sgt->orig_nents, sgl->length);
+
 	err = mlx5_vfmig_relocate_dmabuf_mr(dev->mdev, mkey_index,
 					    fresh_iova, &final_iova);
 	if (err)
